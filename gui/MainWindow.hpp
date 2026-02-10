@@ -13,6 +13,7 @@ class QLineEdit;
 class QLabel;
 class QTabWidget;
 class QPushButton;
+class QPoint;
 
 class MainWindow : public QMainWindow {
   Q_OBJECT
@@ -30,6 +31,9 @@ private:
   QString currentPeerId() const;
 
   void addFriendDialog();
+  void showChatContextMenu(const QPoint& pos);
+  void clearChatFor(const QString& peerId);
+  void removeFriend(const QString& peerId);
 
   void appendMessage(const QString& peerId, const QString& label, const QString& text, bool incoming);
   void refreshHeader();
@@ -56,5 +60,5 @@ private:
 
   QString selectedPeerId_;
   QString selfId_;
-  QMap<QString, QStringList> chatCache_;
+  QMap<QString, QVector<Profile::ChatMessage>> chatCache_;
 };

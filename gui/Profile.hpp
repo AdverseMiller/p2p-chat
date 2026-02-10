@@ -21,6 +21,12 @@ public:
     QString lastIntro;
   };
 
+  struct ChatMessage {
+    qint64 tsMs = 0;   // UTC ms since epoch
+    bool incoming = false;
+    QString text;
+  };
+
   static QString defaultPath();
   static QString defaultKeyPath();
   static Profile load(const QString& path, QString* errorOut = nullptr);
@@ -42,9 +48,15 @@ public:
   const FriendEntry* findFriend(const QString& id) const;
   void upsertFriend(const FriendEntry& e);
 
+  QVector<ChatMessage> loadChat(const QString& peerId, QString* errorOut = nullptr) const;
+  bool saveChat(const QString& peerId, const QVector<ChatMessage>& msgs, QString* errorOut = nullptr) const;
+  bool deleteChat(const QString& peerId, QString* errorOut = nullptr) const;
+
   static QString statusToString(FriendStatus s);
   static FriendStatus statusFromString(const QString& s);
 
 private:
+  static QString chatsDir();
+  static QString chatPathForPeer(const QString& peerId);
   QString path_;
 };

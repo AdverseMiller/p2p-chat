@@ -106,6 +106,10 @@ IDs and names:
 - The GUI stores its identity key in the app config directory (see `profile.json` location), as `identity.pem`.
 - Your name is only shared with peers after they accept your friend request and you establish a direct P2P connection.
 
+Encryption:
+- P2P traffic is end-to-end encrypted and authenticated (X25519 + HKDF-SHA256 + ChaCha20-Poly1305), with peer authentication via Ed25519 signatures (your ID).
+- The rendezvous server channel is not encrypted (it never relays chat content, only discovery + requests).
+
 UPnP / reachability:
 - Reachability is determined by the rendezvous server (it probes your observed public IP + the external port hint).
 - The GUI can run without UPnP; if you manually forwarded a port, set `externalPort` in the profile JSON.

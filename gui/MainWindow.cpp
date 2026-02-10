@@ -13,17 +13,28 @@
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMenuBar>
+#include <QMenu>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QStatusBar>
 #include <QSplitter>
 #include <QTabWidget>
 #include <QTextBrowser>
+#include <QTimeZone>
 #include <QVBoxLayout>
 
 namespace {
+QString renderLine(const QString& stamp, const QString& who, const QString& text) {
+  return QString("[%1] <b>%2</b>: %3").arg(stamp, who.toHtmlEscaped(), text.toHtmlEscaped());
+}
+
 QString nowStamp() {
   return QDateTime::currentDateTime().toString("HH:mm");
+}
+
+QString stampFromUtcMs(qint64 tsMs) {
+  if (tsMs <= 0) return nowStamp();
+  return QDateTime::fromMSecsSinceEpoch(tsMs, QTimeZone::utc()).toLocalTime().toString("HH:mm");
 }
 
 QString friendDisplay(const Profile::FriendEntry& e) {
@@ -96,6 +107,17 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
           [this](QString peerId, QString displayName, QString text, bool incoming) {
             appendMessage(peerId, displayName, text, incoming);
           });
+
+  connect(&backend_, &ChatBackend::peerNameUpdated, this, [this](QString peerId, QString name) {
+    if (name.isEmpty()) return;
+    auto* f = profile_.findFriend(peerId);
+    if (!f || f->status != Profile::FriendStatus::Accepted) return;
+    if (f->name == name) return;
+    f->name = name;
+    saveProfile();
+    rebuildFriendList();
+    refreshHeader();
+  });
 
   connect(&backend_, &ChatBackend::deliveryError, this, [this](QString peerId, QString msg) {
     statusBar()->showMessage(QString("Delivery to %1 failed: %2").arg(peerId.left(12), msg), 8000);
@@ -298,6 +320,11 @@ void MainWindow::buildUi() {
     selectFriend(id);
   });
 
+  friendList_->setContextMenuPolicy(Qt::CustomContextMenu);
+  connect(friendList_, &QListWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
+    showChatContextMenu(pos);
+  });
+
   auto sendNow = [this] {
     const auto pid = currentPeerId();
     if (pid.isEmpty()) return;
@@ -360,8 +387,83 @@ void MainWindow::selectFriend(const QString& id) {
   selectedPeerId_ = id;
   refreshHeader();
   chatView_->clear();
+
+  if (!chatCache_.contains(id)) {
+    QString err;
+    chatCache_[id] = profile_.loadChat(id, &err);
+    if (!err.isEmpty()) statusBar()->showMessage(err, 8000);
+  }
+
   const auto msgs = chatCache_.value(id);
-  for (const auto& m : msgs) chatView_->append(m);
+  const auto* fe = profile_.findFriend(id);
+  const auto peerLabel = fe ? friendDisplay(*fe) : id.left(14) + "...";
+  for (const auto& m : msgs) {
+    const auto who = m.incoming ? peerLabel : "You";
+    chatView_->append(renderLine(stampFromUtcMs(m.tsMs), who, m.text));
+  }
+}
+
+void MainWindow::showChatContextMenu(const QPoint& pos) {
+  if (!friendList_) return;
+  auto* item = friendList_->itemAt(pos);
+  if (!item) return;
+  const auto peerId = item->data(Qt::UserRole).toString();
+  if (peerId.isEmpty()) return;
+
+  QMenu menu(this);
+  auto* clearChat = menu.addAction("Clear chat history");
+  auto* unfriend = menu.addAction("Unfriend / Remove");
+
+  const auto* f = profile_.findFriend(peerId);
+  if (f && f->status == Profile::FriendStatus::IncomingPending) {
+    unfriend->setText("Reject request");
+  } else if (f && f->status == Profile::FriendStatus::OutgoingPending) {
+    unfriend->setText("Cancel request");
+  }
+
+  auto* chosen = menu.exec(friendList_->viewport()->mapToGlobal(pos));
+  if (!chosen) return;
+  if (chosen == clearChat) {
+    clearChatFor(peerId);
+    return;
+  }
+  if (chosen == unfriend) {
+    removeFriend(peerId);
+    return;
+  }
+}
+
+void MainWindow::clearChatFor(const QString& peerId) {
+  chatCache_.remove(peerId);
+  if (selectedPeerId_ == peerId) chatView_->clear();
+  QString err;
+  profile_.deleteChat(peerId, &err);
+  if (!err.isEmpty()) statusBar()->showMessage(err, 8000);
+  statusBar()->showMessage("Chat cleared", 4000);
+}
+
+void MainWindow::removeFriend(const QString& peerId) {
+  backend_.disconnectPeer(peerId);
+  backend_.setFriendAccepted(peerId, false);
+
+  for (int i = 0; i < profile_.friends.size(); ++i) {
+    if (profile_.friends[i].id == peerId) {
+      profile_.friends.removeAt(i);
+      break;
+    }
+  }
+  saveProfile();
+
+  // Keep chat history unless user explicitly clears it.
+  chatCache_.remove(peerId);
+  if (selectedPeerId_ == peerId) {
+    selectedPeerId_.clear();
+    chatView_->clear();
+    refreshHeader();
+  }
+  rebuildFriendList();
+  rebuildFriendsTab();
+  statusBar()->showMessage("Removed", 4000);
 }
 
 QString MainWindow::currentPeerId() const {
@@ -381,10 +483,27 @@ void MainWindow::appendMessage(const QString& peerId, const QString& label, cons
       }
     }
   }
-  const auto prefix = incoming ? label : "You";
-  const auto line = QString("[%1] <b>%2</b>: %3").arg(nowStamp(), prefix.toHtmlEscaped(), text.toHtmlEscaped());
-  chatCache_[peerId].push_back(line);
-  if (chatCache_[peerId].size() > 500) chatCache_[peerId].removeFirst();
+
+  if (!chatCache_.contains(peerId)) {
+    QString err;
+    chatCache_[peerId] = profile_.loadChat(peerId, &err);
+    if (!err.isEmpty()) statusBar()->showMessage(err, 8000);
+  }
+
+  auto& msgs = chatCache_[peerId];
+  Profile::ChatMessage m;
+  m.tsMs = QDateTime::currentDateTimeUtc().toMSecsSinceEpoch();
+  m.incoming = incoming;
+  m.text = text;
+  msgs.push_back(m);
+  while (msgs.size() > 500) msgs.removeFirst();
+
+  QString err;
+  profile_.saveChat(peerId, msgs, &err);
+  if (!err.isEmpty()) statusBar()->showMessage(err, 8000);
+
+  const auto who = incoming ? label : "You";
+  const auto line = renderLine(stampFromUtcMs(m.tsMs), who, text);
   if (peerId == selectedPeerId_) chatView_->append(line);
 }
 

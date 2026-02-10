@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace common {
 
@@ -45,6 +46,46 @@ class Identity {
     EVP_MD_CTX_free(ctx);
     if (ok2 != 1 || siglen != 64) return {};
     return base64url_encode(std::span<const uint8_t>(sig.data(), siglen));
+  }
+
+  std::string sign_bytes_b64url(std::span<const uint8_t> msg) const {
+    std::vector<uint8_t> sig(64);
+    size_t siglen = sig.size();
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) return {};
+    const int ok1 = EVP_DigestSignInit(ctx, nullptr, nullptr, nullptr, pkey_.get());
+    int ok2 = 0;
+    if (ok1 == 1) ok2 = EVP_DigestSign(ctx, sig.data(), &siglen, msg.data(), msg.size());
+    EVP_MD_CTX_free(ctx);
+    if (ok2 != 1 || siglen != 64) return {};
+    return base64url_encode(std::span<const uint8_t>(sig.data(), siglen));
+  }
+
+  static bool verify_bytes_b64url(std::string_view pubkey_b64url,
+                                 std::span<const uint8_t> msg,
+                                 std::string_view sig_b64url) {
+    const auto pub = base64url_decode(pubkey_b64url);
+    const auto sig = base64url_decode(sig_b64url);
+    if (!pub || !sig) return false;
+    if (pub->size() != 32 || sig->size() != 64) return false;
+
+    EVP_PKEY* pkey =
+        EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, nullptr, pub->data(), pub->size());
+    if (!pkey) return false;
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) {
+      EVP_PKEY_free(pkey);
+      return false;
+    }
+
+    bool ok = false;
+    if (EVP_DigestVerifyInit(ctx, nullptr, nullptr, nullptr, pkey) == 1) {
+      const int rc = EVP_DigestVerify(ctx, sig->data(), sig->size(), msg.data(), msg.size());
+      ok = (rc == 1);
+    }
+    EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    return ok;
   }
 
  private:
@@ -119,4 +160,3 @@ class Identity {
 };
 
 } // namespace common
-

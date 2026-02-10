@@ -2,6 +2,7 @@
 
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QStandardPaths>
@@ -14,6 +15,16 @@ QString Profile::defaultPath() {
 QString Profile::defaultKeyPath() {
   const auto dir = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
   return QDir(dir).filePath("identity.pem");
+}
+
+QString Profile::chatsDir() {
+  const auto dir = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+  return QDir(dir).filePath("chats");
+}
+
+QString Profile::chatPathForPeer(const QString& peerId) {
+  // Peer IDs are base64url and safe as filenames on Windows/Linux, but keep a stable extension.
+  return QDir(chatsDir()).filePath(peerId + ".json");
 }
 
 Profile Profile::load(const QString& path, QString* errorOut) {
@@ -115,6 +126,71 @@ void Profile::upsertFriend(const FriendEntry& e) {
     }
   }
   friends.push_back(e);
+}
+
+QVector<Profile::ChatMessage> Profile::loadChat(const QString& peerId, QString* errorOut) const {
+  QVector<ChatMessage> out;
+  const auto p = chatPathForPeer(peerId);
+  QFile f(p);
+  if (!f.exists()) return out;
+  if (!f.open(QIODevice::ReadOnly)) {
+    if (errorOut) *errorOut = "Failed to open chat history";
+    return out;
+  }
+  const auto bytes = f.readAll();
+  f.close();
+
+  QJsonParseError pe;
+  const auto doc = QJsonDocument::fromJson(bytes, &pe);
+  if (pe.error != QJsonParseError::NoError || !doc.isArray()) {
+    if (errorOut) *errorOut = "Failed to parse chat history";
+    return out;
+  }
+  const auto arr = doc.array();
+  out.reserve(arr.size());
+  for (const auto& v : arr) {
+    if (!v.isObject()) continue;
+    const auto o = v.toObject();
+    ChatMessage m;
+    m.tsMs = static_cast<qint64>(o.value("tsMs").toVariant().toLongLong());
+    m.incoming = o.value("incoming").toBool(false);
+    m.text = o.value("text").toString();
+    if (!m.text.isEmpty()) out.push_back(m);
+  }
+  return out;
+}
+
+bool Profile::saveChat(const QString& peerId, const QVector<ChatMessage>& msgs, QString* errorOut) const {
+  const auto dir = chatsDir();
+  QDir().mkpath(dir);
+  QFile f(chatPathForPeer(peerId));
+  if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+    if (errorOut) *errorOut = "Failed to write chat history";
+    return false;
+  }
+
+  QJsonArray arr;
+  for (const auto& m : msgs) {
+    QJsonObject o;
+    o["tsMs"] = static_cast<double>(m.tsMs);
+    o["incoming"] = m.incoming;
+    o["text"] = m.text;
+    arr.push_back(o);
+  }
+
+  f.write(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+  f.close();
+  return true;
+}
+
+bool Profile::deleteChat(const QString& peerId, QString* errorOut) const {
+  QFile f(chatPathForPeer(peerId));
+  if (!f.exists()) return true;
+  if (!f.remove()) {
+    if (errorOut) *errorOut = "Failed to delete chat history";
+    return false;
+  }
+  return true;
 }
 
 QString Profile::statusToString(FriendStatus s) {

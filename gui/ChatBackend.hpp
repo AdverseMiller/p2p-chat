@@ -29,6 +29,7 @@ public:
   void sendFriendRequest(const QString& peerId, const QString& intro);
   void acceptFriend(const QString& peerId);
   void sendMessage(const QString& peerId, const QString& text);
+  void disconnectPeer(const QString& peerId);
 
   void setFriendAccepted(const QString& peerId, bool accepted);
 
@@ -37,6 +38,7 @@ signals:
   void logLine(QString line);
   void friendRequestReceived(QString fromId, QString intro);
   void friendAccepted(QString peerId);
+  void peerNameUpdated(QString peerId, QString name);
   void messageReceived(QString peerId, QString displayName, QString text, bool incoming);
   void deliveryError(QString peerId, QString message);
 
@@ -44,4 +46,3 @@ private:
   struct Impl;
   Impl* impl_;
 };
-
