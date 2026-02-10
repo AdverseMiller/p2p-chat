@@ -21,6 +21,7 @@ jobs:
           update: true
           install: >-
             mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-binutils
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
             mingw-w64-x86_64-qt6-base
@@ -46,22 +47,56 @@ jobs:
           cp build-win/p2p_chat_gui.exe dist/
 
           # Deploy Qt runtime.
-          windeployqt --release --no-translations dist/p2p_chat_gui.exe
+          windeployqt --release --no-translations --compiler-runtime dist/p2p_chat_gui.exe
 
-          # Copy non-Qt DLL dependencies (MinGW runtime, OpenSSL, Boost, miniupnpc).
-          dlls=(
-            libstdc++-6.dll
-            libgcc_s_seh-1.dll
-            libwinpthread-1.dll
-            libssl-3-x64.dll
-            libcrypto-3-x64.dll
-          )
-          for d in "${dlls[@]}"; do
-            if [ -f "/mingw64/bin/$d" ]; then cp "/mingw64/bin/$d" dist/; fi
+          # Copy all transitive DLL deps from /mingw64/bin into dist/.
+          # This prevents "missing libpng/libicu/libdoubleconversion/..." at runtime.
+          declare -A seen
+          queue=()
+          while IFS= read -r f; do
+            queue+=("$f")
+          done < <(find dist -type f \( -iname "*.exe" -o -iname "*.dll" \))
+
+          deps_of() {
+            objdump -p "$1" 2>/dev/null | awk '/DLL Name:/ {print $3}'
+          }
+
+          is_system_dll() {
+            case "$1" in
+              KERNEL32.dll|USER32.dll|GDI32.dll|ADVAPI32.dll|SHELL32.dll|OLE32.dll|OLEAUT32.dll|COMDLG32.dll|COMCTL32.dll|WS2_32.dll|IPHLPAPI.dll|DNSAPI.dll|WINMM.dll|VERSION.dll|IMM32.dll|MSVCRT.dll|SHLWAPI.dll|DWMAPI.dll|UXTHEME.dll|WINSPOOL.DRV|WININET.dll|CRYPT32.dll|SECUR32.dll|NTDLL.dll|SETUPAPI.dll|BCRYPT.dll|BCRYPTPRIMITIVES.dll|dbghelp.dll)
+                return 0
+                ;;
+            esac
+            return 1
+          }
+
+          idx=0
+          while [ $idx -lt ${#queue[@]} ]; do
+            f="${queue[$idx]}"
+            idx=$((idx+1))
+            [ -f "$f" ] || continue
+            while IFS= read -r dep; do
+              [ -n "$dep" ] || continue
+              # Normalize to the canonical filename casing used on disk.
+              dep_file="$(basename "$dep")"
+              if is_system_dll "$dep_file"; then
+                continue
+              fi
+              if [ "${seen[$dep_file]+x}" = "x" ]; then
+                continue
+              fi
+              seen[$dep_file]=1
+
+              if [ -f "dist/$dep_file" ]; then
+                queue+=("dist/$dep_file")
+                continue
+              fi
+              if [ -f "/mingw64/bin/$dep_file" ]; then
+                cp "/mingw64/bin/$dep_file" dist/
+                queue+=("dist/$dep_file")
+              fi
+            done < <(deps_of "$f")
           done
-          # boost_system version varies; copy any match.
-          cp /mingw64/bin/libboost_system*.dll dist/ 2>/dev/null || true
-          cp /mingw64/bin/libminiupnpc*.dll dist/ 2>/dev/null || true
 
       - uses: actions/upload-artifact@v4
         with:
