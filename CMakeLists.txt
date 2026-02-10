@@ -7,7 +7,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CMAKE_AUTOMOC ON)
 
-option(P2PCHAT_ENABLE_LTO "Enable link-time optimization (IPO/LTO) if supported" ON)
+if(WIN32)
+  # MinGW LTO has been observed to produce unwind symbol link failures on CI.
+  option(P2PCHAT_ENABLE_LTO "Enable link-time optimization (IPO/LTO) if supported" OFF)
+else()
+  option(P2PCHAT_ENABLE_LTO "Enable link-time optimization (IPO/LTO) if supported" ON)
+endif()
 include(CheckIPOSupported)
 check_ipo_supported(RESULT P2PCHAT_IPO_OK OUTPUT P2PCHAT_IPO_ERR)
 if(P2PCHAT_ENABLE_LTO AND P2PCHAT_IPO_OK AND CMAKE_BUILD_TYPE MATCHES "^[Rr]elease$")
