@@ -1,0 +1,75 @@
+name: windows-build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-qt6-base
+            mingw-w64-x86_64-boost
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-miniupnpc
+            mingw-w64-x86_64-pkgconf
+
+      - name: Configure
+        run: >
+          cmake -S . -B build-win
+          -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build-win -j 2
+
+      - name: Bundle
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          mkdir -p dist
+          cp build-win/p2p_chat_gui.exe dist/
+
+          # Deploy Qt runtime.
+          windeployqt --release --no-translations dist/p2p_chat_gui.exe
+
+          # Copy non-Qt DLL dependencies (MinGW runtime, OpenSSL, Boost, miniupnpc).
+          dlls=(
+            libstdc++-6.dll
+            libgcc_s_seh-1.dll
+            libwinpthread-1.dll
+            libssl-3-x64.dll
+            libcrypto-3-x64.dll
+          )
+          for d in "${dlls[@]}"; do
+            if [ -f "/mingw64/bin/$d" ]; then cp "/mingw64/bin/$d" dist/; fi
+          done
+          # boost_system version varies; copy any match.
+          cp /mingw64/bin/libboost_system*.dll dist/ 2>/dev/null || true
+          cp /mingw64/bin/libminiupnpc*.dll dist/ 2>/dev/null || true
+
+      - name: Archive
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\* -DestinationPath p2p_chat_gui-windows.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: p2p_chat_gui-windows
+          path: p2p_chat_gui-windows.zip
+
