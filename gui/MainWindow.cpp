@@ -177,7 +177,7 @@ void MainWindow::buildUi() {
     profile_.selfName = name;
     backend_.setSelfName(name);
     saveProfile();
-    statusBar()->showMessage("Name updated (takes effect on next connection)", 6000);
+    statusBar()->showMessage("Name updated", 6000);
   });
   menuBar()->addAction(setName);
 
@@ -613,7 +613,11 @@ void MainWindow::appendMessage(const QString& peerId, const QString& label, cons
   profile_.saveChat(peerId, msgs, &err);
   if (!err.isEmpty()) statusBar()->showMessage(err, 8000);
 
-  const auto who = incoming ? label : "You";
+  QString who = "You";
+  if (incoming) {
+    const auto* f = profile_.findFriend(peerId);
+    who = f ? friendDisplay(*f) : label;
+  }
   const auto line = renderLine(stampFromUtcMs(m.tsMs), who, text);
   if (peerId == selectedPeerId_) chatView_->append(line);
 }

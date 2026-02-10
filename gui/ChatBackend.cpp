@@ -90,6 +90,15 @@ public:
     send_secure(std::move(inner));
   }
 
+  void send_name(std::string name) {
+    if (!ready_) return;
+    if (name.empty()) return;
+    json inner;
+    inner["type"] = "name";
+    inner["name"] = std::move(name);
+    send_secure(std::move(inner));
+  }
+
   void close() {
     if (closed_) return;
     closed_ = true;
@@ -1177,8 +1186,17 @@ void ChatBackend::stop() {
 }
 
 void ChatBackend::setSelfName(const QString& name) {
-  std::lock_guard lk(impl_->m);
-  impl_->self_name = name.toStdString();
+  const auto nm = name.toStdString();
+  {
+    std::lock_guard lk(impl_->m);
+    impl_->self_name = nm;
+  }
+
+  // Pure P2P: if we're currently chatting, push the updated name immediately.
+  boost::asio::post(impl_->io, [impl = impl_, nm] {
+    if (!impl->active_peer) return;
+    impl->active_peer->send_name(nm);
+  });
 }
 
 void ChatBackend::setFriendAccepted(const QString& peerId, bool accepted) {
