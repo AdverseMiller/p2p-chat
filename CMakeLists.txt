@@ -24,9 +24,15 @@ endif()
 function(p2pchat_max_perf target_name)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     # "Max perf" for production builds. Note: `-ffast-math` changes floating-point semantics.
-    target_compile_options(${target_name} PRIVATE
-      $<$<OR:$<CONFIG:Release>,$<CONFIG:MinSizeRel>>:-O3 -ffast-math -DNDEBUG -g0 -fno-unwind-tables -fno-asynchronous-unwind-tables>
-    )
+    if(WIN32)
+      target_compile_options(${target_name} PRIVATE
+        $<$<OR:$<CONFIG:Release>,$<CONFIG:MinSizeRel>>:-O3 -ffast-math -DNDEBUG -g0>
+      )
+    else()
+      target_compile_options(${target_name} PRIVATE
+        $<$<OR:$<CONFIG:Release>,$<CONFIG:MinSizeRel>>:-O3 -ffast-math -DNDEBUG -g0 -fno-unwind-tables -fno-asynchronous-unwind-tables>
+      )
+    endif()
     target_link_options(${target_name} PRIVATE
       $<$<OR:$<CONFIG:Release>,$<CONFIG:MinSizeRel>>:-Wl,-O2>
     )
@@ -36,7 +42,12 @@ endfunction()
 function(p2pchat_small_binary target_name)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(${target_name} PRIVATE $<$<OR:$<CONFIG:Release>,$<CONFIG:MinSizeRel>>:-ffunction-sections -fdata-sections>)
-    target_link_options(${target_name} PRIVATE $<$<OR:$<CONFIG:Release>,$<CONFIG:MinSizeRel>>:-Wl,--gc-sections -Wl,--as-needed>)
+    # Note: `--as-needed` has caused MinGW CI to drop unwind/runtime libs, leading to unresolved _Unwind_SjLj_*.
+    if(WIN32)
+      target_link_options(${target_name} PRIVATE $<$<OR:$<CONFIG:Release>,$<CONFIG:MinSizeRel>>:-Wl,--gc-sections>)
+    else()
+      target_link_options(${target_name} PRIVATE $<$<OR:$<CONFIG:Release>,$<CONFIG:MinSizeRel>>:-Wl,--gc-sections -Wl,--as-needed>)
+    endif()
     # Strip in Release/MinSizeRel (keeps Debug usable).
     target_link_options(${target_name} PRIVATE $<$<OR:$<CONFIG:Release>,$<CONFIG:MinSizeRel>>:-s>)
   endif()
