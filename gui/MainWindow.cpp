@@ -15,8 +15,11 @@
 #include <QMenuBar>
 #include <QMenu>
 #include <QMessageBox>
+#include <QPalette>
+#include <QColor>
 #include <QPushButton>
 #include <QStatusBar>
+#include <QStyleFactory>
 #include <QSplitter>
 #include <QTabWidget>
 #include <QTextBrowser>
@@ -58,6 +61,7 @@ QString statusTag(Profile::FriendStatus s) {
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   buildUi();
   loadProfile();
+  applyTheme(profile_.darkMode);
 
   connect(&backend_, &ChatBackend::registered, this,
           [this](QString selfId, bool reachable, QString observedIp, quint16 externalPort) {
@@ -153,6 +157,10 @@ void MainWindow::buildUi() {
   auto* addFriend = new QAction("Add Friend...", this);
   connect(addFriend, &QAction::triggered, this, [this] { addFriendDialog(); });
   menuBar()->addAction(addFriend);
+
+  auto* darkMode = new QAction("Dark Mode", this);
+  darkMode->setCheckable(true);
+  menuBar()->addAction(darkMode);
 
   auto* setName = new QAction("Set Name...", this);
   connect(setName, &QAction::triggered, this, [this] {
@@ -335,6 +343,14 @@ void MainWindow::buildUi() {
   };
   connect(sendBtn, &QPushButton::clicked, this, sendNow);
   connect(input_, &QLineEdit::returnPressed, this, sendNow);
+
+  // Dark mode toggle (profile loads after UI is built, so we set checked state later in loadProfile()).
+  connect(darkMode, &QAction::toggled, this, [this](bool on) {
+    profile_.darkMode = on;
+    saveProfile();
+    applyTheme(on);
+  });
+  darkModeAction_ = darkMode;
 }
 
 void MainWindow::loadProfile() {
@@ -342,12 +358,44 @@ void MainWindow::loadProfile() {
   profile_ = Profile::load(Profile::defaultPath(), &err);
   if (!err.isEmpty()) statusBar()->showMessage(err, 8000);
   if (profile_.keyPath.isEmpty()) profile_.keyPath = Profile::defaultKeyPath();
+  if (darkModeAction_) darkModeAction_->setChecked(profile_.darkMode);
 }
 
 void MainWindow::saveProfile() {
   QString err;
   profile_.save(&err);
   if (!err.isEmpty()) statusBar()->showMessage(err, 8000);
+}
+
+void MainWindow::applyTheme(bool dark) {
+  // Use Fusion for more consistent palettes across platforms.
+  QApplication::setStyle(QStyleFactory::create("Fusion"));
+
+  if (!dark) {
+    qApp->setPalette(QApplication::style()->standardPalette());
+    qApp->setStyleSheet({});
+    return;
+  }
+
+  QPalette p;
+  p.setColor(QPalette::Window, QColor(30, 30, 30));
+  p.setColor(QPalette::WindowText, QColor(220, 220, 220));
+  p.setColor(QPalette::Base, QColor(20, 20, 20));
+  p.setColor(QPalette::AlternateBase, QColor(35, 35, 35));
+  p.setColor(QPalette::ToolTipBase, QColor(255, 255, 255));
+  p.setColor(QPalette::ToolTipText, QColor(0, 0, 0));
+  p.setColor(QPalette::Text, QColor(220, 220, 220));
+  p.setColor(QPalette::Button, QColor(45, 45, 45));
+  p.setColor(QPalette::ButtonText, QColor(220, 220, 220));
+  p.setColor(QPalette::BrightText, Qt::red);
+  p.setColor(QPalette::Link, QColor(42, 130, 218));
+  p.setColor(QPalette::Highlight, QColor(42, 130, 218));
+  p.setColor(QPalette::HighlightedText, QColor(0, 0, 0));
+
+  qApp->setPalette(p);
+  // Improve readability for some controls that ignore palette colors (e.g., tooltips).
+  qApp->setStyleSheet(
+      "QToolTip { color: #000; background-color: #fff; border: 1px solid #aaa; }");
 }
 
 void MainWindow::rebuildFriendList() {

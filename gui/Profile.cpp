@@ -54,6 +54,7 @@ Profile Profile::load(const QString& path, QString* errorOut) {
   p.listenPort = static_cast<quint16>(root.value("listenPort").toInt(0));
   p.noUpnp = root.value("noUpnp").toBool(false);
   p.externalPort = static_cast<quint16>(root.value("externalPort").toInt(0));
+  p.darkMode = root.value("darkMode").toBool(false);
 
   const auto arr = root.value("friends").toArray();
   for (const auto& v : arr) {
@@ -86,6 +87,7 @@ bool Profile::save(QString* errorOut) const {
   root["listenPort"] = static_cast<int>(listenPort);
   root["noUpnp"] = noUpnp;
   root["externalPort"] = static_cast<int>(externalPort);
+  root["darkMode"] = darkMode;
 
   QJsonArray arr;
   for (const auto& e : friends) {

@@ -14,6 +14,7 @@ class QLabel;
 class QTabWidget;
 class QPushButton;
 class QPoint;
+class QAction;
 
 class MainWindow : public QMainWindow {
   Q_OBJECT
@@ -25,6 +26,7 @@ private:
   void buildUi();
   void loadProfile();
   void saveProfile();
+  void applyTheme(bool dark);
   void rebuildFriendList();
   void rebuildFriendsTab();
   void selectFriend(const QString& id);
@@ -62,4 +64,6 @@ private:
   QString selectedPeerId_;
   QString selfId_;
   QMap<QString, QVector<Profile::ChatMessage>> chatCache_;
+
+  QAction* darkModeAction_ = nullptr;
 };

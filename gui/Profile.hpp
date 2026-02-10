@@ -41,6 +41,7 @@ public:
   quint16 listenPort = 0;
   bool noUpnp = false;
   quint16 externalPort = 0;
+  bool darkMode = false;
 
   QVector<FriendEntry> friends;
 
