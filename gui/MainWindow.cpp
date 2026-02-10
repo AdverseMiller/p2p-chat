@@ -105,6 +105,8 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     rebuildFriendList();
     rebuildFriendsTab();
     backend_.setFriendAccepted(peerId, true);
+    // Best-effort: now that both sides are "friends", establish a P2P session to learn the peer name.
+    backend_.warmConnect(peerId);
   });
 
   connect(&backend_, &ChatBackend::messageReceived, this,
