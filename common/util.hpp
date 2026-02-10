@@ -53,6 +53,33 @@ inline std::string endpoint_to_string(const boost::asio::ip::tcp::endpoint& ep) 
   return oss.str();
 }
 
+inline std::string endpoint_to_string(const boost::asio::ip::udp::endpoint& ep) {
+  std::ostringstream oss;
+  oss << ep.address().to_string() << ":" << ep.port();
+  return oss.str();
+}
+
+inline bool is_private_ipv4(std::string_view ip) {
+  boost::system::error_code ec;
+  const auto addr = boost::asio::ip::make_address_v4(std::string(ip), ec);
+  if (ec) return false;
+  const auto v = addr.to_uint();
+
+  // 10.0.0.0/8
+  if ((v & 0xFF000000u) == 0x0A000000u) return true;
+  // 172.16.0.0/12
+  if ((v & 0xFFF00000u) == 0xAC100000u) return true;
+  // 192.168.0.0/16
+  if ((v & 0xFFFF0000u) == 0xC0A80000u) return true;
+  // 127.0.0.0/8
+  if ((v & 0xFF000000u) == 0x7F000000u) return true;
+  // 169.254.0.0/16 (link-local)
+  if ((v & 0xFFFF0000u) == 0xA9FE0000u) return true;
+  // 100.64.0.0/10 (CGNAT)
+  if ((v & 0xFFC00000u) == 0x64400000u) return true;
+  return false;
+}
+
 inline bool is_valid_id(std::string_view id, std::size_t min_len = 10, std::size_t max_len = 128) {
   if (id.size() < min_len || id.size() > max_len) return false;
   for (unsigned char ch : id) {

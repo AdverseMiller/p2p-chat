@@ -1071,6 +1071,7 @@ public:
     bool ok = false;
     std::string target_id;
     std::string ip;
+    std::string udp_ip;
     uint16_t port = 0;
     uint16_t udp_port = 0;
     bool reachable = false;
@@ -1214,8 +1215,10 @@ private:
 
     id_.clear();
     observed_ip_.clear();
+    udp_ip_.clear();
     reachable_ = false;
     external_port_ = 0;
+    udp_port_ = 0;
 
     const int delay = immediate ? 0 : reconnect_backoff_secs_;
     reconnect_backoff_secs_ = std::min(reconnect_backoff_secs_ * 2, 30);
@@ -1339,9 +1342,18 @@ private:
       external_port_ = j.contains("external_port") && j["external_port"].is_number_integer()
                            ? static_cast<uint16_t>(j["external_port"].get<int>())
                            : 0;
+      // udp_ip is the best contact address for UDP punching.
+      if (j.contains("udp_ip") && j["udp_ip"].is_string()) udp_ip_ = j["udp_ip"].get<std::string>();
       udp_port_ = j.contains("udp_port") && j["udp_port"].is_number_integer()
                       ? static_cast<uint16_t>(j["udp_port"].get<int>())
                       : 0;
+      if (!udp_ip_.empty() && common::is_private_ipv4(udp_ip_)) {
+        log("warning: rendezvous sees your UDP address as private (" + udp_ip_ +
+            "); hole punching will not work for internet peers unless rendezvous is on a public IP");
+      } else if (!observed_ip_.empty() && common::is_private_ipv4(observed_ip_)) {
+        log("warning: rendezvous sees your TCP address as private (" + observed_ip_ +
+            "); run rendezvous on a public IP for internet discovery");
+      }
       schedule_heartbeat();
       if (polling_enabled_) schedule_poll();
       flush_pending();
@@ -1354,6 +1366,7 @@ private:
       r.ok = j.contains("ok") && j["ok"].is_boolean() ? j["ok"].get<bool>() : false;
       r.target_id = (j.contains("target_id") && j["target_id"].is_string()) ? j["target_id"].get<std::string>() : "";
       r.ip = (j.contains("ip") && j["ip"].is_string()) ? j["ip"].get<std::string>() : "";
+      r.udp_ip = (j.contains("udp_ip") && j["udp_ip"].is_string()) ? j["udp_ip"].get<std::string>() : "";
       r.reachable = j.contains("reachable") && j["reachable"].is_boolean() ? j["reachable"].get<bool>() : false;
       r.port = j.contains("port") && j["port"].is_number_integer() ? static_cast<uint16_t>(j["port"].get<int>()) : 0;
       r.udp_port = j.contains("udp_port") && j["udp_port"].is_number_integer()
@@ -1424,6 +1437,7 @@ private:
 
   std::string id_;
   std::string observed_ip_;
+  std::string udp_ip_;
   bool reachable_ = false;
   uint16_t external_port_ = 0;
   uint16_t udp_port_ = 0;
@@ -1472,6 +1486,8 @@ struct ChatBackend::Impl {
   udp::resolver udp_resolver{io};
   udp::endpoint udp_server_ep;
   bool udp_server_ready = false;
+  bool udp_resolving = false;
+  bool udp_announce_confirmed = false;
   boost::asio::steady_timer udp_announce_timer{io};
   std::string server_host;
   uint16_t server_port = 0;
@@ -1562,7 +1578,13 @@ struct ChatBackend::Impl {
   void handle_udp_datagram(const json& j, const udp::endpoint& from) {
     if (!j.contains("type") || !j["type"].is_string()) return;
     const std::string type = j["type"].get<std::string>();
-    if (type == "udp_announce_ok") return;
+    if (type == "udp_announce_ok") {
+      if (!udp_announce_confirmed) {
+        udp_announce_confirmed = true;
+        postToQt([this] { emit q->logLine("udp rendezvous announce confirmed"); });
+      }
+      return;
+    }
 
     if (active_udp) {
       active_udp->handle_datagram(j, from);
@@ -1631,17 +1653,44 @@ struct ChatBackend::Impl {
                              [buf](const boost::system::error_code&, std::size_t) {});
   }
 
-  void resolve_udp_server() {
+  void resolve_udp_server(std::function<void()> on_ready = {}) {
+    if (udp_resolving) return;
     udp_server_ready = false;
     if (server_host.empty() || server_port == 0) return;
-    udp_resolver.async_resolve(server_host, std::to_string(server_port),
-                               [this](const boost::system::error_code& ec, udp::resolver::results_type res) {
-                                 if (ec) return;
-                                 const auto it = res.begin();
-                                 if (it == res.end()) return;
-                                 udp_server_ep = *it;
-                                 udp_server_ready = true;
-                               });
+    udp_resolving = true;
+    udp_resolver.async_resolve(
+        server_host,
+        std::to_string(server_port),
+        [this, on_ready = std::move(on_ready)](const boost::system::error_code& ec, udp::resolver::results_type res) {
+          udp_resolving = false;
+          if (ec) {
+            postToQt([this, msg = QString("udp rendezvous resolve failed: %1").arg(QString::fromUtf8(ec.message()))] {
+              emit q->logLine(msg);
+            });
+            return;
+          }
+
+          std::optional<udp::endpoint> chosen;
+          for (const auto& r : res) {
+            const auto ep = r.endpoint();
+            if (ep.address().is_v4()) {
+              chosen = ep;
+              break;
+            }
+          }
+          if (!chosen) {
+            // We only open a v4 UDP socket, so an IPv6-only rendezvous host won't work for UDP punching.
+            postToQt([this] { emit q->logLine("udp rendezvous resolved to IPv6 only; UDP socket is IPv4"); });
+            return;
+          }
+
+          udp_server_ep = *chosen;
+          udp_server_ready = true;
+          postToQt([this, ep = QString::fromStdString(common::endpoint_to_string(udp_server_ep))] {
+            emit q->logLine(QString("udp rendezvous endpoint: %1").arg(ep));
+          });
+          if (on_ready) on_ready();
+        });
   }
 
   void schedule_udp_announce(bool immediate) {
@@ -1650,8 +1699,11 @@ struct ChatBackend::Impl {
     udp_announce_timer.expires_after(delay);
     udp_announce_timer.async_wait([this](const boost::system::error_code& ec) {
       if (ec) return;
-      if (!udp_server_ready) resolve_udp_server();
-      if (udp_server_ready) send_udp_announce_once();
+      if (!udp_server_ready) {
+        resolve_udp_server([this] { send_udp_announce_once(); });
+      } else {
+        send_udp_announce_once();
+      }
       schedule_udp_announce(false);
     });
   }
@@ -1954,7 +2006,8 @@ struct ChatBackend::Impl {
       if (r.udp_port != 0) {
         // UDP hole punching is the default (works even if both peers are NATed).
         if (rendezvous) rendezvous->send_connect_request(r.target_id); // ask peer to start punching too
-        connectToPeerUdp(r.target_id, r.ip, r.udp_port, r.port, r.reachable, silent);
+        const std::string udp_ip = r.udp_ip.empty() ? r.ip : r.udp_ip;
+        connectToPeerUdp(r.target_id, udp_ip, r.udp_port, r.port, r.reachable, silent);
         return;
       }
       // No UDP info. Try direct TCP if possible; otherwise request connect (may succeed if we become reachable later).
@@ -2012,7 +2065,6 @@ void ChatBackend::start(const Options& opt) {
 
   impl_->server_host = cfg.server_host;
   impl_->server_port = cfg.server_port;
-  impl_->resolve_udp_server();
   impl_->schedule_udp_announce(/*immediate*/ true);
 
   impl_->rendezvous = std::make_shared<RendezvousClient>(impl_->io, std::move(cfg));
@@ -2072,10 +2124,10 @@ void ChatBackend::setSelfName(const QString& name) {
     impl_->self_name = nm;
   }
 
-  // Pure P2P: if we're currently chatting, push the updated name immediately.
+  // Push updated name immediately to any active session (P2P).
   boost::asio::post(impl_->io, [impl = impl_, nm] {
-    if (!impl->active_peer) return;
-    impl->active_peer->send_name(nm);
+    if (impl->active_peer) impl->active_peer->send_name(nm);
+    if (impl->active_udp) impl->active_udp->send_name(nm);
   });
 }
 
@@ -2098,8 +2150,6 @@ void ChatBackend::acceptFriend(const QString& peerId) {
   boost::asio::post(impl_->io, [impl = impl_, pid] {
     if (!impl->rendezvous) return;
     impl->rendezvous->send_friend_accept(pid);
-    // Best-effort: establish a direct connection so we can learn peer name quickly (P2P).
-    impl->attemptDelivery(pid, /*silent*/ true);
   });
 }
 

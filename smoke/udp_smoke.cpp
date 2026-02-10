@@ -78,7 +78,8 @@ int main(int argc, char** argv) {
   oa.selfName = "smokeA";
   oa.listenPort = 41001;
   oa.noUpnp = true;
-  oa.externalPort = oa.listenPort;
+  // Force rendezvous TCP reachability probe to fail so only UDP hole punching can succeed.
+  oa.externalPort = 51001;
 
   ChatBackend::Options ob;
   ob.serverHost = hp->host;
@@ -87,11 +88,13 @@ int main(int argc, char** argv) {
   ob.selfName = "smokeB";
   ob.listenPort = 41002;
   ob.noUpnp = true;
-  ob.externalPort = ob.listenPort;
+  // Force rendezvous TCP reachability probe to fail so only UDP hole punching can succeed.
+  ob.externalPort = 51002;
 
   QString idA;
   QString idB;
   std::atomic<bool> done{false};
+  std::atomic<bool> sawUdpConnect{false};
 
   auto maybeKick = [&] {
     if (idA.isEmpty() || idB.isEmpty()) return;
@@ -115,10 +118,22 @@ int main(int argc, char** argv) {
                      if (done.load()) return;
                      if (peerId != idA) return;
                      if (text != "hello over udp") return;
+                     if (!sawUdpConnect.load()) {
+                       std::cerr << "received message but did not observe UDP session\n";
+                       app.exit(2);
+                       return;
+                     }
                      done.store(true);
                      std::cout << "OK: received message over UDP session\n";
                      QTimer::singleShot(0, &app, [&] { app.exit(0); });
                    });
+
+  QObject::connect(&a, &ChatBackend::logLine, &app, [&](QString line) {
+    if (line.contains("peer connected (udp):")) sawUdpConnect.store(true);
+  });
+  QObject::connect(&b, &ChatBackend::logLine, &app, [&](QString line) {
+    if (line.contains("peer connected (udp):")) sawUdpConnect.store(true);
+  });
 
   QObject::connect(&a, &ChatBackend::deliveryError, &app, [&](QString, QString msg) {
     if (done.load()) return;
@@ -143,4 +158,3 @@ int main(int argc, char** argv) {
   b.stop();
   return rc;
 }
-

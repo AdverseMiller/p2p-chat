@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -44,7 +45,9 @@ struct FriendRequest {
 
 struct Registration {
   std::string id;
+  std::string raw_observed_ip;
   std::string observed_ip;
+  std::string udp_ip;
   uint16_t external_port = 0;
   uint16_t udp_port = 0;
   bool reachable = false;
@@ -108,7 +111,7 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
 class RendezvousServer {
  public:
   explicit RendezvousServer(boost::asio::io_context& io)
-      : io_(io), acceptor_(io), udp_socket_(io), cleanup_timer_(io) {}
+      : io_(io), acceptor_(io), udp_socket_(io), cleanup_timer_(io), public_ip_timer_(io) {}
 
   void listen(const tcp::endpoint& ep) {
     acceptor_.open(ep.protocol());
@@ -138,6 +141,7 @@ class RendezvousServer {
     acceptor_.close(ignored);
     udp_socket_.close(ignored);
     cleanup_timer_.cancel();
+    public_ip_timer_.cancel();
   }
 
   std::optional<Registration> get_registration(std::string_view id) {
@@ -145,6 +149,126 @@ class RendezvousServer {
     if (it == regs_.end()) return std::nullopt;
     if (is_expired(it->second)) return std::nullopt;
     return it->second;
+  }
+
+  std::string_view public_ip() const { return public_ip_; }
+
+  void ensure_public_ip_fresh(std::function<void()> on_done = {}) {
+    using namespace std::chrono;
+    const auto now = steady_clock::now();
+    if (on_done) public_ip_waiters_.push_back(std::move(on_done));
+    if (public_ip_fetching_) return;
+    if (!public_ip_.empty() && (now - public_ip_last_) < minutes(10)) {
+      auto self = this;
+      boost::asio::post(io_, [self] {
+        auto w = std::move(self->public_ip_waiters_);
+        self->public_ip_waiters_.clear();
+        for (auto& fn : w) {
+          if (fn) fn();
+        }
+      });
+      return;
+    }
+    public_ip_fetching_ = true;
+
+    auto resolver = std::make_shared<tcp::resolver>(io_);
+    auto sock = std::make_shared<tcp::socket>(io_);
+    auto buf = std::make_shared<boost::asio::streambuf>();
+    auto req = std::make_shared<std::string>(
+        "GET /ip HTTP/1.1\r\n"
+        "Host: ifconfig.me\r\n"
+        "User-Agent: p2p-chat-rendezvous\r\n"
+        "Connection: close\r\n"
+        "\r\n");
+
+    auto finish = [this, resolver, sock, buf, req](std::string ip) {
+      public_ip_fetching_ = false;
+      if (!ip.empty()) {
+        public_ip_ = std::move(ip);
+        public_ip_last_ = std::chrono::steady_clock::now();
+        common::log("public_ip: " + public_ip_);
+      } else if (public_ip_.empty()) {
+        common::log("public_ip: unavailable");
+      }
+      public_ip_timer_.cancel();
+      boost::system::error_code ignored;
+      sock->close(ignored);
+      resolver->cancel();
+
+      auto w = std::move(public_ip_waiters_);
+      public_ip_waiters_.clear();
+      for (auto& fn : w) {
+        if (fn) fn();
+      }
+    };
+
+    public_ip_timer_.expires_after(std::chrono::seconds(3));
+    public_ip_timer_.async_wait([sock](const boost::system::error_code& ec) {
+      if (ec) return;
+      boost::system::error_code ignored;
+      sock->close(ignored);
+    });
+
+    resolver->async_resolve("ifconfig.me", "80",
+                            [sock, buf, req, finish](const boost::system::error_code& ec,
+                                                    tcp::resolver::results_type results) mutable {
+                              if (ec) return finish({});
+                              boost::asio::async_connect(
+                                  *sock,
+                                  results,
+                                  [sock, buf, req, finish](const boost::system::error_code& ec2, const tcp::endpoint&) mutable {
+                                    if (ec2) return finish({});
+                                    boost::asio::async_write(
+                                        *sock,
+                                        boost::asio::buffer(*req),
+                                        [sock, buf, finish](const boost::system::error_code& ec3, std::size_t) mutable {
+                                          if (ec3) return finish({});
+                                          boost::asio::async_read(
+                                              *sock,
+                                              *buf,
+                                              boost::asio::transfer_all(),
+                                              [buf, finish](const boost::system::error_code& ec4, std::size_t) mutable {
+                                                // transfer_all completes with eof.
+                                                if (ec4 && ec4 != boost::asio::error::eof) return finish({});
+                                                std::istream is(buf.get());
+                                                std::string resp((std::istreambuf_iterator<char>(is)),
+                                                                 std::istreambuf_iterator<char>());
+                                                auto pos = resp.find("\r\n\r\n");
+                                                std::string body =
+                                                    (pos == std::string::npos) ? resp : resp.substr(pos + 4);
+                                                while (!body.empty() && (body.back() == '\n' || body.back() == '\r' ||
+                                                                         body.back() == ' ' || body.back() == '\t')) {
+                                                  body.pop_back();
+                                                }
+                                                while (!body.empty() && (body.front() == ' ' || body.front() == '\t' ||
+                                                                         body.front() == '\r' || body.front() == '\n')) {
+                                                  body.erase(body.begin());
+                                                }
+                                                const auto ws = body.find_first_of(" \t\r\n");
+                                                if (ws != std::string::npos) body.resize(ws);
+                                                boost::system::error_code ecip;
+                                                (void)boost::asio::ip::make_address_v4(body, ecip);
+                                                if (ecip) return finish({});
+                                                finish(body);
+                                              });
+                                        });
+                                  });
+                            });
+  }
+
+  std::string best_udp_ip_for(const Registration& target, std::string_view requester_observed_ip) {
+    std::string candidate = !target.udp_ip.empty() ? target.udp_ip : target.observed_ip;
+    if (candidate.empty()) return candidate;
+
+    if (!common::is_private_ipv4(candidate)) return candidate;
+
+    // If the requester appears to be on a private network too, prefer private discovery (LAN clients).
+    if (!requester_observed_ip.empty() && common::is_private_ipv4(requester_observed_ip)) return candidate;
+
+    // Public requester; hand out server public IP as a best-effort WAN contact IP.
+    ensure_public_ip_fresh();
+    if (!public_ip_.empty()) return public_ip_;
+    return candidate;
   }
 
   bool register_client(const std::shared_ptr<ClientSession>& session,
@@ -167,7 +291,13 @@ class RendezvousServer {
     }
 
     const auto remote_ep = session_remote_endpoint(session);
-    const std::string observed_ip = remote_ep ? remote_ep->address().to_string() : "unknown";
+    const std::string raw_ip = remote_ep ? remote_ep->address().to_string() : "unknown";
+    std::string observed_ip = raw_ip;
+    if (common::is_private_ipv4(raw_ip)) {
+      ensure_public_ip_fresh();
+      // Best-effort: if we already know our public IP, advertise it for local-LAN clients.
+      if (!public_ip_.empty()) observed_ip = public_ip_;
+    }
 
     const std::string final_id = std::move(id);
 
@@ -178,7 +308,9 @@ class RendezvousServer {
 
     Registration reg;
     reg.id = final_id;
+    reg.raw_observed_ip = raw_ip;
     reg.observed_ip = observed_ip;
+    reg.udp_ip = observed_ip;
     reg.external_port = reachable ? external_port : 0;
     reg.reachable = reachable;
     reg.last_seen = now;
@@ -186,6 +318,7 @@ class RendezvousServer {
 
     // If we already observed a UDP mapping for this ID, attach it.
     if (auto it = udp_seen_.find(final_id); it != udp_seen_.end()) {
+      reg.udp_ip = it->second.ip;
       reg.udp_port = it->second.port;
     }
     regs_[final_id] = reg;
@@ -198,6 +331,7 @@ class RendezvousServer {
     common::log("register id=" + final_id + " observed_ip=" + observed_ip +
                 " reachable=" + std::string(reachable ? "true" : "false") +
                 " external_port=" + std::to_string(reg.external_port) +
+                " udp_ip=" + reg.udp_ip +
                 " udp_port=" + std::to_string(reg.udp_port));
     (void)listen_port; // reserved for future (might be useful for diagnostics)
     return true;
@@ -272,6 +406,13 @@ class RendezvousServer {
       *out_error = "unknown or expired id";
       return false;
     }
+    // If this client was observed on a private LAN address but we now know our public IP, advertise the public IP.
+    if (common::is_private_ipv4(it->second.raw_observed_ip)) {
+      ensure_public_ip_fresh();
+      if (!public_ip_.empty()) {
+        it->second.observed_ip = public_ip_;
+      }
+    }
     it->second.last_seen = std::chrono::steady_clock::now();
     return true;
   }
@@ -295,7 +436,7 @@ class RendezvousServer {
 
     ConnectRequest req;
     req.from_id = std::move(from_id);
-    req.ip = from->observed_ip;
+    req.ip = from->udp_ip.empty() ? from->observed_ip : from->udp_ip;
     req.port = from->reachable ? from->external_port : 0;
     req.udp_port = from->udp_port;
     req.reachable = from->reachable;
@@ -345,12 +486,15 @@ class RendezvousServer {
     std::vector<ConnectRequest> out;
     out.reserve(it->second.size());
 
+    std::string_view requester_ip;
+    if (const auto to = get_registration(id)) requester_ip = to->observed_ip;
+
     for (auto& req : it->second) {
       const auto from = get_registration(req.from_id);
       if (!from) continue;
       ConnectRequest live;
       live.from_id = from->id;
-      live.ip = from->observed_ip;
+      live.ip = best_udp_ip_for(*from, requester_ip);
       live.port = from->reachable ? from->external_port : 0;
       live.udp_port = from->udp_port;
       live.reachable = from->reachable;
@@ -440,6 +584,11 @@ class RendezvousServer {
   tcp::acceptor acceptor_;
   udp::socket udp_socket_;
   boost::asio::steady_timer cleanup_timer_;
+  boost::asio::steady_timer public_ip_timer_;
+  std::string public_ip_;
+  std::chrono::steady_clock::time_point public_ip_last_{};
+  bool public_ip_fetching_ = false;
+  std::vector<std::function<void()>> public_ip_waiters_;
 
   struct UdpSeen {
     std::string ip;
@@ -488,10 +637,29 @@ class RendezvousServer {
             seen.ip = remote->address().to_string();
             seen.port = remote->port();
             seen.last_seen = std::chrono::steady_clock::now();
+            if (common::is_private_ipv4(seen.ip)) ensure_public_ip_fresh();
+            {
+              const auto it_prev = udp_seen_.find(id);
+              const bool first = (it_prev == udp_seen_.end());
+              const bool changed = !first && (it_prev->second.ip != seen.ip || it_prev->second.port != seen.port);
+              if (first || changed) {
+                common::log("udp_announce id=" + id + " from " + seen.ip + ":" + std::to_string(seen.port));
+              }
+            }
             udp_seen_[id] = seen;
             if (auto it = regs_.find(id); it != regs_.end()) {
+              it->second.udp_ip = seen.ip;
               it->second.udp_port = seen.port;
               it->second.last_seen = std::chrono::steady_clock::now();
+            }
+
+            // Best-effort ack so clients can warn when UDP to rendezvous is blocked.
+            json okj;
+            okj["type"] = "udp_announce_ok";
+            if (auto framed = common::frame_json_bytes(okj)) {
+              auto out = std::make_shared<std::vector<uint8_t>>(std::move(*framed));
+              udp_socket_.async_send_to(boost::asio::buffer(*out), *remote,
+                                        [out](const boost::system::error_code&, std::size_t) {});
             }
           }
 
@@ -626,31 +794,47 @@ void ClientSession::handle_message(const json& msg) {
     auto self = shared_from_this();
     const auto pa = *pending_auth_;
     pending_auth_.reset();
-    server_.probe_reachability(pa.id, observed_ip_, pa.external_port_hint, [self, pa](bool reachable) mutable {
-      std::string final_id;
-      std::string observed_ip;
-      bool out_reachable = false;
-      uint16_t out_ext_port = 0;
-      std::string err;
 
-      const bool ok = self->server_.register_client(self,
-                                                    pa.id,
-                                                    pa.listen_port,
-                                                    pa.external_port_hint,
-                                                    reachable,
-                                                    &final_id,
-                                                    &observed_ip,
-                                                    &out_reachable,
-                                                    &out_ext_port,
-                                                    &err);
-      if (!ok) {
-        self->send_error(err);
-        return;
+    auto do_probe_and_register = [self, pa]() mutable {
+      std::string probe_ip = self->observed_ip_;
+      if (common::is_private_ipv4(probe_ip) && !self->server_.public_ip().empty()) {
+        // Per user preference: treat local-LAN clients as using the server's public IP for reachability probing.
+        probe_ip = std::string(self->server_.public_ip());
       }
-      self->id_ = final_id;
-      self->listen_port_ = pa.listen_port;
-      self->send_register_ok();
-    });
+
+      self->server_.probe_reachability(pa.id, probe_ip, pa.external_port_hint, [self, pa](bool reachable) mutable {
+        std::string final_id;
+        std::string observed_ip;
+        bool out_reachable = false;
+        uint16_t out_ext_port = 0;
+        std::string err;
+
+        const bool ok = self->server_.register_client(self,
+                                                      pa.id,
+                                                      pa.listen_port,
+                                                      pa.external_port_hint,
+                                                      reachable,
+                                                      &final_id,
+                                                      &observed_ip,
+                                                      &out_reachable,
+                                                      &out_ext_port,
+                                                      &err);
+        if (!ok) {
+          self->send_error(err);
+          return;
+        }
+        self->id_ = final_id;
+        self->listen_port_ = pa.listen_port;
+        self->send_register_ok();
+      });
+    };
+
+    if (common::is_private_ipv4(observed_ip_) && self->server_.public_ip().empty()) {
+      // Try to learn the server's public IP before finalizing registration so observed_ip can be rewritten.
+      self->server_.ensure_public_ip_fresh(std::move(do_probe_and_register));
+    } else {
+      do_probe_and_register();
+    }
     return;
   }
 
@@ -688,6 +872,7 @@ void ClientSession::handle_message(const json& msg) {
       resp["ip"] = "";
       resp["port"] = 0;
       resp["udp_port"] = 0;
+      resp["udp_ip"] = "";
       resp["reachable"] = false;
     } else {
       resp["ok"] = true;
@@ -695,6 +880,7 @@ void ClientSession::handle_message(const json& msg) {
       resp["reachable"] = reg->reachable;
       resp["port"] = reg->reachable ? reg->external_port : 0;
       resp["udp_port"] = reg->udp_port;
+      resp["udp_ip"] = server_.best_udp_ip_for(*reg, observed_ip_);
     }
     common::log("lookup target_id=" + target_id + " ok=" +
                 std::string(resp["ok"].get<bool>() ? "true" : "false"));
@@ -831,6 +1017,7 @@ void ClientSession::send_register_ok() {
   resp["observed_ip"] = reg->observed_ip;
   resp["reachable"] = reg->reachable;
   resp["external_port"] = reg->external_port;
+  resp["udp_ip"] = reg->udp_ip;
   resp["udp_port"] = reg->udp_port;
   send(std::move(resp));
 }
