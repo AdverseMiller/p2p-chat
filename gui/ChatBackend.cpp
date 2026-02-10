@@ -455,6 +455,7 @@ public:
     uint16_t listen_port = 0;
     uint16_t external_port_hint = 0;
     std::function<std::string(std::string_view)> sign_challenge;
+    std::function<void(std::string)> log;
   };
 
   struct LookupResult {
@@ -476,7 +477,8 @@ public:
         socket_(io),
         resolver_(io),
         heartbeat_timer_(io),
-        poll_timer_(io) {}
+        poll_timer_(io),
+        reconnect_timer_(io) {}
 
   void start(std::function<void()> on_registered,
              OnConnectRequest on_connect_request,
@@ -486,13 +488,7 @@ public:
     on_connect_request_ = std::move(on_connect_request);
     on_friend_request_ = std::move(on_friend_request);
     on_friend_accept_ = std::move(on_friend_accept);
-
-    auto self = shared_from_this();
-    resolver_.async_resolve(cfg_.server_host, std::to_string(cfg_.server_port),
-                            [self](const boost::system::error_code& ec, tcp::resolver::results_type results) {
-                              if (ec) return self->stop();
-                              self->connect(results);
-                            });
+    schedule_reconnect(/*immediate*/ true);
   }
 
   void stop() {
@@ -500,6 +496,7 @@ public:
     boost::system::error_code ignored;
     heartbeat_timer_.cancel();
     poll_timer_.cancel();
+    reconnect_timer_.cancel();
     socket_.shutdown(tcp::socket::shutdown_both, ignored);
     socket_.close(ignored);
   }
@@ -511,48 +508,130 @@ public:
 
   void enable_polling(bool enabled) {
     polling_enabled_ = enabled;
-    if (polling_enabled_) schedule_poll();
+    if (!polling_enabled_) {
+      poll_timer_.cancel();
+      return;
+    }
+    if (can_send()) schedule_poll();
   }
 
   void send_lookup(std::string target_id, OnLookup cb) {
     pending_lookups_.push_back({std::move(target_id), std::move(cb)});
-    json j;
-    j["type"] = "lookup";
-    j["from_id"] = id_;
-    j["target_id"] = pending_lookups_.back().target_id;
-    writer_->send(std::move(j));
+    const std::string tid = pending_lookups_.back().target_id;
+    enqueue_or_send([this, tid] {
+      json j;
+      j["type"] = "lookup";
+      j["from_id"] = id_;
+      j["target_id"] = tid;
+      writer_->send(std::move(j));
+    });
   }
 
   void send_connect_request(const std::string& to_id) {
-    json j;
-    j["type"] = "connect_request";
-    j["from_id"] = id_;
-    j["to_id"] = to_id;
-    writer_->send(std::move(j));
+    enqueue_or_send([this, to_id] {
+      json j;
+      j["type"] = "connect_request";
+      j["from_id"] = id_;
+      j["to_id"] = to_id;
+      writer_->send(std::move(j));
+    });
   }
 
   void send_friend_request(const std::string& to_id, std::string intro) {
-    json j;
-    j["type"] = "friend_request";
-    j["from_id"] = id_;
-    j["to_id"] = to_id;
-    j["intro"] = std::move(intro);
-    writer_->send(std::move(j));
+    enqueue_or_send([this, to_id, intro = std::move(intro)]() mutable {
+      json j;
+      j["type"] = "friend_request";
+      j["from_id"] = id_;
+      j["to_id"] = to_id;
+      j["intro"] = std::move(intro);
+      writer_->send(std::move(j));
+    });
   }
 
   void send_friend_accept(const std::string& requester_id) {
-    json j;
-    j["type"] = "friend_accept";
-    j["from_id"] = id_;
-    j["to_id"] = requester_id;
-    writer_->send(std::move(j));
+    enqueue_or_send([this, requester_id] {
+      json j;
+      j["type"] = "friend_accept";
+      j["from_id"] = id_;
+      j["to_id"] = requester_id;
+      writer_->send(std::move(j));
+    });
   }
 
 private:
+  bool can_send() const { return writer_ && socket_.is_open() && !id_.empty() && !stopped_; }
+
+  void log(std::string msg) {
+    if (cfg_.log) {
+      cfg_.log(std::move(msg));
+      return;
+    }
+    common::log(msg);
+  }
+
+  void enqueue_or_send(std::function<void()> fn) {
+    if (can_send()) {
+      fn();
+      return;
+    }
+    pending_actions_.push_back(std::move(fn));
+  }
+
+  void flush_pending() {
+    while (can_send() && !pending_actions_.empty()) {
+      auto fn = std::move(pending_actions_.front());
+      pending_actions_.pop_front();
+      fn();
+    }
+  }
+
   struct PendingLookup {
     std::string target_id;
     OnLookup cb;
   };
+
+  void schedule_reconnect(bool immediate) {
+    if (stopped_) return;
+
+    boost::system::error_code ignored;
+    resolver_.cancel();
+    heartbeat_timer_.cancel();
+    poll_timer_.cancel();
+    socket_.shutdown(tcp::socket::shutdown_both, ignored);
+    socket_.close(ignored);
+    writer_.reset();
+
+    id_.clear();
+    observed_ip_.clear();
+    reachable_ = false;
+    external_port_ = 0;
+
+    const int delay = immediate ? 0 : reconnect_backoff_secs_;
+    reconnect_backoff_secs_ = std::min(reconnect_backoff_secs_ * 2, 30);
+
+    if (delay == 0) {
+      log("rendezvous: connecting…");
+    } else {
+      log("rendezvous: reconnecting in " + std::to_string(delay) + "s…");
+    }
+
+    reconnect_timer_.expires_after(std::chrono::seconds(delay));
+    auto self = shared_from_this();
+    reconnect_timer_.async_wait([self](const boost::system::error_code& ec) {
+      if (ec || self->stopped_) return;
+      self->do_resolve();
+    });
+  }
+
+  void do_resolve() {
+    if (stopped_) return;
+    auto self = shared_from_this();
+    resolver_.async_resolve(cfg_.server_host, std::to_string(cfg_.server_port),
+                            [self](const boost::system::error_code& ec, tcp::resolver::results_type results) {
+                              if (ec || self->stopped_) return self->schedule_reconnect(false);
+                              self->connect(results);
+                            });
+  }
 
   void connect(const tcp::resolver::results_type& results) {
     auto self = shared_from_this();
@@ -560,14 +639,15 @@ private:
     timer->expires_after(kConnectTimeout);
     timer->async_wait([self](const boost::system::error_code& ec) {
       if (ec) return;
-      self->stop();
+      self->schedule_reconnect(false);
     });
 
     boost::asio::async_connect(socket_, results,
                                [self, timer](const boost::system::error_code& ec, const tcp::endpoint&) {
                                  timer->cancel();
-                                 if (ec) return self->stop();
+                                 if (ec) return self->schedule_reconnect(false);
                                  self->writer_ = std::make_shared<common::JsonWriteQueue<tcp::socket>>(self->socket_);
+                                 self->reconnect_backoff_secs_ = 1;
                                  self->send_register_init();
                                  self->read_loop();
                                });
@@ -583,10 +663,12 @@ private:
   }
 
   void schedule_heartbeat() {
+    if (!can_send()) return;
     heartbeat_timer_.expires_after(kHeartbeatInterval);
     auto self = shared_from_this();
     heartbeat_timer_.async_wait([self](const boost::system::error_code& ec) {
       if (ec || self->stopped_) return;
+      if (!self->can_send()) return;
       json hb;
       hb["type"] = "heartbeat";
       hb["id"] = self->id_;
@@ -596,10 +678,12 @@ private:
   }
 
   void schedule_poll() {
+    if (!polling_enabled_ || !can_send()) return;
     poll_timer_.expires_after(kPollInterval);
     auto self = shared_from_this();
     poll_timer_.async_wait([self](const boost::system::error_code& ec) {
       if (ec || self->stopped_ || !self->polling_enabled_) return;
+      if (!self->can_send()) return;
       json p;
       p["type"] = "poll";
       p["id"] = self->id_;
@@ -611,7 +695,7 @@ private:
   void read_loop() {
     auto self = shared_from_this();
     common::async_read_json(socket_, common::kMaxFrameSize, [self](const boost::system::error_code& ec, json j) {
-      if (ec) return self->stop();
+      if (ec) return self->schedule_reconnect(false);
       self->handle_message(j);
       self->read_loop();
     });
@@ -631,6 +715,7 @@ private:
       fin["type"] = "register_finish";
       fin["id"] = cfg_.id;
       fin["signature"] = sig;
+      if (!writer_) return schedule_reconnect(false);
       writer_->send(std::move(fin));
       return;
     }
@@ -644,6 +729,8 @@ private:
                            ? static_cast<uint16_t>(j["external_port"].get<int>())
                            : 0;
       schedule_heartbeat();
+      if (polling_enabled_) schedule_poll();
+      flush_pending();
       if (on_registered_) on_registered_();
       return;
     }
@@ -711,6 +798,7 @@ private:
 
   boost::asio::steady_timer heartbeat_timer_;
   boost::asio::steady_timer poll_timer_;
+  boost::asio::steady_timer reconnect_timer_;
   bool polling_enabled_ = false;
   bool stopped_ = false;
 
@@ -718,8 +806,10 @@ private:
   std::string observed_ip_;
   bool reachable_ = false;
   uint16_t external_port_ = 0;
+  int reconnect_backoff_secs_ = 1;
 
   std::vector<PendingLookup> pending_lookups_;
+  std::deque<std::function<void()>> pending_actions_;
   std::function<void()> on_registered_;
   OnConnectRequest on_connect_request_;
   OnFriendRequest on_friend_request_;
