@@ -32,6 +32,7 @@ private:
 
   void addFriendDialog();
   void showChatContextMenu(const QPoint& pos);
+  void showProfilePopup(const QString& peerId);
   void clearChatFor(const QString& peerId);
   void removeFriend(const QString& peerId);
 

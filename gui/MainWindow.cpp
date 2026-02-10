@@ -411,6 +411,8 @@ void MainWindow::showChatContextMenu(const QPoint& pos) {
   if (peerId.isEmpty()) return;
 
   QMenu menu(this);
+  auto* profile = menu.addAction("View profile…");
+  menu.addSeparator();
   auto* clearChat = menu.addAction("Clear chat history");
   auto* unfriend = menu.addAction("Unfriend / Remove");
 
@@ -423,6 +425,10 @@ void MainWindow::showChatContextMenu(const QPoint& pos) {
 
   auto* chosen = menu.exec(friendList_->viewport()->mapToGlobal(pos));
   if (!chosen) return;
+  if (chosen == profile) {
+    showProfilePopup(peerId);
+    return;
+  }
   if (chosen == clearChat) {
     clearChatFor(peerId);
     return;
@@ -431,6 +437,61 @@ void MainWindow::showChatContextMenu(const QPoint& pos) {
     removeFriend(peerId);
     return;
   }
+}
+
+void MainWindow::showProfilePopup(const QString& peerId) {
+  const auto* f = profile_.findFriend(peerId);
+  const auto display = f ? friendDisplay(*f) : (peerId.left(14) + "...");
+
+  QDialog dlg(this);
+  dlg.setWindowTitle("Profile");
+  QVBoxLayout root(&dlg);
+  root.setContentsMargins(10, 10, 10, 10);
+
+  QLabel title(display, &dlg);
+  title.setStyleSheet("font-weight:600; font-size:15px;");
+  root.addWidget(&title);
+
+  QFormLayout form;
+
+  QLabel nameLabel(f ? f->name : QString(), &dlg);
+  form.addRow("Name:", &nameLabel);
+
+  QLabel aliasLabel(f ? f->alias : QString(), &dlg);
+  form.addRow("Alias:", &aliasLabel);
+
+  QLabel statusLabel(f ? Profile::statusToString(f->status) : QString("unknown"), &dlg);
+  form.addRow("Status:", &statusLabel);
+
+  QLineEdit idEdit(&dlg);
+  idEdit.setReadOnly(true);
+  idEdit.setText(peerId);
+  QPushButton copyBtn("Copy", &dlg);
+  auto* idRow = new QWidget(&dlg);
+  auto* idRowLayout = new QHBoxLayout(idRow);
+  idRowLayout->setContentsMargins(0, 0, 0, 0);
+  idRowLayout->addWidget(&idEdit, 1);
+  idRowLayout->addWidget(&copyBtn);
+  form.addRow("Public key:", idRow);
+
+  if (f && !f->lastIntro.isEmpty()) {
+    QLabel introLabel(f->lastIntro, &dlg);
+    introLabel.setWordWrap(true);
+    form.addRow("Intro:", &introLabel);
+  }
+
+  root.addLayout(&form);
+
+  connect(&copyBtn, &QPushButton::clicked, this, [peerId] {
+    QGuiApplication::clipboard()->setText(peerId);
+  });
+
+  QDialogButtonBox buttons(QDialogButtonBox::Close);
+  connect(&buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+  connect(&buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+  root.addWidget(&buttons);
+
+  dlg.exec();
 }
 
 void MainWindow::clearChatFor(const QString& peerId) {
@@ -514,7 +575,7 @@ void MainWindow::refreshHeader() {
   }
   const auto* f = profile_.findFriend(selectedPeerId_);
   const auto title = f ? friendDisplay(*f) : selectedPeerId_.left(14) + "...";
-  headerLabel_->setText(title + "  (" + selectedPeerId_.left(10) + "…)");
+  headerLabel_->setText(title);
 }
 
 void MainWindow::addFriendDialog() {

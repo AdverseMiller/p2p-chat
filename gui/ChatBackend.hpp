@@ -30,6 +30,7 @@ public:
   void acceptFriend(const QString& peerId);
   void sendMessage(const QString& peerId, const QString& text);
   void disconnectPeer(const QString& peerId);
+  void warmConnect(const QString& peerId);
 
   void setFriendAccepted(const QString& peerId, bool accepted);
 

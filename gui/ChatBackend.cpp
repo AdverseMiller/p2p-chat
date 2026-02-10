@@ -992,7 +992,7 @@ struct ChatBackend::Impl {
         });
   }
 
-  void connectToPeer(const std::string& peer_id, const std::string& ip, uint16_t port) {
+  void connectToPeer(const std::string& peer_id, const std::string& ip, uint16_t port, bool silent) {
     if (active_peer) return;
     auto sock = std::make_shared<tcp::socket>(io);
     auto timer = std::make_shared<boost::asio::steady_timer>(io);
@@ -1008,12 +1008,14 @@ struct ChatBackend::Impl {
     if (ec) return;
     tcp::endpoint ep(addr, port);
 
-    sock->async_connect(ep, [this, sock, timer, peer_id](const boost::system::error_code& ec2) {
+    sock->async_connect(ep, [this, sock, timer, peer_id, silent](const boost::system::error_code& ec2) {
       timer->cancel();
       if (ec2) {
-        postToQt([this, peer_id] {
-          emit q->deliveryError(QString::fromStdString(peer_id), "connect failed");
-        });
+        if (!silent) {
+          postToQt([this, peer_id] {
+            emit q->deliveryError(QString::fromStdString(peer_id), "connect failed");
+          });
+        }
         return;
       }
       startPeerInitiator(std::move(*sock), peer_id);
@@ -1060,29 +1062,33 @@ struct ChatBackend::Impl {
         });
   }
 
-  void attemptDelivery(const std::string& peer_id) {
+  void attemptDelivery(const std::string& peer_id, bool silent) {
     if (!rendezvous) return;
     if (active_peer) return;
     if (!isAccepted(peer_id)) return;
 
-    rendezvous->send_lookup(peer_id, [this](RendezvousClient::LookupResult r) {
+    rendezvous->send_lookup(peer_id, [this, silent](RendezvousClient::LookupResult r) {
       if (!r.ok) {
-        postToQt([this, tid = r.target_id] {
-          emit q->deliveryError(QString::fromStdString(tid), "lookup failed (offline?)");
-        });
+        if (!silent) {
+          postToQt([this, tid = r.target_id] {
+            emit q->deliveryError(QString::fromStdString(tid), "lookup failed (offline?)");
+          });
+        }
         return;
       }
       if (r.reachable && r.port != 0) {
-        connectToPeer(r.target_id, r.ip, r.port);
+        connectToPeer(r.target_id, r.ip, r.port, silent);
         return;
       }
       if (rendezvous->reachable()) {
         rendezvous->send_connect_request(r.target_id);
         return;
       }
-      postToQt([this, tid = r.target_id] {
-        emit q->deliveryError(QString::fromStdString(tid), "both unreachable; cannot connect");
-      });
+      if (!silent) {
+        postToQt([this, tid = r.target_id] {
+          emit q->deliveryError(QString::fromStdString(tid), "both unreachable; cannot connect");
+        });
+      }
     });
   }
 };
@@ -1144,7 +1150,7 @@ void ChatBackend::start(const Options& opt) {
         if (impl_->rendezvous && impl_->rendezvous->reachable()) return;
         if (!impl_->isAccepted(req.from_id)) return;
         if (impl_->active_peer) return; // queueing could be added later
-        impl_->connectToPeer(req.from_id, req.ip, req.port);
+        impl_->connectToPeer(req.from_id, req.ip, req.port, /*silent*/ false);
       },
       [this](const std::string& from_id, const std::string& intro) {
         emit friendRequestReceived(QString::fromStdString(from_id), QString::fromStdString(intro));
@@ -1194,6 +1200,8 @@ void ChatBackend::acceptFriend(const QString& peerId) {
   boost::asio::post(impl_->io, [impl = impl_, pid] {
     if (!impl->rendezvous) return;
     impl->rendezvous->send_friend_accept(pid);
+    // Best-effort: establish a direct connection so we can learn peer name quickly (P2P).
+    impl->attemptDelivery(pid, /*silent*/ true);
   });
 }
 
@@ -1212,7 +1220,7 @@ void ChatBackend::sendMessage(const QString& peerId, const QString& text) {
       impl->flushOutgoing(pid);
       return;
     }
-    impl->attemptDelivery(pid);
+    impl->attemptDelivery(pid, /*silent*/ false);
   });
 }
 
@@ -1222,5 +1230,15 @@ void ChatBackend::disconnectPeer(const QString& peerId) {
     if (!impl->active_peer) return;
     if (std::string(impl->active_peer->peer_id()) != pid) return;
     impl->active_peer->close();
+  });
+}
+
+void ChatBackend::warmConnect(const QString& peerId) {
+  const auto pid = peerId.toStdString();
+  boost::asio::post(impl_->io, [impl = impl_, pid] {
+    if (!impl->rendezvous) return;
+    if (!impl->isAccepted(pid)) return;
+    if (impl->active_peer) return;
+    impl->attemptDelivery(pid, /*silent*/ true);
   });
 }
