@@ -493,51 +493,51 @@ void MainWindow::showProfilePopup(const QString& peerId) {
 
   QDialog dlg(this);
   dlg.setWindowTitle("Profile");
-  QVBoxLayout root(&dlg);
-  root.setContentsMargins(10, 10, 10, 10);
+  auto* root = new QVBoxLayout(&dlg);
+  root->setContentsMargins(10, 10, 10, 10);
 
-  QLabel title(display, &dlg);
-  title.setStyleSheet("font-weight:600; font-size:15px;");
-  root.addWidget(&title);
+  auto* title = new QLabel(display, &dlg);
+  title->setStyleSheet("font-weight:600; font-size:15px;");
+  root->addWidget(title);
 
-  QFormLayout form;
+  auto* form = new QFormLayout();
 
-  QLabel nameLabel(f ? f->name : QString(), &dlg);
-  form.addRow("Name:", &nameLabel);
+  auto* nameLabel = new QLabel(f ? f->name : QString(), &dlg);
+  form->addRow("Name:", nameLabel);
 
-  QLabel aliasLabel(f ? f->alias : QString(), &dlg);
-  form.addRow("Alias:", &aliasLabel);
+  auto* aliasLabel = new QLabel(f ? f->alias : QString(), &dlg);
+  form->addRow("Alias:", aliasLabel);
 
-  QLabel statusLabel(f ? Profile::statusToString(f->status) : QString("unknown"), &dlg);
-  form.addRow("Status:", &statusLabel);
+  auto* statusLabel = new QLabel(f ? Profile::statusToString(f->status) : QString("unknown"), &dlg);
+  form->addRow("Status:", statusLabel);
 
-  QLineEdit idEdit(&dlg);
-  idEdit.setReadOnly(true);
-  idEdit.setText(peerId);
-  QPushButton copyBtn("Copy", &dlg);
   auto* idRow = new QWidget(&dlg);
   auto* idRowLayout = new QHBoxLayout(idRow);
   idRowLayout->setContentsMargins(0, 0, 0, 0);
-  idRowLayout->addWidget(&idEdit, 1);
-  idRowLayout->addWidget(&copyBtn);
-  form.addRow("Public key:", idRow);
+  auto* idEdit = new QLineEdit(idRow);
+  idEdit->setReadOnly(true);
+  idEdit->setText(peerId);
+  auto* copyBtn = new QPushButton("Copy", idRow);
+  idRowLayout->addWidget(idEdit, 1);
+  idRowLayout->addWidget(copyBtn);
+  form->addRow("Public key:", idRow);
 
   if (f && !f->lastIntro.isEmpty()) {
-    QLabel introLabel(f->lastIntro, &dlg);
-    introLabel.setWordWrap(true);
-    form.addRow("Intro:", &introLabel);
+    auto* introLabel = new QLabel(f->lastIntro, &dlg);
+    introLabel->setWordWrap(true);
+    form->addRow("Intro:", introLabel);
   }
 
-  root.addLayout(&form);
+  root->addLayout(form);
 
-  connect(&copyBtn, &QPushButton::clicked, this, [peerId] {
+  connect(copyBtn, &QPushButton::clicked, this, [peerId] {
     QGuiApplication::clipboard()->setText(peerId);
   });
 
-  QDialogButtonBox buttons(QDialogButtonBox::Close);
-  connect(&buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
-  connect(&buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
-  root.addWidget(&buttons);
+  auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dlg);
+  connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+  connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+  root->addWidget(buttons);
 
   dlg.exec();
 }
