@@ -63,13 +63,9 @@ jobs:
           cp /mingw64/bin/libboost_system*.dll dist/ 2>/dev/null || true
           cp /mingw64/bin/libminiupnpc*.dll dist/ 2>/dev/null || true
 
-      - name: Archive
-        shell: pwsh
-        run: |
-          Compress-Archive -Path dist\* -DestinationPath p2p_chat_gui-windows.zip -Force
-
       - uses: actions/upload-artifact@v4
         with:
           name: p2p_chat_gui-windows
-          path: p2p_chat_gui-windows.zip
-
+          # Upload the folder directly; GitHub will produce a standard ZIP for download.
+          # This avoids nested ZIPs and any unzip tool confusion about encryption.
+          path: dist/**
