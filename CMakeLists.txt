@@ -53,18 +53,17 @@ endif()
 
 find_package(Qt6 QUIET COMPONENTS Widgets)
 
-add_executable(rendezvous_server rendezvous_server.cpp)
-target_include_directories(rendezvous_server PRIVATE .)
-target_link_libraries(rendezvous_server PRIVATE Boost::system OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
-p2pchat_max_perf(rendezvous_server)
-p2pchat_small_binary(rendezvous_server)
-if(WIN32)
-  target_link_libraries(rendezvous_server PRIVATE ws2_32 mswsock)
-endif()
-if(MINIUPNPC_FOUND)
-  target_compile_definitions(rendezvous_server PRIVATE HAVE_UPNP)
-  target_include_directories(rendezvous_server PRIVATE ${MINIUPNPC_INCLUDE_DIRS})
-  target_link_libraries(rendezvous_server PRIVATE ${MINIUPNPC_LIBRARIES})
+if(NOT WIN32)
+  add_executable(rendezvous_server rendezvous_server.cpp)
+  target_include_directories(rendezvous_server PRIVATE .)
+  target_link_libraries(rendezvous_server PRIVATE Boost::system OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+  p2pchat_max_perf(rendezvous_server)
+  p2pchat_small_binary(rendezvous_server)
+  if(MINIUPNPC_FOUND)
+    target_compile_definitions(rendezvous_server PRIVATE HAVE_UPNP)
+    target_include_directories(rendezvous_server PRIVATE ${MINIUPNPC_INCLUDE_DIRS})
+    target_link_libraries(rendezvous_server PRIVATE ${MINIUPNPC_LIBRARIES})
+  endif()
 endif()
 
 if(UNIX)
@@ -103,17 +102,16 @@ if(Qt6_FOUND)
     target_link_libraries(p2p_chat_gui PRIVATE ${MINIUPNPC_LIBRARIES})
   endif()
 
-  add_executable(udp_smoke
-    smoke/udp_smoke.cpp
-    gui/ChatBackend.cpp
-    gui/ChatBackend.hpp
-    gui/Profile.cpp
-    gui/Profile.hpp
-  )
-  target_include_directories(udp_smoke PRIVATE .)
-  target_link_libraries(udp_smoke PRIVATE Qt6::Core Boost::system OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
-  if(WIN32)
-    target_link_libraries(udp_smoke PRIVATE ws2_32 mswsock)
+  if(NOT WIN32)
+    add_executable(udp_smoke
+      smoke/udp_smoke.cpp
+      gui/ChatBackend.cpp
+      gui/ChatBackend.hpp
+      gui/Profile.cpp
+      gui/Profile.hpp
+    )
+    target_include_directories(udp_smoke PRIVATE .)
+    target_link_libraries(udp_smoke PRIVATE Qt6::Core Boost::system OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
   endif()
 else()
   message(STATUS "Qt6 not found; p2p_chat_gui target will not be built.")
