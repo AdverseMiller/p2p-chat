@@ -2,6 +2,7 @@
 
 #include <QAction>
 #include <QApplication>
+#include <QClipboard>
 #include <QDateTime>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -16,6 +17,7 @@
 #include <QPushButton>
 #include <QStatusBar>
 #include <QSplitter>
+#include <QTabWidget>
 #include <QTextBrowser>
 #include <QVBoxLayout>
 
@@ -48,6 +50,8 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 
   connect(&backend_, &ChatBackend::registered, this,
           [this](QString selfId, bool reachable, QString observedIp, quint16 externalPort) {
+            selfId_ = selfId;
+            if (myIdEdit_) myIdEdit_->setText(selfId_);
             setWindowTitle(QString("p2p_chat_gui - %1").arg(selfId.left(12)));
             statusBar()->showMessage(QString("Reachable: %1  Observed: %2  External port: %3")
                                          .arg(reachable ? "true" : "false")
@@ -67,18 +71,9 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
             profile_.upsertFriend(e);
             saveProfile();
             rebuildFriendList();
+            rebuildFriendsTab();
 
-            const auto text = intro.isEmpty() ? QString("Friend request from %1").arg(fromId)
-                                              : QString("Friend request from %1:\n%2").arg(fromId, intro);
-            const auto r = QMessageBox::question(this, "Friend request", text, QMessageBox::Yes | QMessageBox::No);
-            if (r == QMessageBox::Yes) {
-              backend_.acceptFriend(fromId);
-              auto* f2 = profile_.findFriend(fromId);
-              if (f2) f2->status = Profile::FriendStatus::Accepted;
-              saveProfile();
-              rebuildFriendList();
-              backend_.setFriendAccepted(fromId, true);
-            }
+            statusBar()->showMessage(QString("Friend request from %1").arg(fromId.left(12)), 8000);
           });
 
   connect(&backend_, &ChatBackend::friendAccepted, this, [this](QString peerId) {
@@ -93,6 +88,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     }
     saveProfile();
     rebuildFriendList();
+    rebuildFriendsTab();
     backend_.setFriendAccepted(peerId, true);
   });
 
@@ -122,6 +118,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   }
 
   rebuildFriendList();
+  rebuildFriendsTab();
   refreshHeader();
 }
 
@@ -158,8 +155,114 @@ void MainWindow::buildUi() {
 
   auto* splitter = new QSplitter(this);
 
-  friendList_ = new QListWidget(splitter);
-  friendList_->setMinimumWidth(200);
+  leftTabs_ = new QTabWidget(splitter);
+  leftTabs_->setMinimumWidth(260);
+
+  friendList_ = new QListWidget(leftTabs_);
+  leftTabs_->addTab(friendList_, "Chats");
+
+  // Friends tab
+  auto* friendsTab = new QWidget(leftTabs_);
+  auto* friendsLayout = new QVBoxLayout(friendsTab);
+  friendsLayout->setContentsMargins(8, 8, 8, 8);
+
+  auto* idLabel = new QLabel("Your ID (share this):", friendsTab);
+  friendsLayout->addWidget(idLabel);
+
+  auto* idRow = new QWidget(friendsTab);
+  auto* idRowLayout = new QHBoxLayout(idRow);
+  idRowLayout->setContentsMargins(0, 0, 0, 0);
+  myIdEdit_ = new QLineEdit(idRow);
+  myIdEdit_->setReadOnly(true);
+  myIdEdit_->setPlaceholderText("Connecting…");
+  copyIdBtn_ = new QPushButton("Copy", idRow);
+  idRowLayout->addWidget(myIdEdit_, 1);
+  idRowLayout->addWidget(copyIdBtn_);
+  friendsLayout->addWidget(idRow);
+
+  connect(copyIdBtn_, &QPushButton::clicked, this, [this] {
+    if (!myIdEdit_) return;
+    QGuiApplication::clipboard()->setText(myIdEdit_->text());
+    statusBar()->showMessage("Copied ID to clipboard", 3000);
+  });
+
+  friendsLayout->addSpacing(10);
+
+  auto* addLabel = new QLabel("Send friend request:", friendsTab);
+  friendsLayout->addWidget(addLabel);
+
+  addIdEdit_ = new QLineEdit(friendsTab);
+  addIdEdit_->setPlaceholderText("Friend ID");
+  friendsLayout->addWidget(addIdEdit_);
+
+  addIntroEdit_ = new QLineEdit(friendsTab);
+  addIntroEdit_->setPlaceholderText("Intro (optional)");
+  friendsLayout->addWidget(addIntroEdit_);
+
+  sendReqBtn_ = new QPushButton("Send Request", friendsTab);
+  friendsLayout->addWidget(sendReqBtn_);
+  connect(sendReqBtn_, &QPushButton::clicked, this, [this] {
+    const auto id = addIdEdit_->text().trimmed();
+    if (id.isEmpty()) return;
+    Profile::FriendEntry e;
+    auto* ex = profile_.findFriend(id);
+    if (ex) e = *ex;
+    e.id = id;
+    if (e.status == Profile::FriendStatus::None) e.status = Profile::FriendStatus::OutgoingPending;
+    profile_.upsertFriend(e);
+    saveProfile();
+    rebuildFriendList();
+    rebuildFriendsTab();
+    backend_.sendFriendRequest(id, addIntroEdit_->text().trimmed());
+    statusBar()->showMessage("Friend request sent", 5000);
+  });
+
+  friendsLayout->addSpacing(10);
+
+  auto* reqLabel = new QLabel("Incoming requests:", friendsTab);
+  friendsLayout->addWidget(reqLabel);
+  requestsList_ = new QListWidget(friendsTab);
+  friendsLayout->addWidget(requestsList_, 1);
+
+  auto* reqBtns = new QWidget(friendsTab);
+  auto* reqBtnsLayout = new QHBoxLayout(reqBtns);
+  reqBtnsLayout->setContentsMargins(0, 0, 0, 0);
+  acceptBtn_ = new QPushButton("Accept", reqBtns);
+  rejectBtn_ = new QPushButton("Reject", reqBtns);
+  reqBtnsLayout->addWidget(acceptBtn_);
+  reqBtnsLayout->addWidget(rejectBtn_);
+  friendsLayout->addWidget(reqBtns);
+
+  connect(acceptBtn_, &QPushButton::clicked, this, [this] {
+    if (!requestsList_ || !requestsList_->currentItem()) return;
+    const auto id = requestsList_->currentItem()->data(Qt::UserRole).toString();
+    auto* f = profile_.findFriend(id);
+    if (!f) return;
+    f->status = Profile::FriendStatus::Accepted;
+    saveProfile();
+    backend_.acceptFriend(id);
+    backend_.setFriendAccepted(id, true);
+    rebuildFriendList();
+    rebuildFriendsTab();
+    statusBar()->showMessage("Friend accepted", 5000);
+  });
+  connect(rejectBtn_, &QPushButton::clicked, this, [this] {
+    if (!requestsList_ || !requestsList_->currentItem()) return;
+    const auto id = requestsList_->currentItem()->data(Qt::UserRole).toString();
+    for (int i = 0; i < profile_.friends.size(); ++i) {
+      if (profile_.friends[i].id == id) {
+        profile_.friends.removeAt(i);
+        break;
+      }
+    }
+    backend_.setFriendAccepted(id, false);
+    saveProfile();
+    rebuildFriendList();
+    rebuildFriendsTab();
+    statusBar()->showMessage("Request rejected", 5000);
+  });
+
+  leftTabs_->addTab(friendsTab, "Friends");
 
   auto* right = new QWidget(splitter);
   auto* rightLayout = new QVBoxLayout(right);
@@ -226,6 +329,7 @@ void MainWindow::rebuildFriendList() {
     if (f.status == Profile::FriendStatus::None) continue;
     auto* item = new QListWidgetItem(friendDisplay(f) + statusTag(f.status));
     item->setData(Qt::UserRole, f.id);
+    if (!f.lastIntro.isEmpty()) item->setToolTip(f.lastIntro);
     friendList_->addItem(item);
   }
   // Restore selection if possible.
@@ -237,6 +341,19 @@ void MainWindow::rebuildFriendList() {
       }
     }
   }
+}
+
+void MainWindow::rebuildFriendsTab() {
+  if (!requestsList_) return;
+  requestsList_->clear();
+  for (const auto& f : profile_.friends) {
+    if (f.status != Profile::FriendStatus::IncomingPending) continue;
+    auto* item = new QListWidgetItem(f.id.left(14) + "…");
+    item->setData(Qt::UserRole, f.id);
+    if (!f.lastIntro.isEmpty()) item->setToolTip(f.lastIntro);
+    requestsList_->addItem(item);
+  }
+  if (myIdEdit_ && !selfId_.isEmpty()) myIdEdit_->setText(selfId_);
 }
 
 void MainWindow::selectFriend(const QString& id) {

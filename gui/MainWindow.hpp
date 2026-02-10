@@ -11,6 +11,8 @@ class QListWidget;
 class QTextBrowser;
 class QLineEdit;
 class QLabel;
+class QTabWidget;
+class QPushButton;
 
 class MainWindow : public QMainWindow {
   Q_OBJECT
@@ -23,6 +25,7 @@ private:
   void loadProfile();
   void saveProfile();
   void rebuildFriendList();
+  void rebuildFriendsTab();
   void selectFriend(const QString& id);
   QString currentPeerId() const;
 
@@ -34,12 +37,24 @@ private:
   Profile profile_;
   ChatBackend backend_;
 
+  QTabWidget* leftTabs_ = nullptr;
   QListWidget* friendList_ = nullptr;
+
+  // Friends tab widgets
+  QLineEdit* myIdEdit_ = nullptr;
+  QPushButton* copyIdBtn_ = nullptr;
+  QLineEdit* addIdEdit_ = nullptr;
+  QLineEdit* addIntroEdit_ = nullptr;
+  QPushButton* sendReqBtn_ = nullptr;
+  QListWidget* requestsList_ = nullptr;
+  QPushButton* acceptBtn_ = nullptr;
+  QPushButton* rejectBtn_ = nullptr;
+
   QLabel* headerLabel_ = nullptr;
   QTextBrowser* chatView_ = nullptr;
   QLineEdit* input_ = nullptr;
 
   QString selectedPeerId_;
+  QString selfId_;
   QMap<QString, QStringList> chatCache_;
 };
-

@@ -44,7 +44,7 @@ inline std::string iso_timestamp_utc() {
 }
 
 inline void log(std::string_view msg) {
-  std::cerr << "[" << iso_timestamp_utc() << "] " << msg << "\n";
+  std::cout << "[" << iso_timestamp_utc() << "] " << msg << "\n";
 }
 
 inline std::string endpoint_to_string(const boost::asio::ip::tcp::endpoint& ep) {
