@@ -1366,6 +1366,28 @@ class App : public std::enable_shared_from_this<App> {
 
 std::optional<App::Options> parse_args(int argc, char** argv) {
   App::Options opt;
+  auto default_key_path = []() -> std::string {
+    // Keep CLI state under XDG config dir.
+    // Matches the GUI's organization folder name ("p2p-chat").
+    const char* xdg = std::getenv("XDG_CONFIG_HOME");
+    const char* home = std::getenv("HOME");
+    const std::string cfgroot = (xdg && *xdg) ? std::string(xdg)
+                               : (home && *home) ? (std::string(home) + "/.config")
+                                                 : std::string();
+
+    const std::string canonical = cfgroot.empty() ? "./p2p-chat/identity.pem" : (cfgroot + "/p2p-chat/identity.pem");
+    const std::string legacy = cfgroot.empty() ? "./p2p_chat/identity.pem" : (cfgroot + "/p2p_chat/identity.pem");
+
+    // Best-effort migration from legacy underscore dir to canonical dash dir.
+    try {
+      if (!std::filesystem::exists(canonical) && std::filesystem::exists(legacy)) {
+        std::filesystem::create_directories(std::filesystem::path(canonical).parent_path());
+        std::filesystem::copy_file(legacy, canonical, std::filesystem::copy_options::skip_existing);
+      }
+    } catch (...) {
+    }
+    return canonical;
+  };
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto get_val = [&](std::string_view flag) -> std::optional<std::string> {
@@ -1422,7 +1444,7 @@ std::optional<App::Options> parse_args(int argc, char** argv) {
     opt.server_host = "learn.fairuse.org";
     opt.server_port = 5555;
   }
-  if (opt.key_path.empty()) opt.key_path = "~/.config/p2p_chat/identity.pem";
+  if (opt.key_path.empty()) opt.key_path = default_key_path();
   if (!opt.display_name.empty()) {
     if (opt.display_name.size() > 32) return std::nullopt;
     if (opt.display_name.find('\n') != std::string::npos || opt.display_name.find('\r') != std::string::npos) {
@@ -1445,6 +1467,7 @@ int main(int argc, char** argv) {
 
   try {
     boost::asio::io_context io;
+    common::log(std::string("identity key: ") + opt->key_path);
     auto identity = Identity::load_or_create(opt->key_path);
     auto app = std::make_shared<App>(io, *opt, std::move(identity));
     app->run();

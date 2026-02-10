@@ -9,6 +9,8 @@
 #include <cstring>
 #include <deque>
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -27,6 +29,31 @@ inline void write_u32_be(uint32_t v, uint8_t out[4]) {
 inline uint32_t read_u32_be(const uint8_t in[4]) {
   return (static_cast<uint32_t>(in[0]) << 24) | (static_cast<uint32_t>(in[1]) << 16) |
          (static_cast<uint32_t>(in[2]) << 8) | static_cast<uint32_t>(in[3]);
+}
+
+// Datagram-friendly helpers: frame/parse a single JSON payload into/from a byte buffer.
+// Useful for UDP where reads are already message-bounded.
+inline std::optional<std::vector<uint8_t>> frame_json_bytes(const json& j, std::size_t max_len = kMaxFrameSize) {
+  const std::string payload = j.dump();
+  if (payload.empty() || payload.size() > max_len) return std::nullopt;
+  std::vector<uint8_t> out(4 + payload.size());
+  write_u32_be(static_cast<uint32_t>(payload.size()), out.data());
+  std::memcpy(out.data() + 4, payload.data(), payload.size());
+  return out;
+}
+
+inline std::optional<json> parse_framed_json_bytes(std::span<const uint8_t> bytes,
+                                                   std::size_t max_len = kMaxFrameSize) {
+  if (bytes.size() < 4) return std::nullopt;
+  const uint32_t len = read_u32_be(bytes.data());
+  if (len == 0 || len > max_len) return std::nullopt;
+  if (bytes.size() != 4 + len) return std::nullopt;
+  try {
+    const std::string s(reinterpret_cast<const char*>(bytes.data() + 4), len);
+    return json::parse(s);
+  } catch (...) {
+    return std::nullopt;
+  }
 }
 
 template <class AsyncReadStream, class Handler>
@@ -144,4 +171,3 @@ class JsonWriteQueue : public std::enable_shared_from_this<JsonWriteQueue<AsyncW
 };
 
 } // namespace common
-

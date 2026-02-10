@@ -3,23 +3,47 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QCryptographicHash>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QStandardPaths>
 
+namespace {
+QString configRootDir() {
+  // Prefer the standard XDG config root; keep our state in ~/.config/p2p-chat on Linux.
+  const auto root = QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation);
+  return QDir(root).filePath("p2p-chat");
+}
+
+QString legacyConfigDir() {
+  // Legacy location used earlier: ~/.config/p2p-chat/p2p_chat (Qt's AppConfigLocation).
+  return QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+}
+
+void copyDirBestEffort(const QString& fromDir, const QString& toDir) {
+  QDir src(fromDir);
+  if (!src.exists()) return;
+  QDir().mkpath(toDir);
+
+  const auto entries = src.entryInfoList(QDir::Files | QDir::NoDotAndDotDot);
+  for (const auto& fi : entries) {
+    const auto dst = QDir(toDir).filePath(fi.fileName());
+    if (QFile::exists(dst)) continue;
+    QFile::copy(fi.absoluteFilePath(), dst);
+  }
+}
+} // namespace
+
 QString Profile::defaultPath() {
-  const auto dir = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
-  return QDir(dir).filePath("profile.json");
+  return QDir(configRootDir()).filePath("profile.json");
 }
 
 QString Profile::defaultKeyPath() {
-  const auto dir = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
-  return QDir(dir).filePath("identity.pem");
+  return QDir(configRootDir()).filePath("identity.pem");
 }
 
 QString Profile::chatsDir() {
-  const auto dir = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
-  return QDir(dir).filePath("chats");
+  return QDir(configRootDir()).filePath("chats");
 }
 
 QString Profile::chatPathForPeer(const QString& peerId) {
@@ -31,8 +55,63 @@ Profile Profile::load(const QString& path, QString* errorOut) {
   Profile p;
   p.path_ = path;
 
+  // Identity migration independent of profile existence:
+  // if a legacy identity exists but the canonical one doesn't, copy it over before any key creation.
+  const auto canonicalKey = Profile::defaultKeyPath();
+  const auto legacy_gui_key = QDir(legacyConfigDir()).filePath("identity.pem");
+  const auto legacy_cli_key =
+      QDir(QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation)).filePath("p2p_chat/identity.pem");
+
+  if (!QFile::exists(canonicalKey)) {
+    const QString src = QFile::exists(legacy_cli_key) ? legacy_cli_key
+                     : QFile::exists(legacy_gui_key) ? legacy_gui_key
+                                                     : QString();
+    if (!src.isEmpty()) {
+      QDir().mkpath(QFileInfo(canonicalKey).absolutePath());
+      (void)QFile::copy(src, canonicalKey);
+    }
+  }
+
+  // If both exist and differ, surface a warning (helps explain mismatched IDs).
+  if (QFile::exists(canonicalKey) && QFile::exists(legacy_cli_key)) {
+    QFile a(canonicalKey), b(legacy_cli_key);
+    if (a.open(QIODevice::ReadOnly) && b.open(QIODevice::ReadOnly)) {
+      const auto ha = QCryptographicHash::hash(a.readAll(), QCryptographicHash::Sha256);
+      const auto hb = QCryptographicHash::hash(b.readAll(), QCryptographicHash::Sha256);
+      if (ha != hb && errorOut) {
+        *errorOut =
+            "Warning: multiple identity keys found in ~/.config/p2p-chat and ~/.config/p2p_chat; IDs may differ.";
+      }
+    }
+  }
+
+  // Best-effort migration from legacy Qt AppConfigLocation to ~/.config/p2p-chat.
+  if (!QFile::exists(path)) {
+    const auto legacyDir = legacyConfigDir();
+    const auto legacyProfile = QDir(legacyDir).filePath("profile.json");
+    if (QFile::exists(legacyProfile)) {
+      QDir().mkpath(QFileInfo(path).absolutePath());
+      (void)QFile::copy(legacyProfile, path);
+
+      // Migrate identity key if present.
+      const auto newKey = Profile::defaultKeyPath();
+      const auto legacyKey = QDir(legacyDir).filePath("identity.pem");
+      if (!QFile::exists(newKey) && QFile::exists(legacyKey)) {
+        QDir().mkpath(QFileInfo(newKey).absolutePath());
+        (void)QFile::copy(legacyKey, newKey);
+      }
+
+      // Migrate chat logs.
+      copyDirBestEffort(QDir(legacyDir).filePath("chats"), Profile::chatsDir());
+    }
+  }
+
   QFile f(path);
-  if (!f.exists()) return p;
+  if (!f.exists()) {
+    // Ensure first run has stable defaults even before the profile is saved.
+    p.keyPath = Profile::defaultKeyPath();
+    return p;
+  }
   if (!f.open(QIODevice::ReadOnly)) {
     if (errorOut) *errorOut = "Failed to open profile for reading";
     return p;
@@ -67,6 +146,42 @@ Profile Profile::load(const QString& path, QString* errorOut) {
     e.status = statusFromString(o.value("status").toString());
     e.lastIntro = o.value("lastIntro").toString();
     if (!e.id.isEmpty()) p.friends.push_back(e);
+  }
+
+  // Normalize/migrate identity key path:
+  // - Legacy GUI default:  <AppConfigLocation>/identity.pem  (typically ~/.config/p2p-chat/p2p_chat/identity.pem)
+  // - Legacy CLI default:  ~/.config/p2p_chat/identity.pem
+  // - New canonical:       ~/.config/p2p-chat/identity.pem
+  const auto canonical = Profile::defaultKeyPath();
+  const auto legacy_gui = QDir(legacyConfigDir()).filePath("identity.pem");
+  const auto legacy_cli = QDir(QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation))
+                              .filePath("p2p_chat/identity.pem");
+
+  auto is_legacy = [&](const QString& kp) {
+    if (kp.isEmpty()) return true;
+    if (QFileInfo(kp).absoluteFilePath() == QFileInfo(legacy_gui).absoluteFilePath()) return true;
+    if (QFileInfo(kp).absoluteFilePath() == QFileInfo(legacy_cli).absoluteFilePath()) return true;
+    if (QFileInfo(kp).absoluteFilePath().startsWith(QFileInfo(legacyConfigDir()).absoluteFilePath())) return true;
+    if (kp.contains("/p2p_chat/identity.pem")) return true;   // old CLI underscore dir
+    if (kp.contains("/p2p_chat/")) return true;
+    return false;
+  };
+
+  if (p.keyPath.isEmpty()) {
+    p.keyPath = canonical;
+  } else if (is_legacy(p.keyPath)) {
+    // Prefer canonical if it exists; otherwise copy legacy into canonical.
+    if (QFile::exists(canonical)) {
+      p.keyPath = canonical;
+    } else if (QFile::exists(p.keyPath)) {
+      QDir().mkpath(QFileInfo(canonical).absolutePath());
+      (void)QFile::copy(p.keyPath, canonical);
+      p.keyPath = canonical;
+    } else if (QFile::exists(legacy_gui)) {
+      QDir().mkpath(QFileInfo(canonical).absolutePath());
+      (void)QFile::copy(legacy_gui, canonical);
+      p.keyPath = canonical;
+    }
   }
   return p;
 }

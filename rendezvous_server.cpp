@@ -1,4 +1,5 @@
 #include "common/framing.hpp"
+#include "common/crypto.hpp"
 #include "common/util.hpp"
 
 #include <boost/asio.hpp>
@@ -19,6 +20,7 @@
 #include <vector>
 
 using boost::asio::ip::tcp;
+using boost::asio::ip::udp;
 using common::json;
 
 namespace {
@@ -30,6 +32,7 @@ struct ConnectRequest {
   std::string from_id;
   std::string ip;
   uint16_t port = 0;
+  uint16_t udp_port = 0;
   bool reachable = true;
 };
 
@@ -43,37 +46,11 @@ struct Registration {
   std::string id;
   std::string observed_ip;
   uint16_t external_port = 0;
+  uint16_t udp_port = 0;
   bool reachable = false;
   std::chrono::steady_clock::time_point last_seen{};
   std::weak_ptr<void> owner_tag;
 };
-
-bool ed25519_verify_b64url(std::string_view pubkey_b64url,
-                           std::string_view msg_b64url,
-                           std::string_view sig_b64url) {
-  const auto pub = common::base64url_decode(pubkey_b64url);
-  const auto msg = common::base64url_decode(msg_b64url);
-  const auto sig = common::base64url_decode(sig_b64url);
-  if (!pub || !msg || !sig) return false;
-  if (pub->size() != 32 || sig->size() != 64) return false;
-
-  EVP_PKEY* pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, nullptr, pub->data(), pub->size());
-  if (!pkey) return false;
-  EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-  if (!ctx) {
-    EVP_PKEY_free(pkey);
-    return false;
-  }
-
-  bool ok = false;
-  if (EVP_DigestVerifyInit(ctx, nullptr, nullptr, nullptr, pkey) == 1) {
-    const int rc = EVP_DigestVerify(ctx, sig->data(), sig->size(), msg->data(), msg->size());
-    ok = (rc == 1);
-  }
-  EVP_MD_CTX_free(ctx);
-  EVP_PKEY_free(pkey);
-  return ok;
-}
 
 std::string random_challenge_b64url(std::size_t nbytes = 32) {
   std::vector<uint8_t> buf(nbytes);
@@ -131,13 +108,26 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
 class RendezvousServer {
  public:
   explicit RendezvousServer(boost::asio::io_context& io)
-      : io_(io), acceptor_(io), cleanup_timer_(io) {}
+      : io_(io), acceptor_(io), udp_socket_(io), cleanup_timer_(io) {}
 
   void listen(const tcp::endpoint& ep) {
     acceptor_.open(ep.protocol());
     acceptor_.set_option(tcp::acceptor::reuse_address(true));
     acceptor_.bind(ep);
     acceptor_.listen();
+
+    // Also listen on UDP for NAT-mapping discovery and hole-punching assist.
+    boost::system::error_code ec;
+    udp_socket_.open(udp::v4(), ec);
+    if (!ec) {
+      udp_socket_.bind(udp::endpoint(ep.address(), ep.port()), ec);
+    }
+    if (!ec) {
+      udp_read_loop();
+    } else {
+      common::log(std::string("udp bind failed: ") + ec.message());
+    }
+
     common::log(std::string("rendezvous_server listening on ") + common::endpoint_to_string(ep));
     do_accept();
     schedule_cleanup();
@@ -146,6 +136,7 @@ class RendezvousServer {
   void stop() {
     boost::system::error_code ignored;
     acceptor_.close(ignored);
+    udp_socket_.close(ignored);
     cleanup_timer_.cancel();
   }
 
@@ -192,6 +183,11 @@ class RendezvousServer {
     reg.reachable = reachable;
     reg.last_seen = now;
     reg.owner_tag = session->owner_tag();
+
+    // If we already observed a UDP mapping for this ID, attach it.
+    if (auto it = udp_seen_.find(final_id); it != udp_seen_.end()) {
+      reg.udp_port = it->second.port;
+    }
     regs_[final_id] = reg;
 
     *out_final_id = final_id;
@@ -201,7 +197,8 @@ class RendezvousServer {
 
     common::log("register id=" + final_id + " observed_ip=" + observed_ip +
                 " reachable=" + std::string(reachable ? "true" : "false") +
-                " external_port=" + std::to_string(reg.external_port));
+                " external_port=" + std::to_string(reg.external_port) +
+                " udp_port=" + std::to_string(reg.udp_port));
     (void)listen_port; // reserved for future (might be useful for diagnostics)
     return true;
   }
@@ -260,7 +257,9 @@ class RendezvousServer {
           const std::string rid = resp["id"].get<std::string>();
           if (rid != id) return cb(false);
           const std::string sig = resp["signature"].get<std::string>();
-          const bool ok = ed25519_verify_b64url(id, *challenge, sig);
+          const auto msg = common::base64url_decode(*challenge);
+          if (!msg) return cb(false);
+          const bool ok = common::ed25519_verify_bytes_b64url(id, *msg, sig);
           cb(ok);
         });
       });
@@ -285,20 +284,21 @@ class RendezvousServer {
       *out_error = "from_id not registered";
       return;
     }
-    if (!from->reachable || from->external_port == 0) {
-      *out_error = "from_id must be reachable to request outbound connect";
-      return;
-    }
     if (!to) {
       *out_error = "to_id not registered";
+      return;
+    }
+    if (from->udp_port == 0 && (!from->reachable || from->external_port == 0)) {
+      *out_error = "from_id has no contact info yet";
       return;
     }
 
     ConnectRequest req;
     req.from_id = std::move(from_id);
     req.ip = from->observed_ip;
-    req.port = from->external_port;
-    req.reachable = true;
+    req.port = from->reachable ? from->external_port : 0;
+    req.udp_port = from->udp_port;
+    req.reachable = from->reachable;
     pending_[std::move(to_id)].push_back(std::move(req));
   }
 
@@ -347,12 +347,13 @@ class RendezvousServer {
 
     for (auto& req : it->second) {
       const auto from = get_registration(req.from_id);
-      if (!from || !from->reachable || from->external_port == 0) continue;
+      if (!from) continue;
       ConnectRequest live;
       live.from_id = from->id;
       live.ip = from->observed_ip;
-      live.port = from->external_port;
-      live.reachable = true;
+      live.port = from->reachable ? from->external_port : 0;
+      live.udp_port = from->udp_port;
+      live.reachable = from->reachable;
       out.push_back(std::move(live));
     }
 
@@ -390,6 +391,12 @@ class RendezvousServer {
       pending_friend_accepts_.erase(id);
       common::log("expired id=" + id);
     }
+
+    std::vector<std::string> udp_erase;
+    for (const auto& [id, seen] : udp_seen_) {
+      if (now - seen.last_seen > kTtl) udp_erase.push_back(id);
+    }
+    for (const auto& id : udp_erase) udp_seen_.erase(id);
   }
 
  private:
@@ -431,12 +438,66 @@ class RendezvousServer {
 
   boost::asio::io_context& io_;
   tcp::acceptor acceptor_;
+  udp::socket udp_socket_;
   boost::asio::steady_timer cleanup_timer_;
+
+  struct UdpSeen {
+    std::string ip;
+    uint16_t port = 0;
+    std::chrono::steady_clock::time_point last_seen{};
+  };
+  std::unordered_map<std::string, UdpSeen> udp_seen_;
 
   std::unordered_map<std::string, Registration> regs_;
   std::unordered_map<std::string, std::vector<ConnectRequest>> pending_;
   std::unordered_map<std::string, std::vector<FriendRequest>> pending_friend_requests_;
   std::unordered_map<std::string, std::vector<std::string>> pending_friend_accepts_;
+
+  void udp_read_loop() {
+    auto buf = std::make_shared<std::array<uint8_t, common::kMaxFrameSize + 4>>();
+    auto remote = std::make_shared<udp::endpoint>();
+    udp_socket_.async_receive_from(
+        boost::asio::buffer(*buf),
+        *remote,
+        [this, buf, remote](const boost::system::error_code& ec, std::size_t n) {
+          if (ec) return;
+          if (n == 0) return udp_read_loop();
+
+          const auto jopt = common::parse_framed_json_bytes(std::span<const uint8_t>(buf->data(), n));
+          if (!jopt) return udp_read_loop();
+          const json& j = *jopt;
+          if (!j.contains("type") || !j["type"].is_string()) return udp_read_loop();
+          const std::string type = j["type"].get<std::string>();
+
+          if (type == "udp_announce") {
+            if (!j.contains("id") || !j["id"].is_string()) return udp_read_loop();
+            if (!j.contains("ts") || !j["ts"].is_number_integer()) return udp_read_loop();
+            if (!j.contains("sig") || !j["sig"].is_string()) return udp_read_loop();
+            const std::string id = j["id"].get<std::string>();
+            const auto ts = j["ts"].get<long long>();
+            if (!common::is_valid_id(id)) return udp_read_loop();
+
+            const std::string msg = "p2p-chat-udp-announce|" + id + "|" + std::to_string(ts);
+            const bool ok = common::ed25519_verify_bytes_b64url(
+                id,
+                std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(msg.data()), msg.size()),
+                j["sig"].get<std::string>());
+            if (!ok) return udp_read_loop();
+
+            UdpSeen seen;
+            seen.ip = remote->address().to_string();
+            seen.port = remote->port();
+            seen.last_seen = std::chrono::steady_clock::now();
+            udp_seen_[id] = seen;
+            if (auto it = regs_.find(id); it != regs_.end()) {
+              it->second.udp_port = seen.port;
+              it->second.last_seen = std::chrono::steady_clock::now();
+            }
+          }
+
+          udp_read_loop();
+        });
+  }
 };
 
 ClientSession::ClientSession(RendezvousServer& server, tcp::socket socket)
@@ -554,7 +615,8 @@ void ClientSession::handle_message(const json& msg) {
       return;
     }
 
-    const bool auth_ok = ed25519_verify_b64url(id, pending_auth_->challenge_b64url, sig);
+    const auto ch = common::base64url_decode(pending_auth_->challenge_b64url);
+    const bool auth_ok = ch && common::ed25519_verify_bytes_b64url(id, *ch, sig);
     if (!auth_ok) {
       send_error("signature verification failed");
       return;
@@ -625,12 +687,14 @@ void ClientSession::handle_message(const json& msg) {
       resp["ok"] = false;
       resp["ip"] = "";
       resp["port"] = 0;
+      resp["udp_port"] = 0;
       resp["reachable"] = false;
     } else {
       resp["ok"] = true;
       resp["ip"] = reg->observed_ip;
       resp["reachable"] = reg->reachable;
       resp["port"] = reg->reachable ? reg->external_port : 0;
+      resp["udp_port"] = reg->udp_port;
     }
     common::log("lookup target_id=" + target_id + " ok=" +
                 std::string(resp["ok"].get<bool>() ? "true" : "false"));
@@ -734,6 +798,7 @@ void ClientSession::handle_message(const json& msg) {
       jr["from_id"] = r.from_id;
       jr["ip"] = r.ip;
       jr["port"] = r.port;
+      jr["udp_port"] = r.udp_port;
       jr["reachable"] = r.reachable;
       resp["connect_requests"].push_back(std::move(jr));
     }
@@ -766,6 +831,7 @@ void ClientSession::send_register_ok() {
   resp["observed_ip"] = reg->observed_ip;
   resp["reachable"] = reg->reachable;
   resp["external_port"] = reg->external_port;
+  resp["udp_port"] = reg->udp_port;
   send(std::move(resp));
 }
 
