@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QObject>
+#include <QByteArray>
 #include <QString>
 
 // Thin Qt wrapper around the existing CLI networking logic (Boost.Asio).
@@ -25,6 +26,7 @@ public:
   void stop();
 
   void setSelfName(const QString& name);
+  void setSelfAvatarPng(const QByteArray& pngBytes);
 
   void sendFriendRequest(const QString& peerId, const QString& intro);
   void acceptFriend(const QString& peerId);
@@ -39,6 +41,8 @@ signals:
   void logLine(QString line);
   void friendRequestReceived(QString fromId, QString intro);
   void friendAccepted(QString peerId);
+  void presenceUpdated(QString peerId, bool online);
+  void peerAvatarUpdated(QString peerId, QByteArray pngBytes);
   void peerNameUpdated(QString peerId, QString name);
   void messageReceived(QString peerId, QString displayName, QString text, bool incoming);
   void deliveryError(QString peerId, QString message);

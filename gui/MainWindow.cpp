@@ -2,16 +2,26 @@
 
 #include <QAction>
 #include <QApplication>
+#include <QBuffer>
 #include <QClipboard>
 #include <QDateTime>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QDir>
+#include <QFileDialog>
+#include <QFile>
+#include <QFileInfo>
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QMouseEvent>
+#include <QPlainTextEdit>
+#include <QPainter>
+#include <QStyledItemDelegate>
+#include <QStyle>
 #include <QMenuBar>
 #include <QMenu>
 #include <QMessageBox>
@@ -26,7 +36,121 @@
 #include <QTimeZone>
 #include <QVBoxLayout>
 
+#include <functional>
+
 namespace {
+constexpr int kRolePeerId = Qt::UserRole;
+constexpr int kRoleOnline = Qt::UserRole + 1;
+
+class ClickableLabel final : public QLabel {
+public:
+  using QLabel::QLabel;
+  std::function<void()> onClick;
+
+protected:
+  void mousePressEvent(QMouseEvent* ev) override {
+    if (onClick) onClick();
+    QLabel::mousePressEvent(ev);
+  }
+};
+
+class PresenceDotDelegate final : public QStyledItemDelegate {
+public:
+  explicit PresenceDotDelegate(QObject* parent = nullptr) : QStyledItemDelegate(parent) {}
+
+  void paint(QPainter* painter, const QStyleOptionViewItem& option, const QModelIndex& index) const override {
+    QStyleOptionViewItem opt(option);
+    initStyleOption(&opt, index);
+
+    const bool selected = (opt.state & QStyle::State_Selected);
+    const bool online = index.data(kRoleOnline).toBool();
+
+    const int dot = 10;
+    const int margin = 8;
+
+    const int icon = opt.decorationSize.isValid() ? std::min(opt.decorationSize.width(), opt.decorationSize.height()) : 24;
+    QRect iconRect = opt.rect;
+    iconRect.setLeft(opt.rect.left() + margin);
+    iconRect.setRight(iconRect.left() + icon);
+    iconRect.setTop(opt.rect.center().y() - icon / 2);
+    iconRect.setBottom(iconRect.top() + icon);
+
+    QRect dotRect = opt.rect;
+    dotRect.setLeft(dotRect.right() - margin - dot);
+    dotRect.setRight(dotRect.left() + dot);
+    dotRect.setTop(opt.rect.center().y() - dot / 2);
+    dotRect.setBottom(dotRect.top() + dot);
+
+    QRect textRect = opt.rect.adjusted(margin + icon + margin, 0, -(margin + dot + margin), 0);
+
+    // Draw background/selection without text.
+    QStyleOptionViewItem bg(opt);
+    bg.text.clear();
+    bg.icon = QIcon();
+    const auto* w = opt.widget;
+    QStyle* style = w ? w->style() : QApplication::style();
+    style->drawControl(QStyle::CE_ItemViewItem, &bg, painter, w);
+
+    painter->save();
+    if (!opt.icon.isNull()) {
+      opt.icon.paint(painter, iconRect, Qt::AlignCenter, selected ? QIcon::Selected : QIcon::Normal);
+    }
+
+    painter->setFont(opt.font);
+    painter->setPen(opt.palette.color(selected ? QPalette::HighlightedText : QPalette::Text));
+    const QFontMetrics fm(opt.font);
+    const auto elided = fm.elidedText(opt.text, Qt::ElideRight, textRect.width());
+    painter->drawText(textRect, Qt::AlignVCenter | Qt::AlignLeft, elided);
+
+    painter->setRenderHint(QPainter::Antialiasing, true);
+    const QColor c = online ? QColor(0, 200, 80) : QColor(120, 120, 120);
+    painter->setBrush(c);
+    painter->setPen(Qt::NoPen);
+    painter->drawEllipse(dotRect);
+    painter->restore();
+  }
+};
+
+QColor colorFromId(const QString& id) {
+  // Deterministic color from the peer id.
+  uint32_t h = 2166136261u;
+  for (const auto ch : id) {
+    h ^= static_cast<uint32_t>(ch.unicode());
+    h *= 16777619u;
+  }
+  const int r = 40 + static_cast<int>(h & 0x7F);
+  const int g = 40 + static_cast<int>((h >> 8) & 0x7F);
+  const int b = 40 + static_cast<int>((h >> 16) & 0x7F);
+  return QColor(r, g, b);
+}
+
+QPixmap placeholderAvatar(const QString& seed, int size) {
+  QPixmap pm(size, size);
+  pm.fill(Qt::transparent);
+  QPainter p(&pm);
+  p.setRenderHint(QPainter::Antialiasing, true);
+  p.setPen(Qt::NoPen);
+  p.setBrush(colorFromId(seed));
+  p.drawEllipse(QRectF(0, 0, size, size));
+
+  QFont f = p.font();
+  f.setBold(true);
+  f.setPointSize(std::max(10, size / 3));
+  p.setFont(f);
+  p.setPen(Qt::white);
+  const QString letter = seed.isEmpty() ? "?" : seed.left(1).toUpper();
+  p.drawText(QRect(0, 0, size, size), Qt::AlignCenter, letter);
+  return pm;
+}
+
+QPixmap loadAvatarOrPlaceholder(const QString& seed, const QString& path, int size) {
+  if (!path.isEmpty() && QFileInfo::exists(path)) {
+    QPixmap pm(path);
+    if (!pm.isNull()) return pm.scaled(size, size, Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
+  }
+  return placeholderAvatar(seed, size);
+}
+
 QString renderLine(const QString& stamp, const QString& who, const QString& text) {
   return QString("[%1] <b>%2</b>: %3").arg(stamp, who.toHtmlEscaped(), text.toHtmlEscaped());
 }
@@ -62,6 +186,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   buildUi();
   loadProfile();
   applyTheme(profile_.darkMode);
+  refreshSelfProfileWidget();
 
   connect(&backend_, &ChatBackend::registered, this,
           [this](QString selfId, bool reachable, QString observedIp, quint16 externalPort) {
@@ -73,6 +198,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
                                          .arg(observedIp)
                                          .arg(externalPort),
                                      10000);
+            refreshSelfProfileWidget();
           });
 
   connect(&backend_, &ChatBackend::friendRequestReceived, this,
@@ -129,6 +255,35 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     statusBar()->showMessage(QString("Delivery to %1 failed: %2").arg(peerId.left(12), msg), 8000);
   });
 
+  connect(&backend_, &ChatBackend::peerAvatarUpdated, this, [this](QString peerId, QByteArray pngBytes) {
+    if (pngBytes.isEmpty()) return;
+    QImage img;
+    if (!img.loadFromData(pngBytes, "PNG")) return;
+    const auto path = Profile::peerAvatarFile(peerId);
+    QDir().mkpath(QFileInfo(path).absolutePath());
+    (void)img.save(path, "PNG");
+
+    auto* f = profile_.findFriend(peerId);
+    if (f && f->avatarPath != path) {
+      f->avatarPath = path;
+      saveProfile();
+    }
+    rebuildFriendList();
+    refreshHeader();
+  });
+
+  connect(&backend_, &ChatBackend::presenceUpdated, this, [this](QString peerId, bool online) {
+    online_[peerId] = online;
+    for (int i = 0; i < friendList_->count(); ++i) {
+      auto* item = friendList_->item(i);
+      if (!item) continue;
+      if (item->data(kRolePeerId).toString() != peerId) continue;
+      item->setData(kRoleOnline, online);
+      friendList_->viewport()->update();
+      break;
+    }
+  });
+
   // Start backend.
   ChatBackend::Options opt;
   opt.serverHost = profile_.serverHost;
@@ -139,6 +294,19 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   opt.noUpnp = profile_.noUpnp;
   opt.externalPort = profile_.externalPort;
   backend_.start(opt);
+
+  // Load and announce our avatar to peers (P2P only; not via rendezvous).
+  if (!profile_.selfAvatarPath.isEmpty() && QFileInfo::exists(profile_.selfAvatarPath)) {
+    QImage img(profile_.selfAvatarPath);
+    if (!img.isNull()) {
+      const QImage wire = img.scaled(96, 96, Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
+      QByteArray out;
+      QBuffer buf(&out);
+      buf.open(QIODevice::WriteOnly);
+      (void)wire.save(&buf, "PNG");
+      backend_.setSelfAvatarPng(out);
+    }
+  }
 
   // Push accepted friends to backend gate.
   for (const auto& f : profile_.friends) {
@@ -156,13 +324,11 @@ MainWindow::~MainWindow() {
 }
 
 void MainWindow::buildUi() {
+  auto* optionsMenu = menuBar()->addMenu("Options");
+
   auto* addFriend = new QAction("Add Friend...", this);
   connect(addFriend, &QAction::triggered, this, [this] { addFriendDialog(); });
-  menuBar()->addAction(addFriend);
-
-  auto* darkMode = new QAction("Dark Mode", this);
-  darkMode->setCheckable(true);
-  menuBar()->addAction(darkMode);
+  optionsMenu->addAction(addFriend);
 
   auto* setName = new QAction("Set Name...", this);
   connect(setName, &QAction::triggered, this, [this] {
@@ -177,21 +343,56 @@ void MainWindow::buildUi() {
     profile_.selfName = name;
     backend_.setSelfName(name);
     saveProfile();
+    refreshSelfProfileWidget();
     statusBar()->showMessage("Name updated", 6000);
   });
-  menuBar()->addAction(setName);
+  optionsMenu->addAction(setName);
+
+  auto* darkMode = new QAction("Dark Mode", this);
+  darkMode->setCheckable(true);
+  optionsMenu->addAction(darkMode);
+  optionsMenu->addSeparator();
 
   auto* quit = new QAction("Quit", this);
   connect(quit, &QAction::triggered, qApp, &QApplication::quit);
-  menuBar()->addAction(quit);
+  optionsMenu->addAction(quit);
 
   auto* splitter = new QSplitter(this);
 
   leftTabs_ = new QTabWidget(splitter);
   leftTabs_->setMinimumWidth(260);
 
-  friendList_ = new QListWidget(leftTabs_);
-  leftTabs_->addTab(friendList_, "Chats");
+  // Chats tab (list + self profile widget)
+  auto* chatsTab = new QWidget(leftTabs_);
+  auto* chatsLayout = new QVBoxLayout(chatsTab);
+  chatsLayout->setContentsMargins(0, 0, 0, 0);
+  chatsLayout->setSpacing(0);
+
+  friendList_ = new QListWidget(chatsTab);
+  friendList_->setItemDelegate(new PresenceDotDelegate(friendList_));
+  friendList_->setIconSize(QSize(28, 28));
+  friendList_->setSpacing(2);
+  chatsLayout->addWidget(friendList_, 1);
+
+  auto* selfPanel = new QWidget(chatsTab);
+  auto* selfLayout = new QHBoxLayout(selfPanel);
+  selfLayout->setContentsMargins(10, 8, 10, 8);
+  selfLayout->setSpacing(10);
+
+  myAvatarLabel_ = new ClickableLabel(selfPanel);
+  myAvatarLabel_->setFixedSize(48, 48);
+  myAvatarLabel_->setCursor(Qt::PointingHandCursor);
+  myAvatarLabel_->setToolTip("Click to change profile picture");
+  myAvatarLabel_->setScaledContents(true);
+
+  myNameLabel_ = new QLabel(selfPanel);
+  myNameLabel_->setStyleSheet("font-weight:600;");
+
+  selfLayout->addWidget(myAvatarLabel_, 0);
+  selfLayout->addWidget(myNameLabel_, 1);
+  chatsLayout->addWidget(selfPanel, 0);
+
+  leftTabs_->addTab(chatsTab, "Chats");
 
   // Friends tab
   auto* friendsTab = new QWidget(leftTabs_);
@@ -326,7 +527,7 @@ void MainWindow::buildUi() {
 
   connect(friendList_, &QListWidget::currentRowChanged, this, [this](int row) {
     if (row < 0 || row >= friendList_->count()) return;
-    const auto id = friendList_->item(row)->data(Qt::UserRole).toString();
+    const auto id = friendList_->item(row)->data(kRolePeerId).toString();
     selectFriend(id);
   });
 
@@ -353,6 +554,38 @@ void MainWindow::buildUi() {
     applyTheme(on);
   });
   darkModeAction_ = darkMode;
+
+  if (auto* clickable = dynamic_cast<ClickableLabel*>(myAvatarLabel_)) {
+    clickable->onClick = [this] {
+      const auto file = QFileDialog::getOpenFileName(
+          this, "Choose profile picture", QDir::homePath(), "Images (*.png *.jpg *.jpeg *.bmp *.gif)");
+      if (file.isEmpty()) return;
+      QImage img(file);
+      if (img.isNull()) {
+        QMessageBox::warning(this, "Invalid image", "Could not load the selected image.");
+        return;
+      }
+      // Save a reasonably sized local copy.
+      const QImage saved = img.scaled(256, 256, Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
+      QDir().mkpath(QFileInfo(Profile::selfAvatarFile()).absolutePath());
+      if (!saved.save(Profile::selfAvatarFile(), "PNG")) {
+        QMessageBox::warning(this, "Save failed", "Failed to save profile picture.");
+        return;
+      }
+      profile_.selfAvatarPath = Profile::selfAvatarFile();
+      saveProfile();
+      refreshSelfProfileWidget();
+
+      // Send a smaller version to peers over the encrypted P2P channel.
+      const QImage wire = img.scaled(96, 96, Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
+      QByteArray out;
+      QBuffer buf(&out);
+      buf.open(QIODevice::WriteOnly);
+      (void)wire.save(&buf, "PNG");
+      backend_.setSelfAvatarPng(out);
+      statusBar()->showMessage("Profile picture updated", 4000);
+    };
+  }
 }
 
 void MainWindow::loadProfile() {
@@ -400,19 +633,32 @@ void MainWindow::applyTheme(bool dark) {
       "QToolTip { color: #000; background-color: #fff; border: 1px solid #aaa; }");
 }
 
+void MainWindow::refreshSelfProfileWidget() {
+  if (myNameLabel_) {
+    myNameLabel_->setText(profile_.selfName.isEmpty() ? QString("(no name)") : profile_.selfName);
+  }
+  if (myAvatarLabel_) {
+    const auto seed = selfId_.isEmpty() ? QString("me") : selfId_;
+    myAvatarLabel_->setPixmap(loadAvatarOrPlaceholder(seed, profile_.selfAvatarPath, 48));
+  }
+}
+
 void MainWindow::rebuildFriendList() {
   friendList_->clear();
   for (const auto& f : profile_.friends) {
     if (f.status == Profile::FriendStatus::None) continue;
     auto* item = new QListWidgetItem(friendDisplay(f) + statusTag(f.status));
-    item->setData(Qt::UserRole, f.id);
+    item->setData(kRolePeerId, f.id);
+    item->setData(kRoleOnline, online_.value(f.id, false));
+    item->setIcon(QIcon(loadAvatarOrPlaceholder(f.id, f.avatarPath, 28)));
+    item->setSizeHint(QSize(0, 46));
     if (!f.lastIntro.isEmpty()) item->setToolTip(f.lastIntro);
     friendList_->addItem(item);
   }
   // Restore selection if possible.
   if (!selectedPeerId_.isEmpty()) {
     for (int i = 0; i < friendList_->count(); ++i) {
-      if (friendList_->item(i)->data(Qt::UserRole).toString() == selectedPeerId_) {
+      if (friendList_->item(i)->data(kRolePeerId).toString() == selectedPeerId_) {
         friendList_->setCurrentRow(i);
         break;
       }
@@ -457,7 +703,7 @@ void MainWindow::showChatContextMenu(const QPoint& pos) {
   if (!friendList_) return;
   auto* item = friendList_->itemAt(pos);
   if (!item) return;
-  const auto peerId = item->data(Qt::UserRole).toString();
+  const auto peerId = item->data(kRolePeerId).toString();
   if (peerId.isEmpty()) return;
 
   QMenu menu(this);
@@ -495,12 +741,26 @@ void MainWindow::showProfilePopup(const QString& peerId) {
 
   QDialog dlg(this);
   dlg.setWindowTitle("Profile");
+  dlg.setMinimumSize(520, 360);
   auto* root = new QVBoxLayout(&dlg);
   root->setContentsMargins(10, 10, 10, 10);
 
-  auto* title = new QLabel(display, &dlg);
-  title->setStyleSheet("font-weight:600; font-size:15px;");
-  root->addWidget(title);
+  auto* header = new QWidget(&dlg);
+  auto* headerLayout = new QHBoxLayout(header);
+  headerLayout->setContentsMargins(0, 0, 0, 0);
+  headerLayout->setSpacing(12);
+
+  auto* avatar = new QLabel(header);
+  avatar->setFixedSize(96, 96);
+  avatar->setScaledContents(true);
+  avatar->setPixmap(loadAvatarOrPlaceholder(peerId, f ? f->avatarPath : QString(), 96));
+  headerLayout->addWidget(avatar, 0);
+
+  auto* title = new QLabel(display, header);
+  title->setStyleSheet("font-weight:600; font-size:16px;");
+  title->setWordWrap(true);
+  headerLayout->addWidget(title, 1);
+  root->addWidget(header);
 
   auto* form = new QFormLayout();
 
@@ -513,16 +773,17 @@ void MainWindow::showProfilePopup(const QString& peerId) {
   auto* statusLabel = new QLabel(f ? Profile::statusToString(f->status) : QString("unknown"), &dlg);
   form->addRow("Status:", statusLabel);
 
-  auto* idRow = new QWidget(&dlg);
-  auto* idRowLayout = new QHBoxLayout(idRow);
-  idRowLayout->setContentsMargins(0, 0, 0, 0);
-  auto* idEdit = new QLineEdit(idRow);
-  idEdit->setReadOnly(true);
-  idEdit->setText(peerId);
-  auto* copyBtn = new QPushButton("Copy", idRow);
-  idRowLayout->addWidget(idEdit, 1);
-  idRowLayout->addWidget(copyBtn);
-  form->addRow("Public key:", idRow);
+  auto* keyRow = new QWidget(&dlg);
+  auto* keyRowLayout = new QHBoxLayout(keyRow);
+  keyRowLayout->setContentsMargins(0, 0, 0, 0);
+  auto* keyEdit = new QLineEdit(keyRow);
+  keyEdit->setReadOnly(true);
+  keyEdit->setText(peerId);
+  keyEdit->setCursorPosition(0);
+  auto* copyBtn = new QPushButton("Copy", keyRow);
+  keyRowLayout->addWidget(keyEdit, 1);
+  keyRowLayout->addWidget(copyBtn, 0);
+  form->addRow("Public key:", keyRow);
 
   if (f && !f->lastIntro.isEmpty()) {
     auto* introLabel = new QLabel(f->lastIntro, &dlg);
@@ -532,9 +793,7 @@ void MainWindow::showProfilePopup(const QString& peerId) {
 
   root->addLayout(form);
 
-  connect(copyBtn, &QPushButton::clicked, this, [peerId] {
-    QGuiApplication::clipboard()->setText(peerId);
-  });
+  connect(copyBtn, &QPushButton::clicked, this, [peerId] { QGuiApplication::clipboard()->setText(peerId); });
 
   auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dlg);
   connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);

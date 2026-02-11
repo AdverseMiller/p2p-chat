@@ -42,6 +42,19 @@ QString Profile::defaultKeyPath() {
   return QDir(configRootDir()).filePath("identity.pem");
 }
 
+QString Profile::avatarsDir() {
+  return QDir(configRootDir()).filePath("avatars");
+}
+
+QString Profile::selfAvatarFile() {
+  return QDir(avatarsDir()).filePath("self.png");
+}
+
+QString Profile::peerAvatarFile(const QString& peerId) {
+  // Peer IDs are base64url and safe as filenames on Windows/Linux.
+  return QDir(avatarsDir()).filePath(peerId + ".png");
+}
+
 QString Profile::chatsDir() {
   return QDir(configRootDir()).filePath("chats");
 }
@@ -128,6 +141,7 @@ Profile Profile::load(const QString& path, QString* errorOut) {
   const auto root = doc.object();
   p.keyPath = root.value("keyPath").toString();
   p.selfName = root.value("selfName").toString();
+  p.selfAvatarPath = root.value("selfAvatarPath").toString();
   p.serverHost = root.value("serverHost").toString(p.serverHost);
   p.serverPort = static_cast<quint16>(root.value("serverPort").toInt(p.serverPort));
   p.listenPort = static_cast<quint16>(root.value("listenPort").toInt(0));
@@ -143,6 +157,7 @@ Profile Profile::load(const QString& path, QString* errorOut) {
     e.id = o.value("id").toString();
     e.alias = o.value("alias").toString();
     e.name = o.value("name").toString();
+    e.avatarPath = o.value("avatarPath").toString();
     e.status = statusFromString(o.value("status").toString());
     e.lastIntro = o.value("lastIntro").toString();
     if (!e.id.isEmpty()) p.friends.push_back(e);
@@ -197,6 +212,7 @@ bool Profile::save(QString* errorOut) const {
   QJsonObject root;
   root["keyPath"] = keyPath;
   root["selfName"] = selfName;
+  root["selfAvatarPath"] = selfAvatarPath;
   root["serverHost"] = serverHost;
   root["serverPort"] = static_cast<int>(serverPort);
   root["listenPort"] = static_cast<int>(listenPort);
@@ -210,6 +226,7 @@ bool Profile::save(QString* errorOut) const {
     o["id"] = e.id;
     o["alias"] = e.alias;
     o["name"] = e.name;
+    o["avatarPath"] = e.avatarPath;
     o["status"] = statusToString(e.status);
     o["lastIntro"] = e.lastIntro;
     arr.push_back(o);

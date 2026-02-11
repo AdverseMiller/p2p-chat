@@ -17,6 +17,7 @@ public:
     QString id;
     QString alias;   // local nickname
     QString name;    // learned from peer after handshake
+    QString avatarPath; // local cached avatar image path (png)
     FriendStatus status = FriendStatus::None;
     QString lastIntro;
   };
@@ -29,6 +30,9 @@ public:
 
   static QString defaultPath();
   static QString defaultKeyPath();
+  static QString avatarsDir();
+  static QString selfAvatarFile();
+  static QString peerAvatarFile(const QString& peerId);
   static Profile load(const QString& path, QString* errorOut = nullptr);
   bool save(QString* errorOut = nullptr) const;
 
@@ -36,6 +40,7 @@ public:
 
   QString keyPath;          // identity pem path
   QString selfName;         // last used name
+  QString selfAvatarPath;   // local avatar path (png)
   QString serverHost = "learn.fairuse.org";
   quint16 serverPort = 5555;
   quint16 listenPort = 0;

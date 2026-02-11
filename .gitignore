@@ -1,4 +1,6 @@
 build/
+build-*/
+cmake-build-*/
 dist/
 *.log
 *.pid
@@ -21,4 +23,3 @@ CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 Makefile.user
-

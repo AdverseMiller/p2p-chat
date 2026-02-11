@@ -40,6 +40,7 @@ private:
 
   void appendMessage(const QString& peerId, const QString& label, const QString& text, bool incoming);
   void refreshHeader();
+  void refreshSelfProfileWidget();
 
   Profile profile_;
   ChatBackend backend_;
@@ -61,9 +62,14 @@ private:
   QTextBrowser* chatView_ = nullptr;
   QLineEdit* input_ = nullptr;
 
+  // Self profile widget (Chats tab bottom)
+  QLabel* myAvatarLabel_ = nullptr;
+  QLabel* myNameLabel_ = nullptr;
+
   QString selectedPeerId_;
   QString selfId_;
   QMap<QString, QVector<Profile::ChatMessage>> chatCache_;
+  QMap<QString, bool> online_;
 
   QAction* darkModeAction_ = nullptr;
 };

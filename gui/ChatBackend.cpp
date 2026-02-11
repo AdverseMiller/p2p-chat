@@ -7,10 +7,14 @@
 #include "common/upnp.hpp"
 #include "common/util.hpp"
 
+#include <QCoreApplication>
+#include <QPointer>
+
 #include <boost/asio.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -39,6 +43,7 @@ public:
   enum class Role { Initiator, Acceptor };
   using OnReady = std::function<void(const std::string& peer_id, const std::string& peer_name)>;
   using OnName = std::function<void(const std::string& peer_id, const std::string& peer_name)>;
+  using OnAvatar = std::function<void(const std::string& peer_id, const std::vector<uint8_t>& png_bytes)>;
   using OnChat = std::function<void(const std::string& peer_id, const std::string& peer_name, const std::string& text)>;
   using OnClosed = std::function<void()>;
 
@@ -47,6 +52,7 @@ public:
               std::string self_id,
               std::shared_ptr<common::Identity> identity,
               std::function<std::string()> get_self_name,
+              std::function<std::vector<uint8_t>()> get_self_avatar_png,
               std::function<bool(const std::string&)> allow_peer,
               std::string expected_peer_id = {})
       : socket_(std::move(socket)),
@@ -54,13 +60,15 @@ public:
         self_id_(std::move(self_id)),
         identity_(std::move(identity)),
         get_self_name_(std::move(get_self_name)),
+        get_self_avatar_png_(std::move(get_self_avatar_png)),
         allow_peer_(std::move(allow_peer)),
         expected_peer_id_(std::move(expected_peer_id)),
         writer_(std::make_shared<common::JsonWriteQueue<tcp::socket>>(socket_)) {}
 
-  void start(OnReady on_ready, OnName on_name, OnChat on_chat, OnClosed on_closed) {
+  void start(OnReady on_ready, OnName on_name, OnAvatar on_avatar, OnChat on_chat, OnClosed on_closed) {
     on_ready_ = std::move(on_ready);
     on_name_ = std::move(on_name);
+    on_avatar_ = std::move(on_avatar);
     on_chat_ = std::move(on_chat);
     on_closed_ = std::move(on_closed);
     if (role_ == Role::Initiator) {
@@ -70,9 +78,11 @@ public:
     }
   }
 
-  void start_accept_with_first(json first, OnReady on_ready, OnName on_name, OnChat on_chat, OnClosed on_closed) {
+  void start_accept_with_first(json first, OnReady on_ready, OnName on_name, OnAvatar on_avatar, OnChat on_chat,
+                               OnClosed on_closed) {
     on_ready_ = std::move(on_ready);
     on_name_ = std::move(on_name);
+    on_avatar_ = std::move(on_avatar);
     on_chat_ = std::move(on_chat);
     on_closed_ = std::move(on_closed);
     if (!first.contains("type") || !first["type"].is_string()) return send_error_and_close("missing type");
@@ -95,6 +105,16 @@ public:
     json inner;
     inner["type"] = "name";
     inner["name"] = std::move(name);
+    send_secure(std::move(inner));
+  }
+
+  void send_avatar(std::vector<uint8_t> png) {
+    if (!ready_) return;
+    if (png.empty()) return;
+    if (png.size() > 48 * 1024) return;
+    json inner;
+    inner["type"] = "avatar";
+    inner["png"] = common::base64url_encode(png);
     send_secure(std::move(inner));
   }
 
@@ -265,6 +285,7 @@ private:
       self->ready_ = true;
       if (self->on_ready_) self->on_ready_(self->peer_id_, self->peer_name_);
       self->send_name_update();
+      self->send_avatar_update();
       self->read_loop_secure();
     });
   }
@@ -287,6 +308,7 @@ private:
       self->ready_ = true;
       if (self->on_ready_) self->on_ready_(self->peer_id_, self->peer_name_);
       self->send_name_update();
+      self->send_avatar_update();
       self->read_loop_secure();
     });
   }
@@ -334,6 +356,12 @@ private:
     inner["type"] = "name";
     inner["name"] = nm;
     send_secure(std::move(inner));
+  }
+
+  void send_avatar_update() {
+    const auto png = get_self_avatar_png_ ? get_self_avatar_png_() : std::vector<uint8_t>{};
+    if (png.empty()) return;
+    send_avatar(std::move(png));
   }
 
   void send_secure(json inner) {
@@ -426,6 +454,14 @@ private:
       }
       return;
     }
+    if (t == "avatar") {
+      if (!inner.contains("png") || !inner["png"].is_string()) return;
+      const auto bytes = common::base64url_decode(inner["png"].get<std::string>());
+      if (!bytes) return;
+      if (bytes->size() > 48 * 1024) return;
+      if (on_avatar_) on_avatar_(peer_id_, *bytes);
+      return;
+    }
   }
 
   tcp::socket socket_;
@@ -433,6 +469,7 @@ private:
   std::string self_id_;
   std::shared_ptr<common::Identity> identity_;
   std::function<std::string()> get_self_name_;
+  std::function<std::vector<uint8_t>()> get_self_avatar_png_;
   std::string peer_id_;
   std::string peer_name_;
   std::string expected_peer_id_;
@@ -442,6 +479,7 @@ private:
   bool closed_ = false;
   OnReady on_ready_;
   OnName on_name_;
+  OnAvatar on_avatar_;
   OnChat on_chat_;
   OnClosed on_closed_;
 
@@ -459,6 +497,7 @@ public:
   enum class Role { Initiator, Acceptor };
   using OnReady = std::function<void(const std::string& peer_id, const std::string& peer_name)>;
   using OnName = std::function<void(const std::string& peer_id, const std::string& peer_name)>;
+  using OnAvatar = std::function<void(const std::string& peer_id, const std::vector<uint8_t>& png_bytes)>;
   using OnChat = std::function<void(const std::string& peer_id, const std::string& peer_name, const std::string& text)>;
   using OnClosed = std::function<void()>;
 
@@ -468,6 +507,7 @@ public:
                  std::string self_id,
                  std::shared_ptr<common::Identity> identity,
                  std::function<std::string()> get_self_name,
+                 std::function<std::vector<uint8_t>()> get_self_avatar_png,
                  std::function<bool(const std::string&)> allow_peer,
                  std::string expected_peer_id = {})
       : socket_(socket),
@@ -476,6 +516,7 @@ public:
         self_id_(std::move(self_id)),
         identity_(std::move(identity)),
         get_self_name_(std::move(get_self_name)),
+        get_self_avatar_png_(std::move(get_self_avatar_png)),
         allow_peer_(std::move(allow_peer)),
         expected_peer_id_(std::move(expected_peer_id)),
         punch_timer_(socket_.get_executor()),
@@ -484,9 +525,10 @@ public:
         deadline_timer_(socket_.get_executor()),
         keepalive_timer_(socket_.get_executor()) {}
 
-  void start(OnReady on_ready, OnName on_name, OnChat on_chat, OnClosed on_closed) {
+  void start(OnReady on_ready, OnName on_name, OnAvatar on_avatar, OnChat on_chat, OnClosed on_closed) {
     on_ready_ = std::move(on_ready);
     on_name_ = std::move(on_name);
+    on_avatar_ = std::move(on_avatar);
     on_chat_ = std::move(on_chat);
     on_closed_ = std::move(on_closed);
     schedule_punch();
@@ -497,10 +539,11 @@ public:
   }
 
   void start_accept_with_first(const json& first, const udp::endpoint& from, OnReady on_ready, OnName on_name,
-                               OnChat on_chat, OnClosed on_closed) {
+                               OnAvatar on_avatar, OnChat on_chat, OnClosed on_closed) {
     peer_ep_ = from;
     on_ready_ = std::move(on_ready);
     on_name_ = std::move(on_name);
+    on_avatar_ = std::move(on_avatar);
     on_chat_ = std::move(on_chat);
     on_closed_ = std::move(on_closed);
     schedule_punch();
@@ -544,6 +587,15 @@ public:
     json inner;
     inner["type"] = "name";
     inner["name"] = std::move(name);
+    enqueue_secure(std::move(inner));
+  }
+
+  void send_avatar(std::vector<uint8_t> png) {
+    if (png.empty()) return;
+    if (png.size() > 48 * 1024) return;
+    json inner;
+    inner["type"] = "avatar";
+    inner["png"] = common::base64url_encode(png);
     enqueue_secure(std::move(inner));
   }
 
@@ -755,6 +807,7 @@ private:
     ready_ = true;
     if (on_ready_) on_ready_(peer_id_, peer_name_);
     send_name_update();
+    send_avatar_update();
     try_send_next();
     // Keep resending finish until the peer proves readiness (ack/secure_msg).
     schedule_hs_resend();
@@ -778,6 +831,7 @@ private:
     schedule_keepalive();
     if (on_ready_) on_ready_(peer_id_, peer_name_);
     send_name_update();
+    send_avatar_update();
     try_send_next();
   }
 
@@ -836,6 +890,12 @@ private:
     const auto nm = get_self_name_ ? get_self_name_() : std::string();
     if (nm.empty()) return;
     send_name(nm);
+  }
+
+  void send_avatar_update() {
+    const auto png = get_self_avatar_png_ ? get_self_avatar_png_() : std::vector<uint8_t>{};
+    if (png.empty()) return;
+    send_avatar(std::move(png));
   }
 
   void enqueue_secure(json inner) {
@@ -1023,6 +1083,14 @@ private:
       }
       return;
     }
+    if (t == "avatar") {
+      if (!inner.contains("png") || !inner["png"].is_string()) return;
+      const auto bytes = common::base64url_decode(inner["png"].get<std::string>());
+      if (!bytes) return;
+      if (bytes->size() > 48 * 1024) return;
+      if (on_avatar_) on_avatar_(peer_id_, *bytes);
+      return;
+    }
   }
 
   udp::socket& socket_;
@@ -1031,6 +1099,7 @@ private:
   std::string self_id_;
   std::shared_ptr<common::Identity> identity_;
   std::function<std::string()> get_self_name_;
+  std::function<std::vector<uint8_t>()> get_self_avatar_png_;
   std::string peer_id_;
   std::string peer_name_;
   std::string expected_peer_id_;
@@ -1042,6 +1111,7 @@ private:
 
   OnReady on_ready_;
   OnName on_name_;
+  OnAvatar on_avatar_;
   OnChat on_chat_;
   OnClosed on_closed_;
 
@@ -1455,6 +1525,7 @@ struct ChatBackend::Impl {
   std::unordered_map<std::string, std::deque<std::string>> queued_outgoing;
   std::unordered_map<std::string, std::string> peer_names;
   std::string self_name;
+  std::vector<uint8_t> self_avatar_png;
 
   boost::asio::io_context io;
   std::optional<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>> work;
@@ -1489,7 +1560,19 @@ struct ChatBackend::Impl {
   bool friend_connect_running = false;
 
   void postToQt(std::function<void()> fn) {
-    QMetaObject::invokeMethod(q, [fn = std::move(fn)] { fn(); }, Qt::QueuedConnection);
+    // All UI objects (including `ChatBackend`) have GUI-thread affinity.
+    // Networking runs on a background thread; never touch Qt/GUI state directly from it.
+    //
+    // Use a QPointer guard so we don't dispatch into a deleted QObject.
+    QPointer<ChatBackend> weak(q);
+    auto* app = QCoreApplication::instance();
+    if (!app) return;
+    QMetaObject::invokeMethod(app,
+                              [weak, fn = std::move(fn)] {
+                                if (!weak) return;
+                                fn();
+                              },
+                              Qt::QueuedConnection);
   }
 
   bool isAccepted(const std::string& id) {
@@ -1500,6 +1583,11 @@ struct ChatBackend::Impl {
   std::string getSelfName() {
     std::lock_guard lk(m);
     return self_name;
+  }
+
+  std::vector<uint8_t> getSelfAvatarPng() {
+    std::lock_guard lk(m);
+    return self_avatar_png;
   }
 
   void setAccepted(const std::string& id, bool ok) {
@@ -1610,6 +1698,7 @@ struct ChatBackend::Impl {
         const std::string selfId = std::string(identity->public_id());
         auto session = std::make_shared<UdpPeerSession>(
             udp_socket, from, UdpPeerSession::Role::Acceptor, selfId, identity, [this] { return getSelfName(); },
+            [this] { return getSelfAvatarPng(); },
             [this](const std::string& x) { return isAccepted(x); });
         udp_sessions[pid] = session;
         udp_ep_to_peer[epkey] = pid;
@@ -1635,6 +1724,12 @@ struct ChatBackend::Impl {
               }
               postToQt([this, peer_id, peer_name] {
                 emit q->peerNameUpdated(QString::fromStdString(peer_id), QString::fromStdString(peer_name));
+              });
+            },
+            [this](const std::string& peer_id, const std::vector<uint8_t>& bytes) {
+              const QByteArray png(reinterpret_cast<const char*>(bytes.data()), static_cast<int>(bytes.size()));
+              postToQt([this, peer_id, png] {
+                emit q->peerAvatarUpdated(QString::fromStdString(peer_id), png);
               });
             },
             [this](const std::string& peer_id, const std::string& peer_name, const std::string& text) {
@@ -1793,7 +1888,8 @@ struct ChatBackend::Impl {
     auto selfId = std::string(rendezvous->id());
     auto session = std::make_shared<PeerSession>(
         std::move(socket), PeerSession::Role::Acceptor, std::move(selfId), identity,
-        [this] { return getSelfName(); }, [this](const std::string& pid) { return isAccepted(pid); });
+        [this] { return getSelfName(); }, [this] { return getSelfAvatarPng(); },
+        [this](const std::string& pid) { return isAccepted(pid); });
     std::weak_ptr<PeerSession> weak = session;
     session->start_accept_with_first(
         std::move(first),
@@ -1814,6 +1910,12 @@ struct ChatBackend::Impl {
           }
           postToQt([this, peer_id, peer_name] {
             emit q->peerNameUpdated(QString::fromStdString(peer_id), QString::fromStdString(peer_name));
+          });
+        },
+        [this](const std::string& peer_id, const std::vector<uint8_t>& bytes) {
+          const QByteArray png(reinterpret_cast<const char*>(bytes.data()), static_cast<int>(bytes.size()));
+          postToQt([this, peer_id, png] {
+            emit q->peerAvatarUpdated(QString::fromStdString(peer_id), png);
           });
         },
         [this](const std::string& peer_id, const std::string& peer_name, const std::string& text) {
@@ -1892,6 +1994,7 @@ struct ChatBackend::Impl {
         selfId,
         identity,
         [this] { return getSelfName(); },
+        [this] { return getSelfAvatarPng(); },
         [this](const std::string& pid) { return isAccepted(pid); },
         peer_id);
 
@@ -1919,6 +2022,10 @@ struct ChatBackend::Impl {
           postToQt([this, pid, pname] {
             emit q->peerNameUpdated(QString::fromStdString(pid), QString::fromStdString(pname));
           });
+        },
+        [this](const std::string& pid, const std::vector<uint8_t>& bytes) {
+          const QByteArray png(reinterpret_cast<const char*>(bytes.data()), static_cast<int>(bytes.size()));
+          postToQt([this, pid, png] { emit q->peerAvatarUpdated(QString::fromStdString(pid), png); });
         },
         [this](const std::string& pid, const std::string& pname, const std::string& text) {
           std::string label = pname.empty() ? pid : pname;
@@ -1976,7 +2083,8 @@ struct ChatBackend::Impl {
     const std::string peer_key = expected_peer_id;
     auto session = std::make_shared<PeerSession>(
         std::move(socket), PeerSession::Role::Initiator, std::move(selfId), identity,
-        [this] { return getSelfName(); }, [this](const std::string& pid) { return isAccepted(pid); },
+        [this] { return getSelfName(); }, [this] { return getSelfAvatarPng(); },
+        [this](const std::string& pid) { return isAccepted(pid); },
         std::move(expected_peer_id));
 
     // Store by expected peer id so we don't attempt another connect while handshaking.
@@ -2000,6 +2108,12 @@ struct ChatBackend::Impl {
           }
           postToQt([this, peer_id, peer_name] {
             emit q->peerNameUpdated(QString::fromStdString(peer_id), QString::fromStdString(peer_name));
+          });
+        },
+        [this](const std::string& peer_id, const std::vector<uint8_t>& bytes) {
+          const QByteArray png(reinterpret_cast<const char*>(bytes.data()), static_cast<int>(bytes.size()));
+          postToQt([this, peer_id, png] {
+            emit q->peerAvatarUpdated(QString::fromStdString(peer_id), png);
           });
         },
         [this](const std::string& peer_id, const std::string& peer_name, const std::string& text) {
@@ -2028,6 +2142,7 @@ struct ChatBackend::Impl {
 
     rendezvous->send_lookup(peer_id, [this, silent](RendezvousClient::LookupResult r) {
       if (!r.ok) {
+        postToQt([this, tid = r.target_id] { emit q->presenceUpdated(QString::fromStdString(tid), false); });
         if (!silent) {
           postToQt([this, tid = r.target_id] {
             emit q->deliveryError(QString::fromStdString(tid), "lookup failed (offline?)");
@@ -2036,6 +2151,7 @@ struct ChatBackend::Impl {
         return;
       }
       last_lookup[r.target_id] = r;
+      postToQt([this, tid = r.target_id] { emit q->presenceUpdated(QString::fromStdString(tid), true); });
       if (r.udp_port != 0) {
         // UDP hole punching is the default (works even if both peers are NATed).
         const std::string udp_ip = r.udp_ip.empty() ? r.ip : r.udp_ip;
@@ -2071,7 +2187,7 @@ struct ChatBackend::Impl {
       if (friend_connect_running) return;
       friend_connect_running = true;
     }
-    const auto delay = immediate ? std::chrono::seconds(0) : std::chrono::seconds(5);
+    const auto delay = immediate ? std::chrono::seconds(0) : std::chrono::seconds(10);
     friend_connect_timer.expires_after(delay);
     friend_connect_timer.async_wait([this](const boost::system::error_code& ec) {
       if (ec) return;
@@ -2135,19 +2251,26 @@ void ChatBackend::start(const Options& opt) {
 
   impl_->rendezvous = std::make_shared<RendezvousClient>(impl_->io, std::move(cfg));
   impl_->rendezvous->start(
-      [this]() {
-        const auto selfId = QString::fromStdString(std::string(impl_->rendezvous->id()));
-        const auto reachable = impl_->rendezvous->reachable();
-        const auto observedIp = QString::fromStdString(std::string(impl_->rendezvous->observed_ip()));
-        const auto extPort = static_cast<quint16>(impl_->rendezvous->external_port());
-        emit registered(selfId, reachable, observedIp, extPort);
-        impl_->rendezvous->enable_polling(true);
-        impl_->scheduleFriendConnect(/*immediate*/ true);
+      [impl = impl_]() {
+        const auto selfId = QString::fromStdString(std::string(impl->rendezvous->id()));
+        const auto reachable = impl->rendezvous->reachable();
+        const auto observedIp = QString::fromStdString(std::string(impl->rendezvous->observed_ip()));
+        const auto extPort = static_cast<quint16>(impl->rendezvous->external_port());
+        impl->postToQt([impl, selfId, reachable, observedIp, extPort] {
+          emit impl->q->registered(selfId, reachable, observedIp, extPort);
+        });
+        impl->rendezvous->enable_polling(true);
+        impl->scheduleFriendConnect(/*immediate*/ true);
       },
-      [this](const std::string& from_id, const std::string& intro) {
-        emit friendRequestReceived(QString::fromStdString(from_id), QString::fromStdString(intro));
+      [impl = impl_](const std::string& from_id, const std::string& intro) {
+        const auto fromId = QString::fromStdString(from_id);
+        const auto in = QString::fromStdString(intro);
+        impl->postToQt([impl, fromId, in] { emit impl->q->friendRequestReceived(fromId, in); });
       },
-      [this](const std::string& from_id) { emit friendAccepted(QString::fromStdString(from_id)); });
+      [impl = impl_](const std::string& from_id) {
+        const auto fromId = QString::fromStdString(from_id);
+        impl->postToQt([impl, fromId] { emit impl->q->friendAccepted(fromId); });
+      });
 
   impl_->work.emplace(boost::asio::make_work_guard(impl_->io));
   impl_->io_thread = std::thread([this] { impl_->io.run(); });
@@ -2190,6 +2313,30 @@ void ChatBackend::setSelfName(const QString& name) {
     }
     for (auto& [_, s] : impl->udp_sessions) {
       if (s) s->send_name(nm);
+    }
+  });
+}
+
+void ChatBackend::setSelfAvatarPng(const QByteArray& pngBytes) {
+  std::vector<uint8_t> bytes;
+  if (pngBytes.size() > 0) bytes.resize(static_cast<std::size_t>(pngBytes.size()));
+  if (!bytes.empty()) {
+    std::memcpy(bytes.data(), pngBytes.constData(), bytes.size());
+  }
+  // Cap to keep UDP frames safe.
+  if (bytes.size() > 48 * 1024) bytes.clear();
+
+  {
+    std::lock_guard lk(impl_->m);
+    impl_->self_avatar_png = bytes;
+  }
+
+  boost::asio::post(impl_->io, [impl = impl_, bytes = std::move(bytes)]() mutable {
+    for (auto& [_, s] : impl->tcp_sessions) {
+      if (s) s->send_avatar(bytes);
+    }
+    for (auto& [_, s] : impl->udp_sessions) {
+      if (s) s->send_avatar(bytes);
     }
   });
 }
