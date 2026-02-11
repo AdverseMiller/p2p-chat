@@ -27,7 +27,7 @@ make -j
 Qt GUI build (Qt6 Widgets):
 
 ```bash
-sudo apt-get install -y qt6-base-dev qt6-base-dev-tools
+sudo apt-get install -y qt6-base-dev qt6-base-dev-tools qt6-multimedia-dev libopus-dev
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ./build/p2p_chat_gui
@@ -71,7 +71,8 @@ This is often simpler than cross-compiling:
 pacman -Syu
 pacman -S --needed \
   mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja \
-  mingw-w64-x86_64-qt6-base mingw-w64-x86_64-boost mingw-w64-x86_64-openssl \
+  mingw-w64-x86_64-qt6-base mingw-w64-x86_64-qt6-multimedia mingw-w64-x86_64-opus \
+  mingw-w64-x86_64-boost mingw-w64-x86_64-openssl \
   mingw-w64-x86_64-miniupnpc mingw-w64-x86_64-pkgconf
 ```
 
@@ -100,6 +101,10 @@ Clients:
 ```
 
 The GUI defaults to `learn.fairuse.org:5555` as the rendezvous server (editable in the profile JSON for now).
+
+Voice calls:
+- Requires Qt6 Multimedia + Opus.
+- Use the top-right `Call` button in a chat; configure devices/bitrate via `Options -> Audio Settings...`.
 
 IDs and names:
 - Each user has a cryptographic shareable ID (`Your ID:`) derived from their Ed25519 public key.

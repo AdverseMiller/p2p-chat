@@ -76,6 +76,28 @@ if(PKG_CONFIG_FOUND)
 endif()
 
 find_package(Qt6 QUIET COMPONENTS Widgets)
+find_package(Qt6 QUIET COMPONENTS Multimedia)
+
+option(P2PCHAT_ENABLE_VOICE "Enable voice call support (requires Qt6 Multimedia + Opus)" ON)
+
+set(P2PCHAT_HAVE_OPUS OFF)
+if(P2PCHAT_ENABLE_VOICE)
+  # Prefer pkg-config (Linux/MSYS2), but also support toolchains without it.
+  if(PKG_CONFIG_FOUND)
+    pkg_check_modules(OPUS opus)
+  endif()
+  if(OPUS_FOUND)
+    set(P2PCHAT_HAVE_OPUS ON)
+  else()
+    find_path(OPUS_INCLUDE_DIR opus/opus.h)
+    find_library(OPUS_LIBRARY NAMES opus libopus)
+    if(OPUS_INCLUDE_DIR AND OPUS_LIBRARY)
+      set(P2PCHAT_HAVE_OPUS ON)
+      set(OPUS_INCLUDE_DIRS ${OPUS_INCLUDE_DIR})
+      set(OPUS_LIBRARIES ${OPUS_LIBRARY})
+    endif()
+  endif()
+endif()
 
 if(NOT WIN32)
   add_executable(rendezvous_server rendezvous_server.cpp)
@@ -105,7 +127,7 @@ if(UNIX)
   endif()
 endif()
 
-if(Qt6_FOUND)
+if(Qt6Widgets_FOUND)
   add_executable(p2p_chat_gui
     gui/main.cpp
     gui/MainWindow.cpp
@@ -114,6 +136,8 @@ if(Qt6_FOUND)
     gui/Profile.hpp
     gui/ChatBackend.cpp
     gui/ChatBackend.hpp
+    gui/AudioSettingsDialog.cpp
+    gui/AudioSettingsDialog.hpp
   )
   target_include_directories(p2p_chat_gui PRIVATE .)
   target_link_libraries(p2p_chat_gui PRIVATE Qt6::Widgets Boost::system OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
@@ -127,6 +151,15 @@ if(Qt6_FOUND)
     target_compile_definitions(p2p_chat_gui PRIVATE HAVE_UPNP)
     target_include_directories(p2p_chat_gui PRIVATE ${MINIUPNPC_INCLUDE_DIRS})
     target_link_libraries(p2p_chat_gui PRIVATE ${MINIUPNPC_LIBRARIES})
+  endif()
+
+  if(P2PCHAT_ENABLE_VOICE AND Qt6Multimedia_FOUND AND P2PCHAT_HAVE_OPUS)
+    target_compile_definitions(p2p_chat_gui PRIVATE P2PCHAT_VOICE)
+    target_link_libraries(p2p_chat_gui PRIVATE Qt6::Multimedia)
+    target_include_directories(p2p_chat_gui PRIVATE ${OPUS_INCLUDE_DIRS})
+    target_link_libraries(p2p_chat_gui PRIVATE ${OPUS_LIBRARIES})
+  else()
+    target_compile_definitions(p2p_chat_gui PRIVATE P2PCHAT_NO_VOICE)
   endif()
 
   if(NOT WIN32)

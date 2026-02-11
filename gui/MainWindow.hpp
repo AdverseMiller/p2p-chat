@@ -41,6 +41,7 @@ private:
   void appendMessage(const QString& peerId, const QString& label, const QString& text, bool incoming);
   void refreshHeader();
   void refreshSelfProfileWidget();
+  void refreshCallButton();
 
   Profile profile_;
   ChatBackend backend_;
@@ -59,6 +60,7 @@ private:
   QPushButton* rejectBtn_ = nullptr;
 
   QLabel* headerLabel_ = nullptr;
+  QPushButton* callBtn_ = nullptr;
   QTextBrowser* chatView_ = nullptr;
   QLineEdit* input_ = nullptr;
 
@@ -72,4 +74,7 @@ private:
   QMap<QString, bool> online_;
 
   QAction* darkModeAction_ = nullptr;
+
+  QString activeCallPeer_;
+  QString activeCallState_;
 };

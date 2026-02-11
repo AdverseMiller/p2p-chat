@@ -9,10 +9,12 @@
 
 #include <QCoreApplication>
 #include <QPointer>
+#include <QTimer>
 
 #include <boost/asio.hpp>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <deque>
@@ -26,6 +28,21 @@
 #include <unordered_set>
 #include <vector>
 
+#include <unistd.h>
+
+#if defined(P2PCHAT_VOICE)
+#include <QAudioDevice>
+#include <QAudioFormat>
+#include <QAudioSink>
+#include <QAudioSource>
+#include <QElapsedTimer>
+#include <QIODevice>
+#include <QMap>
+#include <QMediaDevices>
+
+#include <opus/opus.h>
+#endif
+
 using boost::asio::ip::tcp;
 using boost::asio::ip::udp;
 using common::json;
@@ -38,6 +55,118 @@ constexpr auto kUdpPunchInterval = std::chrono::milliseconds(250);
 constexpr auto kUdpHandshakeResend = std::chrono::milliseconds(400);
 constexpr auto kUdpDataResend = std::chrono::milliseconds(500);
 
+#if !defined(NDEBUG)
+constexpr bool kDebugLogs = true;
+#else
+constexpr bool kDebugLogs = false;
+#endif
+
+#if defined(P2PCHAT_VOICE)
+constexpr uint32_t kVoiceMagic = 0x50325056u; // "P2PV"
+constexpr uint8_t kVoiceVersion = 1;
+
+inline void write_u16be(uint8_t* p, uint16_t v) {
+  p[0] = static_cast<uint8_t>((v >> 8) & 0xFF);
+  p[1] = static_cast<uint8_t>(v & 0xFF);
+}
+inline void write_u32be(uint8_t* p, uint32_t v) {
+  p[0] = static_cast<uint8_t>((v >> 24) & 0xFF);
+  p[1] = static_cast<uint8_t>((v >> 16) & 0xFF);
+  p[2] = static_cast<uint8_t>((v >> 8) & 0xFF);
+  p[3] = static_cast<uint8_t>(v & 0xFF);
+}
+inline void write_u64be(uint8_t* p, uint64_t v) {
+  p[0] = static_cast<uint8_t>((v >> 56) & 0xFF);
+  p[1] = static_cast<uint8_t>((v >> 48) & 0xFF);
+  p[2] = static_cast<uint8_t>((v >> 40) & 0xFF);
+  p[3] = static_cast<uint8_t>((v >> 32) & 0xFF);
+  p[4] = static_cast<uint8_t>((v >> 24) & 0xFF);
+  p[5] = static_cast<uint8_t>((v >> 16) & 0xFF);
+  p[6] = static_cast<uint8_t>((v >> 8) & 0xFF);
+  p[7] = static_cast<uint8_t>(v & 0xFF);
+}
+inline uint16_t read_u16be(const uint8_t* p) {
+  return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | static_cast<uint16_t>(p[1]));
+}
+inline uint32_t read_u32be(const uint8_t* p) {
+  return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
+         (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
+}
+inline uint64_t read_u64be(const uint8_t* p) {
+  return (static_cast<uint64_t>(p[0]) << 56) | (static_cast<uint64_t>(p[1]) << 48) |
+         (static_cast<uint64_t>(p[2]) << 40) | (static_cast<uint64_t>(p[3]) << 32) |
+         (static_cast<uint64_t>(p[4]) << 24) | (static_cast<uint64_t>(p[5]) << 16) |
+         (static_cast<uint64_t>(p[6]) << 8) | static_cast<uint64_t>(p[7]);
+}
+
+class PcmRingBufferIODevice final : public QIODevice {
+public:
+  explicit PcmRingBufferIODevice(QObject* parent = nullptr) : QIODevice(parent) {}
+
+  void start() { open(QIODevice::ReadOnly); }
+  void stop() { close(); }
+
+  bool isSequential() const override { return true; }
+
+  void push(const QByteArray& pcm) {
+    if (pcm.isEmpty()) return;
+    std::lock_guard lk(m_);
+    if (buf_.size() > kMaxBytes) {
+      // Drop oldest data under pressure.
+      const int drop = std::min<int>(buf_.size(), pcm.size());
+      buf_.remove(0, drop);
+    }
+    buf_.append(pcm);
+  }
+
+  qint64 bytesAvailable() const override {
+    std::lock_guard lk(m_);
+    return QIODevice::bytesAvailable() + buf_.size();
+  }
+
+  qint64 readData(char* data, qint64 maxlen) override {
+    std::lock_guard lk(m_);
+    if (buf_.isEmpty()) return 0;
+    const qint64 n = std::min<qint64>(maxlen, buf_.size());
+    std::memcpy(data, buf_.constData(), static_cast<std::size_t>(n));
+    buf_.remove(0, static_cast<int>(n));
+    return n;
+  }
+
+  qint64 writeData(const char*, qint64) override { return -1; }
+
+private:
+  static constexpr int kMaxBytes = 48000 * 2 * 1; // ~1s @48kHz mono s16
+  mutable std::mutex m_;
+  QByteArray buf_;
+};
+
+#if !defined(_WIN32)
+bool pipewireSpaSupportPresent() {
+  // PipeWire needs the SPA support plugin for its system handle.
+  // Many minimal installs have libpipewire but miss this plugin directory, and QtMultimedia may abort.
+  const char* env = std::getenv("SPA_PLUGIN_DIR");
+  auto exists = [](const std::string& dir) {
+    const std::string a = dir + "/support/libspa-support.so";
+    const std::string b = dir + "/support/libspa-support.so.0";
+    return ::access(a.c_str(), R_OK) == 0 || ::access(b.c_str(), R_OK) == 0;
+  };
+  if (env && *env) {
+    std::string s(env);
+    std::size_t pos = 0;
+    while (pos <= s.size()) {
+      const auto next = s.find(':', pos);
+      const auto part = s.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+      if (!part.empty() && exists(part)) return true;
+      if (next == std::string::npos) break;
+      pos = next + 1;
+    }
+  }
+  return exists("/usr/lib/spa-0.2") || exists("/usr/lib64/spa-0.2") || exists("/lib/spa-0.2") || exists("/lib64/spa-0.2");
+}
+#endif
+#endif // P2PCHAT_VOICE
+
 class PeerSession : public std::enable_shared_from_this<PeerSession> {
 public:
   enum class Role { Initiator, Acceptor };
@@ -45,6 +174,7 @@ public:
   using OnName = std::function<void(const std::string& peer_id, const std::string& peer_name)>;
   using OnAvatar = std::function<void(const std::string& peer_id, const std::vector<uint8_t>& png_bytes)>;
   using OnChat = std::function<void(const std::string& peer_id, const std::string& peer_name, const std::string& text)>;
+  using OnControl = std::function<void(const std::string& peer_id, json inner)>;
   using OnClosed = std::function<void()>;
 
   PeerSession(tcp::socket socket,
@@ -65,11 +195,17 @@ public:
         expected_peer_id_(std::move(expected_peer_id)),
         writer_(std::make_shared<common::JsonWriteQueue<tcp::socket>>(socket_)) {}
 
-  void start(OnReady on_ready, OnName on_name, OnAvatar on_avatar, OnChat on_chat, OnClosed on_closed) {
+  void start(OnReady on_ready,
+             OnName on_name,
+             OnAvatar on_avatar,
+             OnChat on_chat,
+             OnControl on_control,
+             OnClosed on_closed) {
     on_ready_ = std::move(on_ready);
     on_name_ = std::move(on_name);
     on_avatar_ = std::move(on_avatar);
     on_chat_ = std::move(on_chat);
+    on_control_ = std::move(on_control);
     on_closed_ = std::move(on_closed);
     if (role_ == Role::Initiator) {
       start_secure_initiator();
@@ -78,12 +214,18 @@ public:
     }
   }
 
-  void start_accept_with_first(json first, OnReady on_ready, OnName on_name, OnAvatar on_avatar, OnChat on_chat,
+  void start_accept_with_first(json first,
+                               OnReady on_ready,
+                               OnName on_name,
+                               OnAvatar on_avatar,
+                               OnChat on_chat,
+                               OnControl on_control,
                                OnClosed on_closed) {
     on_ready_ = std::move(on_ready);
     on_name_ = std::move(on_name);
     on_avatar_ = std::move(on_avatar);
     on_chat_ = std::move(on_chat);
+    on_control_ = std::move(on_control);
     on_closed_ = std::move(on_closed);
     if (!first.contains("type") || !first["type"].is_string()) return send_error_and_close("missing type");
     const std::string type = first["type"].get<std::string>();
@@ -115,6 +257,11 @@ public:
     json inner;
     inner["type"] = "avatar";
     inner["png"] = common::base64url_encode(png);
+    send_secure(std::move(inner));
+  }
+
+  void send_control(json inner) {
+    if (!ready_) return;
     send_secure(std::move(inner));
   }
 
@@ -462,6 +609,7 @@ private:
       if (on_avatar_) on_avatar_(peer_id_, *bytes);
       return;
     }
+    if (on_control_) on_control_(peer_id_, std::move(inner));
   }
 
   tcp::socket socket_;
@@ -481,6 +629,7 @@ private:
   OnName on_name_;
   OnAvatar on_avatar_;
   OnChat on_chat_;
+  OnControl on_control_;
   OnClosed on_closed_;
 
   std::optional<common::X25519KeyPair> eph_;
@@ -499,6 +648,8 @@ public:
   using OnName = std::function<void(const std::string& peer_id, const std::string& peer_name)>;
   using OnAvatar = std::function<void(const std::string& peer_id, const std::vector<uint8_t>& png_bytes)>;
   using OnChat = std::function<void(const std::string& peer_id, const std::string& peer_name, const std::string& text)>;
+  using OnControl = std::function<void(const std::string& peer_id, json inner)>;
+  using OnVoice = std::function<void(const std::string& peer_id, uint64_t seq, uint32_t ts, const std::vector<uint8_t>& opus)>;
   using OnClosed = std::function<void()>;
 
   UdpPeerSession(udp::socket& socket,
@@ -509,7 +660,8 @@ public:
                  std::function<std::string()> get_self_name,
                  std::function<std::vector<uint8_t>()> get_self_avatar_png,
                  std::function<bool(const std::string&)> allow_peer,
-                 std::string expected_peer_id = {})
+                 std::string expected_peer_id = {},
+                 std::function<void(const std::string&)> debug_log = {})
       : socket_(socket),
         peer_ep_(std::move(peer_ep)),
         role_(role),
@@ -519,18 +671,29 @@ public:
         get_self_avatar_png_(std::move(get_self_avatar_png)),
         allow_peer_(std::move(allow_peer)),
         expected_peer_id_(std::move(expected_peer_id)),
+        debug_log_(std::move(debug_log)),
         punch_timer_(socket_.get_executor()),
         hs_timer_(socket_.get_executor()),
         data_timer_(socket_.get_executor()),
         deadline_timer_(socket_.get_executor()),
         keepalive_timer_(socket_.get_executor()) {}
 
-  void start(OnReady on_ready, OnName on_name, OnAvatar on_avatar, OnChat on_chat, OnClosed on_closed) {
+  void start(OnReady on_ready,
+             OnName on_name,
+             OnAvatar on_avatar,
+             OnChat on_chat,
+             OnControl on_control,
+             OnVoice on_voice,
+             OnClosed on_closed) {
     on_ready_ = std::move(on_ready);
     on_name_ = std::move(on_name);
     on_avatar_ = std::move(on_avatar);
     on_chat_ = std::move(on_chat);
+    on_control_ = std::move(on_control);
+    on_voice_ = std::move(on_voice);
     on_closed_ = std::move(on_closed);
+    dlog(std::string("start role=") + (role_ == Role::Initiator ? "initiator" : "acceptor") +
+         " peer_ep=" + common::endpoint_to_string(peer_ep_) + " expected_peer_id=" + expected_peer_id_);
     schedule_punch();
     schedule_deadline();
     if (role_ == Role::Initiator) {
@@ -539,12 +702,14 @@ public:
   }
 
   void start_accept_with_first(const json& first, const udp::endpoint& from, OnReady on_ready, OnName on_name,
-                               OnAvatar on_avatar, OnChat on_chat, OnClosed on_closed) {
+                               OnAvatar on_avatar, OnChat on_chat, OnControl on_control, OnVoice on_voice, OnClosed on_closed) {
     peer_ep_ = from;
     on_ready_ = std::move(on_ready);
     on_name_ = std::move(on_name);
     on_avatar_ = std::move(on_avatar);
     on_chat_ = std::move(on_chat);
+    on_control_ = std::move(on_control);
+    on_voice_ = std::move(on_voice);
     on_closed_ = std::move(on_closed);
     schedule_punch();
     schedule_deadline();
@@ -599,6 +764,83 @@ public:
     enqueue_secure(std::move(inner));
   }
 
+  void send_control(json inner) { enqueue_secure(std::move(inner)); }
+
+  bool voice_ready() const { return ready_ && ready_confirmed_ && !closed_; }
+
+  void set_voice_frame_ms(int frame_ms) {
+#if defined(P2PCHAT_VOICE)
+    if (frame_ms != 10 && frame_ms != 20) frame_ms = 20;
+    voice_frame_samples_ = 48000 * frame_ms / 1000;
+#else
+    (void)frame_ms;
+#endif
+  }
+
+  void send_voice_frame(std::vector<uint8_t> opus_frame) {
+#if !defined(P2PCHAT_VOICE)
+    (void)opus_frame;
+    return;
+#else
+    if (!voice_ready()) {
+      if (kDebugLogs) {
+        voice_tx_drop_not_ready_++;
+        if ((voice_tx_drop_not_ready_ % 200) == 1) {
+          dlog("voice tx drop: not ready (ready=" + std::to_string(ready_) + " confirmed=" +
+               std::to_string(ready_confirmed_) + " closed=" + std::to_string(closed_) + ")");
+        }
+      }
+      return;
+    }
+    if (opus_frame.empty()) return;
+    if (opus_frame.size() > 1200) {
+      if (kDebugLogs) dlog("voice tx drop: opus_frame too big=" + std::to_string(opus_frame.size()));
+      return; // conservative MTU-ish cap
+    }
+    if (peer_ep_.port() == 0) {
+      if (kDebugLogs) dlog("voice tx drop: peer_ep port=0");
+      return;
+    }
+
+    const uint64_t seq = voice_send_key_.counter;
+    const std::string aad = transcript_ + "|voice|" + std::to_string(seq);
+    const auto nonce = common::make_nonce(voice_send_key_);
+    const auto ct = common::aead_chacha20poly1305_encrypt(
+        voice_send_key_.key,
+        nonce,
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(aad.data()), aad.size()),
+        std::span<const uint8_t>(opus_frame.data(), opus_frame.size()));
+    if (!ct) {
+      if (kDebugLogs) dlog("voice tx encrypt failed seq=" + std::to_string(seq));
+      return;
+    }
+
+    voice_timestamp_ += static_cast<uint32_t>(voice_frame_samples_);
+    const uint32_t ts = voice_timestamp_;
+
+    const uint16_t ct_len = static_cast<uint16_t>(ct->size());
+    std::vector<uint8_t> pkt;
+    pkt.resize(20u + ct_len);
+    write_u32be(pkt.data(), kVoiceMagic);
+    pkt[4] = kVoiceVersion;
+    pkt[5] = 0;
+    write_u64be(pkt.data() + 6, seq);
+    write_u32be(pkt.data() + 14, ts);
+    write_u16be(pkt.data() + 18, ct_len);
+    std::memcpy(pkt.data() + 20, ct->data(), ct_len);
+
+    auto buf = std::make_shared<std::vector<uint8_t>>(std::move(pkt));
+    if (kDebugLogs) {
+      voice_tx_ok_++;
+      if ((voice_tx_ok_ % 50) == 1) {
+        dlog("voice tx ok seq=" + std::to_string(seq) + " ts=" + std::to_string(ts) + " ct_len=" +
+             std::to_string(ct_len) + " to=" + common::endpoint_to_string(peer_ep_));
+      }
+    }
+    socket_.async_send_to(boost::asio::buffer(*buf), peer_ep_, [buf](const boost::system::error_code&, std::size_t) {});
+#endif
+  }
+
   void close() {
     if (closed_) return;
     closed_ = true;
@@ -613,6 +855,47 @@ public:
   std::string_view peer_id() const { return peer_id_; }
   std::string_view peer_name() const { return peer_name_; }
   const udp::endpoint& peer_endpoint() const { return peer_ep_; }
+
+  void handle_voice_packet(uint64_t seq, uint32_t ts, std::span<const uint8_t> ct, const udp::endpoint& from) {
+#if !defined(P2PCHAT_VOICE)
+    (void)seq;
+    (void)ts;
+    (void)ct;
+    (void)from;
+    return;
+#else
+    if (!voice_ready()) return;
+    if (from != peer_ep_) return;
+    if (ct.size() < 16) return;
+
+    const std::string aad = transcript_ + "|voice|" + std::to_string(seq);
+    const auto nonce = make_voice_recv_nonce(seq);
+    const auto pt = common::aead_chacha20poly1305_decrypt(
+        voice_recv_key_,
+        nonce,
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(aad.data()), aad.size()),
+        ct);
+    if (!pt) {
+      if (kDebugLogs) {
+        voice_rx_decrypt_fail_++;
+        if ((voice_rx_decrypt_fail_ % 200) == 1) {
+          dlog("voice rx decrypt failed count=" + std::to_string(voice_rx_decrypt_fail_) + " seq=" + std::to_string(seq) +
+               " ct_len=" + std::to_string(ct.size()));
+        }
+      }
+      return;
+    }
+    if (pt->size() > 1200) return;
+    if (kDebugLogs) {
+      voice_rx_ok_++;
+      if ((voice_rx_ok_ % 50) == 1) {
+        dlog("voice rx ok seq=" + std::to_string(seq) + " ts=" + std::to_string(ts) + " opus_len=" +
+             std::to_string(pt->size()));
+      }
+    }
+    if (on_voice_) on_voice_(peer_id_, seq, ts, *pt);
+#endif
+  }
 
 private:
   static constexpr std::string_view kProto = "p2p-chat-secure-v1";
@@ -708,6 +991,7 @@ private:
     hello_sent_ = true;
     last_hs_msg_ = hello;
     send_datagram(hello);
+    dlog("sent secure_hello");
     schedule_hs_resend();
   }
 
@@ -736,7 +1020,10 @@ private:
 
     const std::string init_id = j["id"].get<std::string>();
     if (!common::is_valid_id(init_id)) return close();
-    if (allow_peer_ && !allow_peer_(init_id)) return close();
+    if (allow_peer_ && !allow_peer_(init_id)) {
+      dlog("reject secure_hello: allow_peer=false id=" + init_id);
+      return close();
+    }
 
     const std::string init_eph_b64 = j["eph"].get<std::string>();
     const auto init_eph = common::base64url_decode(init_eph_b64);
@@ -764,6 +1051,7 @@ private:
     ack["sig"] = ack_sig;
     last_hs_msg_ = ack;
     send_datagram(ack);
+    dlog("sent secure_hello_ack peer_id=" + peer_id_);
     // Wait for finish; keep resending ack for a short while (duplicate hellos will also refresh it).
     schedule_hs_resend();
   }
@@ -802,6 +1090,7 @@ private:
     fin["sig"] = fin_sig;
     last_hs_msg_ = fin;
     send_datagram(fin);
+    dlog("sent secure_finish");
 
     if (!derive_keys()) return close();
     ready_ = true;
@@ -809,6 +1098,7 @@ private:
     send_name_update();
     send_avatar_update();
     try_send_next();
+    dlog("handshake ready (initiator) peer_id=" + peer_id_);
     // Keep resending finish until the peer proves readiness (ack/secure_msg).
     schedule_hs_resend();
   }
@@ -833,6 +1123,7 @@ private:
     send_name_update();
     send_avatar_update();
     try_send_next();
+    dlog("handshake ready (acceptor) peer_id=" + peer_id_);
   }
 
   bool derive_keys() {
@@ -853,11 +1144,16 @@ private:
     const auto k_resp_to_init = hkdf32(std::string(kProto) + " key resp->init");
     const auto n_init_to_resp = hkdf32(std::string(kProto) + " nonce init->resp");
     const auto n_resp_to_init = hkdf32(std::string(kProto) + " nonce resp->init");
+    const auto vk_init_to_resp = hkdf32(std::string(kProto) + " voice key init->resp");
+    const auto vk_resp_to_init = hkdf32(std::string(kProto) + " voice key resp->init");
+    const auto vn_init_to_resp = hkdf32(std::string(kProto) + " voice nonce init->resp");
+    const auto vn_resp_to_init = hkdf32(std::string(kProto) + " voice nonce resp->init");
     const auto ak_init_to_resp = hkdf32(std::string(kProto) + " ack key init->resp");
     const auto ak_resp_to_init = hkdf32(std::string(kProto) + " ack key resp->init");
     const auto an_init_to_resp = hkdf32(std::string(kProto) + " ack nonce init->resp");
     const auto an_resp_to_init = hkdf32(std::string(kProto) + " ack nonce resp->init");
     if (!k_init_to_resp || !k_resp_to_init || !n_init_to_resp || !n_resp_to_init ||
+        !vk_init_to_resp || !vk_resp_to_init || !vn_init_to_resp || !vn_resp_to_init ||
         !ak_init_to_resp || !ak_resp_to_init || !an_init_to_resp || !an_resp_to_init) return false;
 
     if (role_ == Role::Initiator) {
@@ -865,6 +1161,11 @@ private:
       recv_key_.key = *k_resp_to_init;
       std::copy_n(n_init_to_resp->data(), 4, send_key_.nonce_prefix.data());
       std::copy_n(n_resp_to_init->data(), 4, recv_nonce_prefix_.data());
+
+      voice_send_key_.key = *vk_init_to_resp;
+      voice_recv_key_ = *vk_resp_to_init;
+      std::copy_n(vn_init_to_resp->data(), 4, voice_send_key_.nonce_prefix.data());
+      std::copy_n(vn_resp_to_init->data(), 4, voice_recv_nonce_prefix_.data());
 
       ack_send_key_ = *ak_resp_to_init;
       ack_recv_key_ = *ak_init_to_resp;
@@ -876,6 +1177,11 @@ private:
       std::copy_n(n_resp_to_init->data(), 4, send_key_.nonce_prefix.data());
       std::copy_n(n_init_to_resp->data(), 4, recv_nonce_prefix_.data());
 
+      voice_send_key_.key = *vk_resp_to_init;
+      voice_recv_key_ = *vk_init_to_resp;
+      std::copy_n(vn_resp_to_init->data(), 4, voice_send_key_.nonce_prefix.data());
+      std::copy_n(vn_init_to_resp->data(), 4, voice_recv_nonce_prefix_.data());
+
       ack_send_key_ = *ak_init_to_resp;
       ack_recv_key_ = *ak_resp_to_init;
       std::copy_n(an_init_to_resp->data(), 4, ack_send_nonce_prefix_.data());
@@ -883,6 +1189,10 @@ private:
     }
     send_key_.counter = 0;
     recv_expected_seq_ = 0;
+    voice_send_key_.counter = 0;
+    voice_timestamp_ = 0;
+    voice_frame_samples_ = 960; // default 20ms @ 48kHz mono
+    dlog("keys derived ok");
     return true;
   }
 
@@ -954,6 +1264,23 @@ private:
     nonce[1] = recv_nonce_prefix_[1];
     nonce[2] = recv_nonce_prefix_[2];
     nonce[3] = recv_nonce_prefix_[3];
+    nonce[4] = static_cast<uint8_t>((seq >> 56) & 0xFF);
+    nonce[5] = static_cast<uint8_t>((seq >> 48) & 0xFF);
+    nonce[6] = static_cast<uint8_t>((seq >> 40) & 0xFF);
+    nonce[7] = static_cast<uint8_t>((seq >> 32) & 0xFF);
+    nonce[8] = static_cast<uint8_t>((seq >> 24) & 0xFF);
+    nonce[9] = static_cast<uint8_t>((seq >> 16) & 0xFF);
+    nonce[10] = static_cast<uint8_t>((seq >> 8) & 0xFF);
+    nonce[11] = static_cast<uint8_t>(seq & 0xFF);
+    return nonce;
+  }
+
+  std::array<uint8_t, 12> make_voice_recv_nonce(uint64_t seq) const {
+    std::array<uint8_t, 12> nonce{};
+    nonce[0] = voice_recv_nonce_prefix_[0];
+    nonce[1] = voice_recv_nonce_prefix_[1];
+    nonce[2] = voice_recv_nonce_prefix_[2];
+    nonce[3] = voice_recv_nonce_prefix_[3];
     nonce[4] = static_cast<uint8_t>((seq >> 56) & 0xFF);
     nonce[5] = static_cast<uint8_t>((seq >> 48) & 0xFF);
     nonce[6] = static_cast<uint8_t>((seq >> 40) & 0xFF);
@@ -1091,6 +1418,14 @@ private:
       if (on_avatar_) on_avatar_(peer_id_, *bytes);
       return;
     }
+    if (on_control_) on_control_(peer_id_, std::move(inner));
+  }
+
+  void dlog(const std::string& msg) const {
+    if (!kDebugLogs) return;
+    if (!debug_log_) return;
+    const std::string who = !peer_id_.empty() ? peer_id_ : expected_peer_id_;
+    debug_log_("udp[" + who + "] " + msg);
   }
 
   udp::socket& socket_;
@@ -1104,6 +1439,7 @@ private:
   std::string peer_name_;
   std::string expected_peer_id_;
   std::function<bool(const std::string&)> allow_peer_;
+  std::function<void(const std::string&)> debug_log_;
   bool ready_ = false;
   bool closed_ = false;
   bool hello_sent_ = false;
@@ -1113,6 +1449,8 @@ private:
   OnName on_name_;
   OnAvatar on_avatar_;
   OnChat on_chat_;
+  OnControl on_control_;
+  OnVoice on_voice_;
   OnClosed on_closed_;
 
   boost::asio::steady_timer punch_timer_;
@@ -1133,6 +1471,16 @@ private:
   common::AeadKey recv_key_;
   std::array<uint8_t, 4> recv_nonce_prefix_{};
   uint64_t recv_expected_seq_ = 0;
+
+  common::AeadKey voice_send_key_;
+  std::array<uint8_t, 32> voice_recv_key_{};
+  std::array<uint8_t, 4> voice_recv_nonce_prefix_{};
+  uint32_t voice_timestamp_ = 0;
+  int voice_frame_samples_ = 960;
+  uint64_t voice_tx_ok_ = 0;
+  uint64_t voice_tx_drop_not_ready_ = 0;
+  uint64_t voice_rx_ok_ = 0;
+  uint64_t voice_rx_decrypt_fail_ = 0;
 
   std::array<uint8_t, 32> ack_send_key_{};
   std::array<uint8_t, 32> ack_recv_key_{};
@@ -1523,9 +1871,54 @@ struct ChatBackend::Impl {
   std::mutex m;
   std::unordered_set<std::string> accepted_friends;
   std::unordered_map<std::string, std::deque<std::string>> queued_outgoing;
+  std::unordered_map<std::string, std::deque<json>> queued_control;
   std::unordered_map<std::string, std::string> peer_names;
   std::string self_name;
   std::vector<uint8_t> self_avatar_png;
+
+  // Call state (Qt thread only).
+  QString callPeerId;
+  QString callId;
+  bool callOutgoing = false;
+  bool callLocalAccepted = false;
+  bool callRemoteAccepted = false;
+  int callBitrate = 32000;
+  int callFrameMs = 20;
+  ChatBackend::VoiceSettings callSettings;
+
+#if defined(P2PCHAT_VOICE)
+  struct VoiceRuntime {
+    QString peerId;
+    QString callId;
+    int frameMs = 20;
+    int bitrate = 32000;
+    int sampleRate = 48000;
+    int channels = 1;
+
+    OpusEncoder* enc = nullptr;
+    OpusDecoder* dec = nullptr;
+
+    QPointer<QAudioSource> source;
+    QPointer<QIODevice> sourceDev;
+    QByteArray captureBuf;
+
+    QPointer<QAudioSink> sink;
+    QPointer<PcmRingBufferIODevice> sinkDev;
+
+    QPointer<QTimer> playoutTimer;
+    QMap<quint64, QByteArray> jitter; // seq -> opus frame
+    quint64 expectedSeq = 0;
+    bool playoutStarted = false;
+
+    QElapsedTimer logTimer;
+    uint64_t capBytes = 0;
+    uint64_t encFrames = 0;
+    uint64_t txFrames = 0;
+    uint64_t rxFrames = 0;
+    uint64_t decFrames = 0;
+  };
+  std::unique_ptr<VoiceRuntime> voice;
+#endif
 
   boost::asio::io_context io;
   std::optional<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>> work;
@@ -1549,6 +1942,12 @@ struct ChatBackend::Impl {
   boost::asio::steady_timer udp_announce_timer{io};
   std::string server_host;
   uint16_t server_port = 0;
+#if defined(P2PCHAT_VOICE)
+  uint64_t udp_voice_routed = 0;
+  uint64_t udp_voice_drop_no_map = 0;
+  uint64_t udp_voice_drop_no_session = 0;
+  uint64_t udp_voice_drop_bad_frame = 0;
+#endif
 
   std::shared_ptr<RendezvousClient> rendezvous;
   std::unordered_map<std::string, std::shared_ptr<PeerSession>> tcp_sessions;
@@ -1575,6 +1974,402 @@ struct ChatBackend::Impl {
                               Qt::QueuedConnection);
   }
 
+  void resetCallStateQt() {
+    callPeerId.clear();
+    callId.clear();
+    callOutgoing = false;
+    callLocalAccepted = false;
+    callRemoteAccepted = false;
+    callBitrate = 32000;
+    callFrameMs = 20;
+    callSettings = {};
+  }
+
+#if defined(P2PCHAT_VOICE)
+  void stopVoiceQt() {
+    if (!voice) return;
+    if (kDebugLogs) {
+      emit q->logLine("[dbg] voice stop peer=" + voice->peerId + " capBytes=" + QString::number(voice->capBytes) +
+                      " encFrames=" + QString::number(voice->encFrames) + " rxFrames=" + QString::number(voice->rxFrames) +
+                      " decFrames=" + QString::number(voice->decFrames));
+    }
+
+    if (voice->playoutTimer) {
+      voice->playoutTimer->stop();
+      voice->playoutTimer->deleteLater();
+      voice->playoutTimer = nullptr;
+    }
+    if (voice->source) {
+      voice->source->stop();
+      voice->source->deleteLater();
+      voice->source = nullptr;
+    }
+    voice->sourceDev = nullptr;
+    voice->captureBuf.clear();
+
+    if (voice->sink) {
+      voice->sink->stop();
+      voice->sink->deleteLater();
+      voice->sink = nullptr;
+    }
+    if (voice->sinkDev) {
+      voice->sinkDev->stop();
+      voice->sinkDev->deleteLater();
+      voice->sinkDev = nullptr;
+    }
+
+    if (voice->enc) {
+      opus_encoder_destroy(voice->enc);
+      voice->enc = nullptr;
+    }
+    if (voice->dec) {
+      opus_decoder_destroy(voice->dec);
+      voice->dec = nullptr;
+    }
+    voice.reset();
+  }
+
+  static QAudioDevice findAudioDeviceByHexId(const QList<QAudioDevice>& devices, const QString& hexId) {
+    if (hexId.isEmpty()) return QAudioDevice();
+    for (const auto& d : devices) {
+      if (QString::fromLatin1(d.id().toHex()) == hexId) return d;
+    }
+    return QAudioDevice();
+  }
+
+  void maybeStartVoiceQt() {
+    if (callPeerId.isEmpty() || callId.isEmpty()) return;
+    if (!(callLocalAccepted && callRemoteAccepted)) return;
+    if (voice) return;
+
+    const int frameMs = (callFrameMs == 10) ? 10 : 20;
+    const int sampleRate = 48000;
+    const int channels = 1;
+    const int frameSamples = sampleRate * frameMs / 1000;
+
+    int err = 0;
+    OpusEncoder* enc = opus_encoder_create(sampleRate, channels, OPUS_APPLICATION_VOIP, &err);
+    if (!enc || err != OPUS_OK) {
+      if (enc) opus_encoder_destroy(enc);
+      emit q->callEnded(callPeerId, "failed to create Opus encoder");
+      resetCallStateQt();
+      return;
+    }
+    OpusDecoder* dec = opus_decoder_create(sampleRate, channels, &err);
+    if (!dec || err != OPUS_OK) {
+      opus_encoder_destroy(enc);
+      if (dec) opus_decoder_destroy(dec);
+      emit q->callEnded(callPeerId, "failed to create Opus decoder");
+      resetCallStateQt();
+      return;
+    }
+
+    // Configure bitrate (best-effort).
+    opus_encoder_ctl(enc, OPUS_SET_BITRATE(callBitrate));
+
+    QAudioFormat fmt;
+    fmt.setSampleRate(sampleRate);
+    fmt.setChannelCount(channels);
+    fmt.setSampleFormat(QAudioFormat::Int16);
+
+    auto inDev = findAudioDeviceByHexId(QMediaDevices::audioInputs(), callSettings.inputDeviceIdHex);
+    if (inDev.isNull()) inDev = QMediaDevices::defaultAudioInput();
+    auto outDev = findAudioDeviceByHexId(QMediaDevices::audioOutputs(), callSettings.outputDeviceIdHex);
+    if (outDev.isNull()) outDev = QMediaDevices::defaultAudioOutput();
+
+    auto vr = std::make_unique<VoiceRuntime>();
+    vr->peerId = callPeerId;
+    vr->callId = callId;
+    vr->frameMs = frameMs;
+    vr->bitrate = callBitrate;
+    vr->sampleRate = sampleRate;
+    vr->channels = channels;
+    vr->enc = enc;
+    vr->dec = dec;
+    vr->logTimer.start();
+
+    if (kDebugLogs) {
+      const bool inOk = inDev.isNull() ? false : inDev.isFormatSupported(fmt);
+      const bool outOk = outDev.isNull() ? false : outDev.isFormatSupported(fmt);
+      emit q->logLine("[dbg] voice init peer=" + vr->peerId + " frameMs=" + QString::number(frameMs) +
+                      " bitrate=" + QString::number(callBitrate) + " inDev=" + inDev.description() +
+                      " outDev=" + outDev.description() + " fmtSupported(in/out)=" + (inOk ? "Y" : "N") + "/" +
+                      (outOk ? "Y" : "N"));
+    }
+
+    auto stateName = [](QAudio::State s) -> const char* {
+      switch (s) {
+        case QAudio::ActiveState:
+          return "active";
+        case QAudio::SuspendedState:
+          return "suspended";
+        case QAudio::StoppedState:
+          return "stopped";
+        case QAudio::IdleState:
+          return "idle";
+      }
+      return "unknown";
+    };
+
+    vr->sinkDev = new PcmRingBufferIODevice(q);
+    vr->sinkDev->start();
+    vr->sink = new QAudioSink(outDev, fmt, q);
+    vr->sink->setVolume(std::clamp(callSettings.speakerVolume, 0, 100) / 100.0);
+    vr->sink->start(vr->sinkDev.data());
+    if (kDebugLogs) {
+      QObject::connect(vr->sink.data(), &QAudioSink::stateChanged, q, [this, stateName](QAudio::State st) {
+        emit q->logLine("[dbg] voice sink state=" + QString::fromLatin1(stateName(st)) +
+                        " err=" + QString::number(static_cast<int>(voice && voice->sink ? voice->sink->error() : 0)));
+      });
+      emit q->logLine("[dbg] voice sink started state=" + QString::fromLatin1(stateName(vr->sink->state())) +
+                      " err=" + QString::number(static_cast<int>(vr->sink->error())));
+    }
+
+    vr->source = new QAudioSource(inDev, fmt, q);
+    vr->source->setVolume(std::clamp(callSettings.micVolume, 0, 100) / 100.0);
+    vr->sourceDev = vr->source->start();
+    if (kDebugLogs) {
+      QObject::connect(vr->source.data(), &QAudioSource::stateChanged, q, [this, stateName](QAudio::State st) {
+        emit q->logLine("[dbg] voice source state=" + QString::fromLatin1(stateName(st)) +
+                        " err=" + QString::number(static_cast<int>(voice && voice->source ? voice->source->error() : 0)));
+      });
+      emit q->logLine("[dbg] voice source started state=" + QString::fromLatin1(stateName(vr->source->state())) +
+                      " err=" + QString::number(static_cast<int>(vr->source->error())) +
+                      " dev=" + (vr->sourceDev ? "ok" : "null"));
+    }
+
+    vr->playoutTimer = new QTimer(q);
+    vr->playoutTimer->setInterval(frameMs);
+    QObject::connect(vr->playoutTimer, &QTimer::timeout, q, [this] {
+      if (!voice) return;
+      if (!voice->sinkDev) return;
+      if (!voice->playoutStarted) return;
+
+      // Drop overly old packets.
+      while (!voice->jitter.isEmpty() && voice->jitter.firstKey() + 100 < voice->expectedSeq) {
+        voice->jitter.erase(voice->jitter.begin());
+      }
+
+      QByteArray frame;
+      if (voice->jitter.contains(voice->expectedSeq)) {
+        frame = voice->jitter.take(voice->expectedSeq);
+      }
+      voice->expectedSeq++;
+
+      std::vector<opus_int16> pcm;
+      pcm.resize(static_cast<std::size_t>(48000 * voice->frameMs / 1000));
+      int outSamples = 0;
+      if (!frame.isEmpty()) {
+        if (kDebugLogs) voice->rxFrames++;
+        outSamples = opus_decode(voice->dec,
+                                 reinterpret_cast<const unsigned char*>(frame.constData()),
+                                 frame.size(),
+                                 pcm.data(),
+                                 static_cast<int>(pcm.size()),
+                                 0);
+      } else {
+        // PLC.
+        outSamples = opus_decode(voice->dec, nullptr, 0, pcm.data(), static_cast<int>(pcm.size()), 0);
+      }
+      if (outSamples <= 0) return;
+      if (kDebugLogs) {
+        voice->decFrames++;
+        if (voice->logTimer.elapsed() > 1000 && (voice->decFrames % 50) == 1) {
+          emit q->logLine("[dbg] voice playout decFrames=" + QString::number(voice->decFrames) +
+                          " jitter=" + QString::number(voice->jitter.size()));
+        }
+      }
+      const int outBytes = outSamples * static_cast<int>(sizeof(opus_int16));
+      voice->sinkDev->push(QByteArray(reinterpret_cast<const char*>(pcm.data()), outBytes));
+    });
+
+    QObject::connect(vr->sourceDev.data(), &QIODevice::readyRead, q, [this, frameSamples] {
+      if (!voice) return;
+      if (!voice->sourceDev) return;
+      const QByteArray got = voice->sourceDev->readAll();
+      voice->capBytes += static_cast<uint64_t>(got.size());
+      voice->captureBuf.append(got);
+      const int frameBytes = frameSamples * static_cast<int>(sizeof(opus_int16));
+      while (voice && voice->captureBuf.size() >= frameBytes) {
+        const QByteArray pcm = voice->captureBuf.left(frameBytes);
+        voice->captureBuf.remove(0, frameBytes);
+
+        std::array<unsigned char, 1500> out{};
+        const int n = opus_encode(voice->enc,
+                                  reinterpret_cast<const opus_int16*>(pcm.constData()),
+                                  frameSamples,
+                                  out.data(),
+                                  static_cast<opus_int32>(out.size()));
+        if (n <= 0) continue;
+        if (kDebugLogs) voice->encFrames++;
+        std::vector<uint8_t> pkt(out.data(), out.data() + n);
+        const auto peer = voice->peerId.toStdString();
+        boost::asio::post(io, [this, peer, pkt = std::move(pkt)]() mutable {
+          auto it = udp_sessions.find(peer);
+          if (it == udp_sessions.end() || !it->second) return;
+          if (kDebugLogs) {
+            postToQt([this, peer] {
+              static uint64_t once = 0;
+              if ((++once % 200) == 1) emit q->logLine("[dbg] voice tx path using udp session peer=" + QString::fromStdString(peer));
+            });
+          }
+          it->second->send_voice_frame(std::move(pkt));
+        });
+        if (kDebugLogs && voice->logTimer.elapsed() > 1000 && (voice->encFrames % 50) == 1) {
+          emit q->logLine("[dbg] voice capture capBytes=" + QString::number(voice->capBytes) +
+                          " encFrames=" + QString::number(voice->encFrames) +
+                          " buf=" + QString::number(voice->captureBuf.size()));
+        }
+      }
+    });
+
+    voice = std::move(vr);
+
+    // Tell the UDP session what our frame size is (affects timestamps).
+    const auto peer = callPeerId.toStdString();
+    boost::asio::post(io, [this, peer, frameMs] {
+      auto it = udp_sessions.find(peer);
+      if (it != udp_sessions.end() && it->second) it->second->set_voice_frame_ms(frameMs);
+    });
+
+    emit q->callStateChanged(callPeerId, "in_call");
+  }
+
+  void handleVoiceFrameQt(const QString& peerId, quint64 seq, const QByteArray& opusFrame) {
+    if (!voice) return;
+    if (voice->peerId != peerId) return;
+    if (opusFrame.isEmpty()) return;
+
+    if (kDebugLogs) {
+      voice->rxFrames++;
+      if (voice->logTimer.elapsed() > 1000 && (voice->rxFrames % 50) == 1) {
+        emit q->logLine("[dbg] voice rx frame seq=" + QString::number(seq) + " len=" + QString::number(opusFrame.size()) +
+                        " jitter=" + QString::number(voice->jitter.size()) + " expected=" +
+                        QString::number(voice->expectedSeq));
+      }
+    }
+    if (!voice->jitter.contains(seq)) voice->jitter.insert(seq, opusFrame);
+
+    if (!voice->playoutStarted && voice->jitter.size() >= 3) {
+      voice->expectedSeq = voice->jitter.firstKey();
+      voice->playoutStarted = true;
+      voice->playoutTimer->start();
+      if (kDebugLogs) {
+        emit q->logLine("[dbg] voice playout started expectedSeq=" + QString::number(voice->expectedSeq) +
+                        " jitter=" + QString::number(voice->jitter.size()));
+      }
+    }
+  }
+#else
+  void stopVoiceQt() {}
+  void maybeStartVoiceQt() {}
+  void handleVoiceFrameQt(const QString&, quint64, const QByteArray&) {}
+#endif
+
+  void endCallQt(const QString& reason, bool notifyPeer) {
+    const QString peer = callPeerId;
+    const QString cid = callId;
+    stopVoiceQt();
+    resetCallStateQt();
+    if (!peer.isEmpty()) emit q->callEnded(peer, reason);
+
+    if (notifyPeer && !peer.isEmpty() && !cid.isEmpty()) {
+      const auto pid = peer.toStdString();
+      const auto call_id = cid.toStdString();
+      boost::asio::post(io, [this, pid, call_id] {
+        json j;
+        j["type"] = "call_end";
+        j["call_id"] = call_id;
+        sendControlToPeer(pid, std::move(j));
+      });
+    }
+  }
+
+  void handleControlQt(const QString& peerId, json inner) {
+    if (!inner.contains("type") || !inner["type"].is_string()) return;
+    const QString type = QString::fromStdString(inner["type"].get<std::string>());
+
+    if (type == "call_offer") {
+      const QString cid = inner.contains("call_id") && inner["call_id"].is_string()
+                              ? QString::fromStdString(inner["call_id"].get<std::string>())
+                              : QString();
+      if (cid.isEmpty()) return;
+
+      const int frameMs = inner.contains("frame_ms") && inner["frame_ms"].is_number_integer()
+                              ? inner["frame_ms"].get<int>()
+                              : 20;
+      const int bitrate = inner.contains("bitrate") && inner["bitrate"].is_number_integer()
+                              ? inner["bitrate"].get<int>()
+                              : 32000;
+
+      if (!callPeerId.isEmpty()) {
+        // Busy.
+        const auto pid = peerId.toStdString();
+        const auto call_id = cid.toStdString();
+        boost::asio::post(io, [this, pid, call_id] {
+          json a;
+          a["type"] = "call_answer";
+          a["call_id"] = call_id;
+          a["accept"] = false;
+          a["reason"] = "busy";
+          sendControlToPeer(pid, std::move(a));
+        });
+        return;
+      }
+
+      callPeerId = peerId;
+      callId = cid;
+      callOutgoing = false;
+      callLocalAccepted = false;
+      callRemoteAccepted = true;
+      callFrameMs = (frameMs == 10) ? 10 : 20;
+      callBitrate = std::clamp(bitrate, 8000, 128000);
+      if (kDebugLogs) {
+        emit q->logLine("[dbg] incoming call offer peer=" + callPeerId + " call_id=" + callId +
+                        " frameMs=" + QString::number(callFrameMs) + " bitrate=" + QString::number(callBitrate));
+      }
+      emit q->callStateChanged(callPeerId, "incoming");
+      emit q->incomingCall(callPeerId);
+      return;
+    }
+
+    if (type == "call_answer") {
+      if (callPeerId != peerId) return;
+      const QString cid = inner.contains("call_id") && inner["call_id"].is_string()
+                              ? QString::fromStdString(inner["call_id"].get<std::string>())
+                              : QString();
+      if (cid.isEmpty() || cid != callId) return;
+      const bool accept = inner.contains("accept") && inner["accept"].is_boolean() ? inner["accept"].get<bool>() : false;
+      if (!accept) {
+        endCallQt("call rejected", /*notifyPeer*/ false);
+        return;
+      }
+      callRemoteAccepted = true;
+      if (kDebugLogs) {
+        emit q->logLine("[dbg] call_answer accepted by peer=" + peerId + " call_id=" + callId);
+      }
+      emit q->callStateChanged(callPeerId, "connecting");
+      maybeStartVoiceQt();
+      return;
+    }
+
+    if (type == "call_end") {
+      const QString cid = inner.contains("call_id") && inner["call_id"].is_string()
+                              ? QString::fromStdString(inner["call_id"].get<std::string>())
+                              : QString();
+      if (callPeerId == peerId && !cid.isEmpty() && cid == callId) {
+        endCallQt("call ended", /*notifyPeer*/ false);
+      }
+      return;
+    }
+  }
+
+  void onPeerReadyQt(const QString& peerId) {
+    if (peerId != callPeerId) return;
+    if (callPeerId.isEmpty()) return;
+    if (callLocalAccepted && callRemoteAccepted) maybeStartVoiceQt();
+  }
+
   bool isAccepted(const std::string& id) {
     std::lock_guard lk(m);
     return accepted_friends.find(id) != accepted_friends.end();
@@ -1599,6 +2394,12 @@ struct ChatBackend::Impl {
   void queueOutgoing(const std::string& peer, std::string text) {
     std::lock_guard lk(m);
     queued_outgoing[peer].push_back(std::move(text));
+  }
+
+  void queueControl(const std::string& peer, json inner) {
+    std::lock_guard lk(m);
+    queued_control[peer].push_back(std::move(inner));
+    if (queued_control[peer].size() > 64) queued_control[peer].pop_front();
   }
 
   void flushOutgoing(const std::string& peer) {
@@ -1628,6 +2429,46 @@ struct ChatBackend::Impl {
     }
   }
 
+  void flushControl(const std::string& peer) {
+    std::deque<json> msgs;
+    {
+      std::lock_guard lk(m);
+      auto it = queued_control.find(peer);
+      if (it == queued_control.end()) return;
+      msgs = std::move(it->second);
+      queued_control.erase(it);
+    }
+    auto u = udp_sessions.find(peer);
+    if (u != udp_sessions.end() && u->second) {
+      while (!msgs.empty()) {
+        u->second->send_control(std::move(msgs.front()));
+        msgs.pop_front();
+      }
+      return;
+    }
+    auto t = tcp_sessions.find(peer);
+    if (t != tcp_sessions.end() && t->second) {
+      while (!msgs.empty()) {
+        t->second->send_control(std::move(msgs.front()));
+        msgs.pop_front();
+      }
+      return;
+    }
+  }
+
+  void sendControlToPeer(const std::string& peer, json inner) {
+    if (auto u = udp_sessions.find(peer); u != udp_sessions.end() && u->second) {
+      u->second->send_control(std::move(inner));
+      return;
+    }
+    if (auto t = tcp_sessions.find(peer); t != tcp_sessions.end() && t->second) {
+      t->second->send_control(std::move(inner));
+      return;
+    }
+    queueControl(peer, std::move(inner));
+    attemptDelivery(peer, /*silent*/ true);
+  }
+
   void bindAcceptor(uint16_t port) {
     boost::system::error_code ec;
     tcp::endpoint ep(boost::asio::ip::address_v4::any(), port);
@@ -1655,6 +2496,12 @@ struct ChatBackend::Impl {
                                   [this, buf, remote](const boost::system::error_code& ec, std::size_t n) {
                                     if (ec) return;
                                     if (n == 0) return udp_read_loop();
+#if defined(P2PCHAT_VOICE)
+                                    if (n >= 20 && read_u32be(buf->data()) == kVoiceMagic) {
+                                      handle_udp_voice_packet(std::span<const uint8_t>(buf->data(), n), *remote);
+                                      return udp_read_loop();
+                                    }
+#endif
                                     const auto jopt = common::parse_framed_json_bytes(
                                         std::span<const uint8_t>(buf->data(), n), common::kMaxFrameSize);
                                     if (!jopt) return udp_read_loop();
@@ -1662,6 +2509,66 @@ struct ChatBackend::Impl {
                                     udp_read_loop();
                                   });
   }
+
+#if defined(P2PCHAT_VOICE)
+  void handle_udp_voice_packet(std::span<const uint8_t> pkt, const udp::endpoint& from) {
+    if (pkt.size() < 20) {
+      if (kDebugLogs && (++udp_voice_drop_bad_frame % 200) == 1) {
+        postToQt([this] { emit q->logLine("[dbg] udp voice drop: short packet"); });
+      }
+      return;
+    }
+    if (read_u32be(pkt.data()) != kVoiceMagic) return;
+    if (pkt[4] != kVoiceVersion) {
+      if (kDebugLogs && (++udp_voice_drop_bad_frame % 200) == 1) {
+        postToQt([this] { emit q->logLine("[dbg] udp voice drop: bad version"); });
+      }
+      return;
+    }
+    const uint64_t seq = read_u64be(pkt.data() + 6);
+    const uint32_t ts = read_u32be(pkt.data() + 14);
+    const uint16_t ct_len = read_u16be(pkt.data() + 18);
+    if (20u + static_cast<std::size_t>(ct_len) != pkt.size()) {
+      if (kDebugLogs && (++udp_voice_drop_bad_frame % 200) == 1) {
+        postToQt([this, got = pkt.size(), want = 20u + static_cast<std::size_t>(ct_len)] {
+          emit q->logLine("[dbg] udp voice drop: length mismatch got=" + QString::number(got) + " want=" +
+                          QString::number(want));
+        });
+      }
+      return;
+    }
+    const auto ct = pkt.subspan(20, ct_len);
+
+    const std::string epkey = common::endpoint_to_string(from);
+    auto it = udp_ep_to_peer.find(epkey);
+    if (it == udp_ep_to_peer.end()) {
+      if (kDebugLogs && (++udp_voice_drop_no_map % 200) == 1) {
+        postToQt([this, epkey] { emit q->logLine("[dbg] udp voice drop: no ep map for " + QString::fromStdString(epkey)); });
+      }
+      return;
+    }
+    const std::string& pid = it->second;
+    auto sit = udp_sessions.find(pid);
+    if (sit == udp_sessions.end() || !sit->second) {
+      if (kDebugLogs && (++udp_voice_drop_no_session % 200) == 1) {
+        postToQt([this, pid] {
+          emit q->logLine("[dbg] udp voice drop: no session for " + QString::fromStdString(pid));
+        });
+      }
+      return;
+    }
+    if (kDebugLogs) {
+      udp_voice_routed++;
+      if ((udp_voice_routed % 200) == 1) {
+        postToQt([this, pid, seq, ts, ct_len] {
+          emit q->logLine("[dbg] udp voice routed peer=" + QString::fromStdString(pid) + " seq=" + QString::number(seq) +
+                          " ts=" + QString::number(ts) + " ct=" + QString::number(ct_len));
+        });
+      }
+    }
+    sit->second->handle_voice_packet(seq, ts, ct, from);
+  }
+#endif
 
   void handle_udp_datagram(const json& j, const udp::endpoint& from) {
     if (!j.contains("type") || !j["type"].is_string()) return;
@@ -1699,7 +2606,12 @@ struct ChatBackend::Impl {
         auto session = std::make_shared<UdpPeerSession>(
             udp_socket, from, UdpPeerSession::Role::Acceptor, selfId, identity, [this] { return getSelfName(); },
             [this] { return getSelfAvatarPng(); },
-            [this](const std::string& x) { return isAccepted(x); });
+            [this](const std::string& x) { return isAccepted(x); },
+            std::string{},
+            [this](const std::string& s) {
+              if (!kDebugLogs) return;
+              postToQt([this, s] { emit q->logLine("[dbg] " + QString::fromStdString(s)); });
+            });
         udp_sessions[pid] = session;
         udp_ep_to_peer[epkey] = pid;
 
@@ -1715,6 +2627,8 @@ struct ChatBackend::Impl {
                 emit q->logLine("peer connected (udp): " + QString::fromStdString(peer_id));
               });
               flushOutgoing(peer_id);
+              flushControl(peer_id);
+              postToQt([this, pid = QString::fromStdString(peer_id)] { onPeerReadyQt(pid); });
             },
             [this](const std::string& peer_id, const std::string& peer_name) {
               if (peer_name.empty()) return;
@@ -1737,6 +2651,17 @@ struct ChatBackend::Impl {
               postToQt([this, peer_id, label, text] {
                 emit q->messageReceived(QString::fromStdString(peer_id), QString::fromStdString(label),
                                         QString::fromStdString(text), true);
+              });
+            },
+            [this](const std::string& peer_id, json inner) {
+              postToQt([this, pid = QString::fromStdString(peer_id), inner = std::move(inner)]() mutable {
+                handleControlQt(pid, std::move(inner));
+              });
+            },
+            [this](const std::string& peer_id, uint64_t seq, uint32_t, const std::vector<uint8_t>& opus) {
+              const QByteArray bytes(reinterpret_cast<const char*>(opus.data()), static_cast<int>(opus.size()));
+              postToQt([this, pid = QString::fromStdString(peer_id), seq, bytes]() mutable {
+                handleVoiceFrameQt(pid, seq, bytes);
               });
             },
             [this, pid, epkey, weak]() {
@@ -1901,6 +2826,8 @@ struct ChatBackend::Impl {
           }
           postToQt([this, peer_id] { emit q->logLine("peer connected: " + QString::fromStdString(peer_id)); });
           flushOutgoing(peer_id);
+          flushControl(peer_id);
+          postToQt([this, pid = QString::fromStdString(peer_id)] { onPeerReadyQt(pid); });
         },
         [this](const std::string& peer_id, const std::string& peer_name) {
           if (peer_name.empty()) return;
@@ -1923,6 +2850,11 @@ struct ChatBackend::Impl {
           postToQt([this, peer_id, label, text] {
             emit q->messageReceived(QString::fromStdString(peer_id), QString::fromStdString(label),
                                     QString::fromStdString(text), true);
+          });
+        },
+        [this](const std::string& peer_id, json inner) {
+          postToQt([this, pid = QString::fromStdString(peer_id), inner = std::move(inner)]() mutable {
+            handleControlQt(pid, std::move(inner));
           });
         },
         [this, weak]() {
@@ -1996,7 +2928,11 @@ struct ChatBackend::Impl {
         [this] { return getSelfName(); },
         [this] { return getSelfAvatarPng(); },
         [this](const std::string& pid) { return isAccepted(pid); },
-        peer_id);
+        peer_id,
+        [this](const std::string& s) {
+          if (!kDebugLogs) return;
+          postToQt([this, s] { emit q->logLine("[dbg] " + QString::fromStdString(s)); });
+        });
 
     udp_sessions[peer_id] = session;
     udp_ep_to_peer[common::endpoint_to_string(ep)] = peer_id;
@@ -2012,6 +2948,8 @@ struct ChatBackend::Impl {
           }
           postToQt([this, pid] { emit q->logLine("peer connected (udp): " + QString::fromStdString(pid)); });
           flushOutgoing(pid);
+          flushControl(pid);
+          postToQt([this, qpid = QString::fromStdString(pid)] { onPeerReadyQt(qpid); });
         },
         [this](const std::string& pid, const std::string& pname) {
           if (pname.empty()) return;
@@ -2032,6 +2970,17 @@ struct ChatBackend::Impl {
           postToQt([this, pid, label, text] {
             emit q->messageReceived(QString::fromStdString(pid), QString::fromStdString(label),
                                     QString::fromStdString(text), true);
+          });
+        },
+        [this](const std::string& pid, json inner) {
+          postToQt([this, qpid = QString::fromStdString(pid), inner = std::move(inner)]() mutable {
+            handleControlQt(qpid, std::move(inner));
+          });
+        },
+        [this](const std::string& pid, uint64_t seq, uint32_t, const std::vector<uint8_t>& opus) {
+          const QByteArray bytes(reinterpret_cast<const char*>(opus.data()), static_cast<int>(opus.size()));
+          postToQt([this, qpid = QString::fromStdString(pid), seq, bytes]() mutable {
+            handleVoiceFrameQt(qpid, seq, bytes);
           });
         },
         [this, weak, udp_ready, peer_id, epkey, tcp_ip, tcp_port, tcp_reachable, silent, role]() {
@@ -2099,6 +3048,8 @@ struct ChatBackend::Impl {
           }
           postToQt([this, peer_id] { emit q->logLine("peer connected: " + QString::fromStdString(peer_id)); });
           flushOutgoing(peer_id);
+          flushControl(peer_id);
+          postToQt([this, pid = QString::fromStdString(peer_id)] { onPeerReadyQt(pid); });
         },
         [this](const std::string& peer_id, const std::string& peer_name) {
           if (peer_name.empty()) return;
@@ -2121,6 +3072,11 @@ struct ChatBackend::Impl {
           postToQt([this, peer_id, label, text] {
             emit q->messageReceived(QString::fromStdString(peer_id), QString::fromStdString(label),
                                     QString::fromStdString(text), true);
+          });
+        },
+        [this](const std::string& peer_id, json inner) {
+          postToQt([this, pid = QString::fromStdString(peer_id), inner = std::move(inner)]() mutable {
+            handleControlQt(pid, std::move(inner));
           });
         },
         [this, weak, peer_key]() {
@@ -2405,4 +3361,261 @@ void ChatBackend::warmConnect(const QString& peerId) {
     if (!impl->isAccepted(pid)) return;
     impl->attemptDelivery(pid, /*silent*/ true);
   });
+}
+
+void ChatBackend::startCall(const QString& peerId, const VoiceSettings& settings) {
+#if !defined(P2PCHAT_VOICE)
+  emit deliveryError(peerId, "voice unavailable (built without QtMultimedia/Opus)");
+  emit callEnded(peerId, "voice unavailable");
+  (void)settings;
+  return;
+#else
+  if (::geteuid() == 0) {
+    emit deliveryError(peerId, "voice unavailable when running as root");
+    emit callEnded(peerId, "voice unavailable (running as root)");
+    (void)settings;
+    return;
+  }
+#if !defined(_WIN32)
+  if (!pipewireSpaSupportPresent()) {
+    emit deliveryError(peerId, "voice unavailable (missing PipeWire SPA support)");
+    emit callEnded(peerId, "voice unavailable (missing PipeWire SPA support)");
+    (void)settings;
+    return;
+  }
+#endif
+  const auto pid = peerId.toStdString();
+  if (!impl_->isAccepted(pid)) {
+    emit deliveryError(peerId, "not friends");
+    emit callEnded(peerId, "not friends");
+    return;
+  }
+  if (!impl_->callPeerId.isEmpty()) {
+    emit callEnded(peerId, "busy");
+    return;
+  }
+
+  impl_->callPeerId = peerId;
+  impl_->callId = QString::fromStdString(common::generate_id(24));
+  impl_->callOutgoing = true;
+  impl_->callLocalAccepted = true;
+  impl_->callRemoteAccepted = false;
+  impl_->callSettings = settings;
+  impl_->callFrameMs = (settings.frameMs == 10) ? 10 : 20;
+  impl_->callBitrate = std::clamp(settings.bitrate, 8000, 128000);
+
+  emit callStateChanged(peerId, "calling");
+  if (kDebugLogs) {
+    emit logLine("[dbg] call start outgoing peer=" + peerId + " call_id=" + impl_->callId +
+                 " frameMs=" + QString::number(impl_->callFrameMs) + " bitrate=" + QString::number(impl_->callBitrate));
+  }
+
+  const auto call_id = impl_->callId.toStdString();
+  const int frameMs = impl_->callFrameMs;
+  const int bitrate = impl_->callBitrate;
+  boost::asio::post(impl_->io, [impl = impl_, pid, call_id, frameMs, bitrate] {
+    json offer;
+    offer["type"] = "call_offer";
+    offer["call_id"] = call_id;
+    offer["sr"] = 48000;
+    offer["ch"] = 1;
+    offer["frame_ms"] = frameMs;
+    offer["bitrate"] = bitrate;
+    impl->sendControlToPeer(pid, std::move(offer));
+    impl->attemptDelivery(pid, /*silent*/ false);
+  });
+#endif
+}
+
+void ChatBackend::answerCall(const QString& peerId, bool accept, const VoiceSettings& settings) {
+  if (impl_->callPeerId != peerId) return;
+  if (impl_->callId.isEmpty()) return;
+
+  const auto pid = peerId.toStdString();
+  const auto call_id = impl_->callId.toStdString();
+
+  if (!accept) {
+    boost::asio::post(impl_->io, [impl = impl_, pid, call_id] {
+      json ans;
+      ans["type"] = "call_answer";
+      ans["call_id"] = call_id;
+      ans["accept"] = false;
+      ans["reason"] = "declined";
+      impl->sendControlToPeer(pid, std::move(ans));
+    });
+    impl_->endCallQt("declined", /*notifyPeer*/ false);
+    return;
+  }
+
+#if !defined(P2PCHAT_VOICE)
+  emit deliveryError(peerId, "voice unavailable (built without QtMultimedia/Opus)");
+  impl_->endCallQt("voice unavailable", /*notifyPeer*/ false);
+  (void)settings;
+  return;
+#else
+  if (::geteuid() == 0) {
+    emit deliveryError(peerId, "voice unavailable when running as root");
+    impl_->endCallQt("voice unavailable (running as root)", /*notifyPeer*/ false);
+    (void)settings;
+    return;
+  }
+#if !defined(_WIN32)
+  if (!pipewireSpaSupportPresent()) {
+    emit deliveryError(peerId, "voice unavailable (missing PipeWire SPA support)");
+    impl_->endCallQt("voice unavailable (missing PipeWire SPA support)", /*notifyPeer*/ false);
+    (void)settings;
+    return;
+  }
+#endif
+  impl_->callSettings = settings;
+  impl_->callFrameMs = (settings.frameMs == 10) ? 10 : 20;
+  impl_->callBitrate = std::clamp(settings.bitrate, 8000, 128000);
+  impl_->callLocalAccepted = true;
+
+  emit callStateChanged(peerId, "connecting");
+  if (kDebugLogs) {
+    emit logLine("[dbg] call answer accept peer=" + peerId + " call_id=" + impl_->callId +
+                 " frameMs=" + QString::number(impl_->callFrameMs) + " bitrate=" + QString::number(impl_->callBitrate));
+  }
+
+  const int frameMs = impl_->callFrameMs;
+  const int bitrate = impl_->callBitrate;
+  boost::asio::post(impl_->io, [impl = impl_, pid, call_id, frameMs, bitrate] {
+    json ans;
+    ans["type"] = "call_answer";
+    ans["call_id"] = call_id;
+    ans["accept"] = true;
+    ans["sr"] = 48000;
+    ans["ch"] = 1;
+    ans["frame_ms"] = frameMs;
+    ans["bitrate"] = bitrate;
+    impl->sendControlToPeer(pid, std::move(ans));
+    impl->attemptDelivery(pid, /*silent*/ true);
+  });
+  impl_->maybeStartVoiceQt();
+#endif
+}
+
+void ChatBackend::endCall(const QString& peerId) {
+  if (impl_->callPeerId != peerId) return;
+  impl_->endCallQt("hangup", /*notifyPeer*/ true);
+}
+
+void ChatBackend::updateVoiceSettings(const VoiceSettings& settings) {
+  // Store for the current call (if any). For future calls, MainWindow passes settings explicitly.
+  const auto prev = impl_->callSettings;
+  impl_->callSettings = settings;
+
+#if defined(P2PCHAT_VOICE)
+  if (!impl_->voice) return;
+
+  // Volumes should apply live.
+  if (impl_->voice->source) {
+    impl_->voice->source->setVolume(std::clamp(settings.micVolume, 0, 100) / 100.0);
+  }
+  if (impl_->voice->sink) {
+    impl_->voice->sink->setVolume(std::clamp(settings.speakerVolume, 0, 100) / 100.0);
+  }
+
+  // Bitrate can apply live (encoder only).
+  const int newBitrate = std::clamp(settings.bitrate, 8000, 128000);
+  if (impl_->callBitrate != newBitrate && impl_->voice->enc) {
+    opus_encoder_ctl(impl_->voice->enc, OPUS_SET_BITRATE(newBitrate));
+    impl_->callBitrate = newBitrate;
+    emit logLine("Voice bitrate updated");
+  }
+
+  // Frame size changes affect capture chunking/playout timing; keep it simple for now.
+  const int newFrameMs = (settings.frameMs == 10) ? 10 : 20;
+  if (impl_->callFrameMs != newFrameMs) {
+    emit logLine("Voice frame size change applies next call");
+  }
+
+  auto findByHex = [](const QList<QAudioDevice>& devices, const QString& hexId) -> QAudioDevice {
+    if (hexId.isEmpty()) return QAudioDevice();
+    for (const auto& d : devices) {
+      if (QString::fromLatin1(d.id().toHex()) == hexId) return d;
+    }
+    return QAudioDevice();
+  };
+
+  QAudioFormat fmt;
+  fmt.setSampleRate(impl_->voice->sampleRate);
+  fmt.setChannelCount(impl_->voice->channels);
+  fmt.setSampleFormat(QAudioFormat::Int16);
+  const int frameSamples = impl_->voice->sampleRate * impl_->voice->frameMs / 1000;
+
+  // Device changes: attempt live restart of the Qt audio objects.
+  if (settings.outputDeviceIdHex != prev.outputDeviceIdHex) {
+    auto outDev = findByHex(QMediaDevices::audioOutputs(), settings.outputDeviceIdHex);
+    if (outDev.isNull()) outDev = QMediaDevices::defaultAudioOutput();
+    if (outDev.isNull()) {
+      emit logLine("Failed to switch output device (none available)");
+    } else {
+    if (!outDev.isNull() && impl_->voice->sink) {
+      impl_->voice->sink->stop();
+      impl_->voice->sink->deleteLater();
+      impl_->voice->sink = nullptr;
+    }
+    impl_->voice->sink = new QAudioSink(outDev, fmt, this);
+    impl_->voice->sink->setVolume(std::clamp(settings.speakerVolume, 0, 100) / 100.0);
+    if (impl_->voice->sinkDev) impl_->voice->sink->start(impl_->voice->sinkDev.data());
+    emit logLine("Output device updated");
+    }
+  }
+
+  if (settings.inputDeviceIdHex != prev.inputDeviceIdHex) {
+    auto inDev = findByHex(QMediaDevices::audioInputs(), settings.inputDeviceIdHex);
+    if (inDev.isNull()) inDev = QMediaDevices::defaultAudioInput();
+    if (inDev.isNull()) {
+      emit logLine("Failed to switch input device (none available)");
+    } else {
+    if (!inDev.isNull() && impl_->voice->source) {
+      impl_->voice->source->stop();
+      impl_->voice->source->deleteLater();
+      impl_->voice->source = nullptr;
+    }
+    impl_->voice->sourceDev = nullptr;
+    impl_->voice->captureBuf.clear();
+
+    impl_->voice->source = new QAudioSource(inDev, fmt, this);
+    impl_->voice->source->setVolume(std::clamp(settings.micVolume, 0, 100) / 100.0);
+    impl_->voice->sourceDev = impl_->voice->source->start();
+    if (impl_->voice->sourceDev) {
+      QObject::connect(impl_->voice->sourceDev.data(), &QIODevice::readyRead, this, [impl = impl_, frameSamples] {
+        if (!impl->voice) return;
+        if (!impl->voice->sourceDev) return;
+        const QByteArray got = impl->voice->sourceDev->readAll();
+        impl->voice->capBytes += static_cast<uint64_t>(got.size());
+        impl->voice->captureBuf.append(got);
+        const int frameBytes = frameSamples * static_cast<int>(sizeof(opus_int16));
+        while (impl->voice && impl->voice->captureBuf.size() >= frameBytes) {
+          const QByteArray pcm = impl->voice->captureBuf.left(frameBytes);
+          impl->voice->captureBuf.remove(0, frameBytes);
+
+          std::array<unsigned char, 1500> out{};
+          const int n = opus_encode(impl->voice->enc,
+                                    reinterpret_cast<const opus_int16*>(pcm.constData()),
+                                    frameSamples,
+                                    out.data(),
+                                    static_cast<opus_int32>(out.size()));
+          if (n <= 0) continue;
+          if (kDebugLogs) impl->voice->encFrames++;
+          std::vector<uint8_t> pkt(out.data(), out.data() + n);
+          const auto peer = impl->voice->peerId.toStdString();
+          boost::asio::post(impl->io, [impl, peer, pkt = std::move(pkt)]() mutable {
+            auto it = impl->udp_sessions.find(peer);
+            if (it == impl->udp_sessions.end() || !it->second) return;
+            it->second->send_voice_frame(std::move(pkt));
+          });
+        }
+      });
+    }
+    emit logLine("Input device updated");
+    }
+  }
+#else
+  (void)prev;
+  (void)settings;
+#endif
 }

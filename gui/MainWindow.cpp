@@ -1,4 +1,5 @@
 #include "gui/MainWindow.hpp"
+#include "gui/AudioSettingsDialog.hpp"
 
 #include <QAction>
 #include <QApplication>
@@ -33,7 +34,6 @@
 #include <QSplitter>
 #include <QTabWidget>
 #include <QTextBrowser>
-#include <QTimeZone>
 #include <QVBoxLayout>
 
 #include <functional>
@@ -161,7 +161,18 @@ QString nowStamp() {
 
 QString stampFromUtcMs(qint64 tsMs) {
   if (tsMs <= 0) return nowStamp();
-  return QDateTime::fromMSecsSinceEpoch(tsMs, QTimeZone::utc()).toLocalTime().toString("HH:mm");
+  // Guard against corrupted/out-of-range timestamps: some Qt timezone conversions can misbehave on extreme values.
+  constexpr qint64 kMin = 946684800000LL;   // 2000-01-01T00:00:00Z
+  constexpr qint64 kMax = 4102444800000LL;  // 2100-01-01T00:00:00Z
+  if (tsMs < kMin || tsMs > kMax) return nowStamp();
+
+  // Avoid Qt timezone/date conversions entirely (we've observed crashes in some environments).
+  // Render a simple UTC HH:MM from epoch milliseconds.
+  const qint64 totalSecs = tsMs / 1000;
+  const qint64 daySecs = totalSecs % 86400;
+  const int hh = static_cast<int>(daySecs / 3600);
+  const int mm = static_cast<int>((daySecs % 3600) / 60);
+  return QString("%1:%2").arg(hh, 2, 10, QLatin1Char('0')).arg(mm, 2, 10, QLatin1Char('0'));
 }
 
 QString friendDisplay(const Profile::FriendEntry& e) {
@@ -179,6 +190,17 @@ QString statusTag(Profile::FriendStatus s) {
     default:
       return "";
   }
+}
+
+ChatBackend::VoiceSettings voiceSettingsFromProfile(const Profile::AudioSettings& a) {
+  ChatBackend::VoiceSettings v;
+  v.inputDeviceIdHex = a.inputDeviceIdHex;
+  v.outputDeviceIdHex = a.outputDeviceIdHex;
+  v.micVolume = a.micVolume;
+  v.speakerVolume = a.speakerVolume;
+  v.bitrate = a.bitrate;
+  v.frameMs = a.frameMs;
+  return v;
 }
 } // namespace
 
@@ -255,6 +277,37 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     statusBar()->showMessage(QString("Delivery to %1 failed: %2").arg(peerId.left(12), msg), 8000);
   });
 
+  connect(&backend_, &ChatBackend::incomingCall, this, [this](QString peerId) {
+    activeCallPeer_ = peerId;
+    activeCallState_ = "incoming";
+    refreshCallButton();
+    const auto* f = profile_.findFriend(peerId);
+    const auto who = f ? friendDisplay(*f) : peerId.left(14) + "...";
+    auto ret = QMessageBox::question(this, "Incoming call", QString("%1 is calling you. Accept?").arg(who));
+    const bool accept = (ret == QMessageBox::Yes);
+    backend_.answerCall(peerId, accept, voiceSettingsFromProfile(profile_.audio));
+    if (!accept) {
+      activeCallPeer_.clear();
+      activeCallState_.clear();
+      refreshCallButton();
+    }
+  });
+
+  connect(&backend_, &ChatBackend::callStateChanged, this, [this](QString peerId, QString state) {
+    activeCallPeer_ = peerId;
+    activeCallState_ = state;
+    refreshCallButton();
+  });
+
+  connect(&backend_, &ChatBackend::callEnded, this, [this](QString peerId, QString reason) {
+    if (activeCallPeer_ == peerId) {
+      activeCallPeer_.clear();
+      activeCallState_.clear();
+      refreshCallButton();
+    }
+    statusBar()->showMessage(QString("Call with %1 ended: %2").arg(peerId.left(12), reason), 8000);
+  });
+
   connect(&backend_, &ChatBackend::peerAvatarUpdated, this, [this](QString peerId, QByteArray pngBytes) {
     if (pngBytes.isEmpty()) return;
     QImage img;
@@ -282,6 +335,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
       friendList_->viewport()->update();
       break;
     }
+    if (peerId == selectedPeerId_) refreshCallButton();
   });
 
   // Start backend.
@@ -347,6 +401,16 @@ void MainWindow::buildUi() {
     statusBar()->showMessage("Name updated", 6000);
   });
   optionsMenu->addAction(setName);
+
+  auto* audioSettings = new QAction("Audio Settings...", this);
+  connect(audioSettings, &QAction::triggered, this, [this] {
+    if (AudioSettingsDialog::edit(&profile_.audio, this)) {
+      backend_.updateVoiceSettings(voiceSettingsFromProfile(profile_.audio));
+      saveProfile();
+      statusBar()->showMessage("Audio settings updated", 4000);
+    }
+  });
+  optionsMenu->addAction(audioSettings);
 
   auto* darkMode = new QAction("Dark Mode", this);
   darkMode->setCheckable(true);
@@ -501,9 +565,20 @@ void MainWindow::buildUi() {
   auto* rightLayout = new QVBoxLayout(right);
   rightLayout->setContentsMargins(8, 8, 8, 8);
 
-  headerLabel_ = new QLabel("No chat selected", right);
+  auto* headerRow = new QWidget(right);
+  auto* headerRowLayout = new QHBoxLayout(headerRow);
+  headerRowLayout->setContentsMargins(0, 0, 0, 0);
+  headerRowLayout->setSpacing(10);
+
+  headerLabel_ = new QLabel("No chat selected", headerRow);
   headerLabel_->setStyleSheet("font-weight:600; font-size:14px;");
-  rightLayout->addWidget(headerLabel_);
+  headerRowLayout->addWidget(headerLabel_, 1);
+
+  callBtn_ = new QPushButton("Call", headerRow);
+  callBtn_->setEnabled(false);
+  headerRowLayout->addWidget(callBtn_, 0, Qt::AlignRight);
+
+  rightLayout->addWidget(headerRow);
 
   chatView_ = new QTextBrowser(right);
   chatView_->setOpenExternalLinks(false);
@@ -546,6 +621,23 @@ void MainWindow::buildUi() {
   };
   connect(sendBtn, &QPushButton::clicked, this, sendNow);
   connect(input_, &QLineEdit::returnPressed, this, sendNow);
+
+  connect(callBtn_, &QPushButton::clicked, this, [this] {
+    const auto pid = currentPeerId();
+    if (pid.isEmpty()) return;
+    if (!activeCallPeer_.isEmpty() && activeCallPeer_ == pid && !activeCallState_.isEmpty()) {
+      backend_.endCall(pid);
+      return;
+    }
+    if (!online_.value(pid, false)) {
+      statusBar()->showMessage("Peer is offline", 4000);
+      return;
+    }
+    activeCallPeer_ = pid;
+    activeCallState_ = "calling";
+    refreshCallButton();
+    backend_.startCall(pid, voiceSettingsFromProfile(profile_.audio));
+  });
 
   // Dark mode toggle (profile loads after UI is built, so we set checked state later in loadProfile()).
   connect(darkMode, &QAction::toggled, this, [this](bool on) {
@@ -840,6 +932,30 @@ QString MainWindow::currentPeerId() const {
   return selectedPeerId_;
 }
 
+void MainWindow::refreshCallButton() {
+  if (!callBtn_) return;
+  const auto pid = currentPeerId();
+  if (pid.isEmpty()) {
+    callBtn_->setEnabled(false);
+    callBtn_->setText("Call");
+    return;
+  }
+
+  const bool callActiveForThis =
+      (!activeCallPeer_.isEmpty() && activeCallPeer_ == pid && !activeCallState_.isEmpty());
+  if (callActiveForThis) {
+    callBtn_->setEnabled(true);
+    callBtn_->setText("Hang up");
+    return;
+  }
+
+  const auto* f = profile_.findFriend(pid);
+  const bool accepted = (f && f->status == Profile::FriendStatus::Accepted);
+  const bool online = online_.value(pid, false);
+  callBtn_->setEnabled(accepted && online);
+  callBtn_->setText("Call");
+}
+
 void MainWindow::appendMessage(const QString& peerId, const QString& label, const QString& text, bool incoming) {
   // Best-effort: if we learned a peer name, store it in the profile.
   if (incoming) {
@@ -884,11 +1000,13 @@ void MainWindow::appendMessage(const QString& peerId, const QString& label, cons
 void MainWindow::refreshHeader() {
   if (selectedPeerId_.isEmpty()) {
     headerLabel_->setText("No chat selected");
+    refreshCallButton();
     return;
   }
   const auto* f = profile_.findFriend(selectedPeerId_);
   const auto title = f ? friendDisplay(*f) : selectedPeerId_.left(14) + "...";
   headerLabel_->setText(title);
+  refreshCallButton();
 }
 
 void MainWindow::addFriendDialog() {

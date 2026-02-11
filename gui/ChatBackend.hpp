@@ -19,6 +19,15 @@ public:
     quint16 externalPort = 0;
   };
 
+  struct VoiceSettings {
+    QString inputDeviceIdHex;
+    QString outputDeviceIdHex;
+    int micVolume = 100;      // 0..100
+    int speakerVolume = 100;  // 0..100
+    int bitrate = 32000;      // bps
+    int frameMs = 20;         // 10 or 20
+  };
+
   explicit ChatBackend(QObject* parent = nullptr);
   ~ChatBackend() override;
 
@@ -36,6 +45,13 @@ public:
 
   void setFriendAccepted(const QString& peerId, bool accepted);
 
+  // Voice calls (Opus over UDP hole-punching). Only one active call at a time.
+  void startCall(const QString& peerId, const VoiceSettings& settings);
+  void answerCall(const QString& peerId, bool accept, const VoiceSettings& settings);
+  void endCall(const QString& peerId);
+  // Update voice settings; applies live when in a call (where possible).
+  void updateVoiceSettings(const VoiceSettings& settings);
+
 signals:
   void registered(QString selfId, bool reachable, QString observedIp, quint16 externalPort);
   void logLine(QString line);
@@ -46,6 +62,10 @@ signals:
   void peerNameUpdated(QString peerId, QString name);
   void messageReceived(QString peerId, QString displayName, QString text, bool incoming);
   void deliveryError(QString peerId, QString message);
+
+  void incomingCall(QString peerId);
+  void callStateChanged(QString peerId, QString state);
+  void callEnded(QString peerId, QString reason);
 
 private:
   struct Impl;

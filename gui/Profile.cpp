@@ -8,6 +8,8 @@
 #include <QJsonDocument>
 #include <QStandardPaths>
 
+#include <algorithm>
+
 namespace {
 QString configRootDir() {
   // Prefer the standard XDG config root; keep our state in ~/.config/p2p-chat on Linux.
@@ -149,6 +151,21 @@ Profile Profile::load(const QString& path, QString* errorOut) {
   p.externalPort = static_cast<quint16>(root.value("externalPort").toInt(0));
   p.darkMode = root.value("darkMode").toBool(false);
 
+  if (root.value("audio").isObject()) {
+    const auto a = root.value("audio").toObject();
+    p.audio.inputDeviceIdHex = a.value("inputDeviceIdHex").toString();
+    p.audio.outputDeviceIdHex = a.value("outputDeviceIdHex").toString();
+    p.audio.micVolume = a.value("micVolume").toInt(p.audio.micVolume);
+    p.audio.speakerVolume = a.value("speakerVolume").toInt(p.audio.speakerVolume);
+    p.audio.bitrate = a.value("bitrate").toInt(p.audio.bitrate);
+    p.audio.frameMs = a.value("frameMs").toInt(p.audio.frameMs);
+    if (p.audio.frameMs != 10 && p.audio.frameMs != 20) p.audio.frameMs = 20;
+    p.audio.micVolume = std::clamp(p.audio.micVolume, 0, 100);
+    p.audio.speakerVolume = std::clamp(p.audio.speakerVolume, 0, 100);
+    if (p.audio.bitrate < 8000) p.audio.bitrate = 8000;
+    if (p.audio.bitrate > 128000) p.audio.bitrate = 128000;
+  }
+
   const auto arr = root.value("friends").toArray();
   for (const auto& v : arr) {
     if (!v.isObject()) continue;
@@ -220,6 +237,17 @@ bool Profile::save(QString* errorOut) const {
   root["externalPort"] = static_cast<int>(externalPort);
   root["darkMode"] = darkMode;
 
+  {
+    QJsonObject a;
+    a["inputDeviceIdHex"] = audio.inputDeviceIdHex;
+    a["outputDeviceIdHex"] = audio.outputDeviceIdHex;
+    a["micVolume"] = audio.micVolume;
+    a["speakerVolume"] = audio.speakerVolume;
+    a["bitrate"] = audio.bitrate;
+    a["frameMs"] = audio.frameMs;
+    root["audio"] = a;
+  }
+
   QJsonArray arr;
   for (const auto& e : friends) {
     QJsonObject o;
@@ -289,6 +317,10 @@ QVector<Profile::ChatMessage> Profile::loadChat(const QString& peerId, QString* 
     m.tsMs = static_cast<qint64>(o.value("tsMs").toVariant().toLongLong());
     m.incoming = o.value("incoming").toBool(false);
     m.text = o.value("text").toString();
+    // Sanitize timestamps: corrupted chat logs should not crash rendering.
+    constexpr qint64 kMin = 946684800000LL;   // 2000-01-01
+    constexpr qint64 kMax = 4102444800000LL;  // 2100-01-01
+    if (m.tsMs < kMin || m.tsMs > kMax) m.tsMs = 0;
     if (!m.text.isEmpty()) out.push_back(m);
   }
   return out;

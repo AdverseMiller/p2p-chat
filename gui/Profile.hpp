@@ -38,6 +38,15 @@ public:
 
   const QString& path() const { return path_; }
 
+  struct AudioSettings {
+    QString inputDeviceIdHex;
+    QString outputDeviceIdHex;
+    int micVolume = 100;      // 0..100
+    int speakerVolume = 100;  // 0..100
+    int bitrate = 32000;      // bps (Opus target)
+    int frameMs = 20;         // 10 or 20
+  };
+
   QString keyPath;          // identity pem path
   QString selfName;         // last used name
   QString selfAvatarPath;   // local avatar path (png)
@@ -47,6 +56,7 @@ public:
   bool noUpnp = false;
   quint16 externalPort = 0;
   bool darkMode = false;
+  AudioSettings audio;
 
   QVector<FriendEntry> friends;
 
