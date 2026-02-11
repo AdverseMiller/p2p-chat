@@ -29,14 +29,6 @@ namespace {
 constexpr auto kTtl = std::chrono::seconds(60);
 constexpr auto kCleanupInterval = std::chrono::seconds(5);
 
-struct ConnectRequest {
-  std::string from_id;
-  std::string ip;
-  uint16_t port = 0;
-  uint16_t udp_port = 0;
-  bool reachable = true;
-};
-
 struct FriendRequest {
   std::string from_id;
   std::string intro;
@@ -113,6 +105,8 @@ class RendezvousServer {
   explicit RendezvousServer(boost::asio::io_context& io)
       : io_(io), acceptor_(io), udp_socket_(io), cleanup_timer_(io), public_ip_timer_(io) {}
 
+  void set_public_ip_fetch_enabled(bool enabled) { public_ip_fetch_enabled_ = enabled; }
+
   void listen(const tcp::endpoint& ep) {
     acceptor_.open(ep.protocol());
     acceptor_.set_option(tcp::acceptor::reuse_address(true));
@@ -132,6 +126,8 @@ class RendezvousServer {
     }
 
     common::log(std::string("rendezvous_server listening on ") + common::endpoint_to_string(ep));
+    // Warm public IP cache early to reduce races for LAN clients.
+    ensure_public_ip_fresh();
     do_accept();
     schedule_cleanup();
   }
@@ -157,6 +153,14 @@ class RendezvousServer {
     using namespace std::chrono;
     const auto now = steady_clock::now();
     if (on_done) public_ip_waiters_.push_back(std::move(on_done));
+    if (!public_ip_fetch_enabled_) {
+      auto w = std::move(public_ip_waiters_);
+      public_ip_waiters_.clear();
+      for (auto& fn : w) {
+        if (fn) fn();
+      }
+      return;
+    }
     if (public_ip_fetching_) return;
     if (!public_ip_.empty() && (now - public_ip_last_) < minutes(10)) {
       auto self = this;
@@ -170,6 +174,7 @@ class RendezvousServer {
       return;
     }
     public_ip_fetching_ = true;
+    common::log("public_ip: fetching from ifconfig.me");
 
     auto resolver = std::make_shared<tcp::resolver>(io_);
     auto sock = std::make_shared<tcp::socket>(io_);
@@ -254,6 +259,17 @@ class RendezvousServer {
                                         });
                                   });
                             });
+  }
+
+  bool set_public_ip(std::string ip) {
+    boost::system::error_code ec;
+    (void)boost::asio::ip::make_address_v4(ip, ec);
+    if (ec) return false;
+    if (common::is_private_ipv4(ip)) return false;
+    public_ip_ = std::move(ip);
+    public_ip_last_ = std::chrono::steady_clock::now();
+    common::log("public_ip: configured " + public_ip_);
+    return true;
   }
 
   std::string best_udp_ip_for(const Registration& target, std::string_view requester_observed_ip) {
@@ -417,32 +433,6 @@ class RendezvousServer {
     return true;
   }
 
-  void enqueue_connect_request(std::string from_id, std::string to_id, std::string* out_error) {
-    const auto from = get_registration(from_id);
-    const auto to = get_registration(to_id);
-
-    if (!from) {
-      *out_error = "from_id not registered";
-      return;
-    }
-    if (!to) {
-      *out_error = "to_id not registered";
-      return;
-    }
-    if (from->udp_port == 0 && (!from->reachable || from->external_port == 0)) {
-      *out_error = "from_id has no contact info yet";
-      return;
-    }
-
-    ConnectRequest req;
-    req.from_id = std::move(from_id);
-    req.ip = from->udp_ip.empty() ? from->observed_ip : from->udp_ip;
-    req.port = from->reachable ? from->external_port : 0;
-    req.udp_port = from->udp_port;
-    req.reachable = from->reachable;
-    pending_[std::move(to_id)].push_back(std::move(req));
-  }
-
   void enqueue_friend_request(std::string from_id,
                               std::string to_id,
                               std::string intro,
@@ -479,33 +469,6 @@ class RendezvousServer {
     pending_friend_accepts_[std::move(to_id)].push_back(std::move(from_id));
   }
 
-  std::vector<ConnectRequest> take_pending_requests(std::string_view id, std::string* out_error) {
-    auto it = pending_.find(std::string(id));
-    if (it == pending_.end()) return {};
-
-    std::vector<ConnectRequest> out;
-    out.reserve(it->second.size());
-
-    std::string_view requester_ip;
-    if (const auto to = get_registration(id)) requester_ip = to->observed_ip;
-
-    for (auto& req : it->second) {
-      const auto from = get_registration(req.from_id);
-      if (!from) continue;
-      ConnectRequest live;
-      live.from_id = from->id;
-      live.ip = best_udp_ip_for(*from, requester_ip);
-      live.port = from->reachable ? from->external_port : 0;
-      live.udp_port = from->udp_port;
-      live.reachable = from->reachable;
-      out.push_back(std::move(live));
-    }
-
-    pending_.erase(it);
-    (void)out_error;
-    return out;
-  }
-
   std::vector<FriendRequest> take_pending_friend_requests(std::string_view id) {
     auto it = pending_friend_requests_.find(std::string(id));
     if (it == pending_friend_requests_.end()) return {};
@@ -530,7 +493,6 @@ class RendezvousServer {
     }
     for (const auto& id : to_erase) {
       regs_.erase(id);
-      pending_.erase(id);
       pending_friend_requests_.erase(id);
       pending_friend_accepts_.erase(id);
       common::log("expired id=" + id);
@@ -589,6 +551,7 @@ class RendezvousServer {
   std::chrono::steady_clock::time_point public_ip_last_{};
   bool public_ip_fetching_ = false;
   std::vector<std::function<void()>> public_ip_waiters_;
+  bool public_ip_fetch_enabled_ = true;
 
   struct UdpSeen {
     std::string ip;
@@ -598,7 +561,6 @@ class RendezvousServer {
   std::unordered_map<std::string, UdpSeen> udp_seen_;
 
   std::unordered_map<std::string, Registration> regs_;
-  std::unordered_map<std::string, std::vector<ConnectRequest>> pending_;
   std::unordered_map<std::string, std::vector<FriendRequest>> pending_friend_requests_;
   std::unordered_map<std::string, std::vector<std::string>> pending_friend_accepts_;
 
@@ -888,28 +850,6 @@ void ClientSession::handle_message(const json& msg) {
     return;
   }
 
-  if (type == "connect_request") {
-    if (!msg.contains("from_id") || !msg["from_id"].is_string() || !msg.contains("to_id") ||
-        !msg["to_id"].is_string()) {
-      send_error("missing/invalid fields: from_id/to_id");
-      return;
-    }
-    const std::string from_id = msg["from_id"].get<std::string>();
-    const std::string to_id = msg["to_id"].get<std::string>();
-    if (!id_.empty() && from_id != id_) {
-      send_error("from_id mismatch for this connection");
-      return;
-    }
-    std::string err;
-    server_.enqueue_connect_request(from_id, to_id, &err);
-    if (!err.empty()) {
-      send_error(err);
-      return;
-    }
-    common::log("connect_request from_id=" + from_id + " to_id=" + to_id);
-    return;
-  }
-
   if (type == "friend_request") {
     if (!msg.contains("from_id") || !msg["from_id"].is_string() || !msg.contains("to_id") ||
         !msg["to_id"].is_string()) {
@@ -973,21 +913,10 @@ void ClientSession::handle_message(const json& msg) {
       return;
     }
 
-    auto connect_reqs = server_.take_pending_requests(id, &err);
     auto friend_reqs = server_.take_pending_friend_requests(id);
     auto friend_accepts = server_.take_pending_friend_accepts(id);
     json resp;
     resp["type"] = "poll_result";
-    resp["connect_requests"] = json::array();
-    for (const auto& r : connect_reqs) {
-      json jr;
-      jr["from_id"] = r.from_id;
-      jr["ip"] = r.ip;
-      jr["port"] = r.port;
-      jr["udp_port"] = r.udp_port;
-      jr["reachable"] = r.reachable;
-      resp["connect_requests"].push_back(std::move(jr));
-    }
     resp["friend_requests"] = json::array();
     for (const auto& fr : friend_reqs) {
       json jf;
@@ -1025,8 +954,8 @@ void ClientSession::send_register_ok() {
 } // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 3) {
-    std::cerr << "Usage: " << argv[0] << " <bind_ip> <port>\n";
+  if (argc < 3) {
+    std::cerr << "Usage: " << argv[0] << " <bind_ip> <port> [--public-ip <ip>] [--no-public-ip-fetch]\n";
     std::cerr << "Example: " << argv[0] << " 0.0.0.0 5555\n";
     return 2;
   }
@@ -1038,8 +967,40 @@ int main(int argc, char** argv) {
     return 2;
   }
 
+  std::string public_ip_override;
+  bool no_public_ip_fetch = false;
+  for (int i = 3; i < argc; ++i) {
+    const std::string a = argv[i];
+    auto need_val = [&](const char* flag) -> std::optional<std::string> {
+      if (a != flag) return std::nullopt;
+      if (i + 1 >= argc) return std::nullopt;
+      return std::string(argv[++i]);
+    };
+    if (auto v = need_val("--public-ip")) {
+      public_ip_override = *v;
+      continue;
+    }
+    if (a == "--no-public-ip-fetch") {
+      no_public_ip_fetch = true;
+      continue;
+    }
+    if (a == "--help" || a == "-h") {
+      std::cout << "Usage: " << argv[0] << " <bind_ip> <port> [--public-ip <ip>] [--no-public-ip-fetch]\n";
+      return 0;
+    }
+    std::cerr << "Unknown arg: " << a << "\n";
+    return 2;
+  }
+
   boost::asio::io_context io;
   RendezvousServer server(io);
+  if (no_public_ip_fetch) server.set_public_ip_fetch_enabled(false);
+  if (!public_ip_override.empty()) {
+    if (!server.set_public_ip(public_ip_override)) {
+      std::cerr << "Invalid --public-ip (must be a public IPv4 address)\n";
+      return 2;
+    }
+  }
 
   boost::asio::signal_set signals(io, SIGINT, SIGTERM);
   signals.async_wait([&](const boost::system::error_code&, int) {

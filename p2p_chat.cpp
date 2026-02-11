@@ -43,13 +43,6 @@ constexpr auto kHeartbeatInterval = std::chrono::seconds(15);
 constexpr auto kPollInterval = std::chrono::seconds(4);
 constexpr auto kConnectTimeout = std::chrono::seconds(10);
 
-struct ConnectRequest {
-  std::string from_id;
-  std::string ip;
-  uint16_t port = 0;
-  bool reachable = true;
-};
-
 struct UpnpMapping {
   bool ok = false;
   uint16_t external_port = 0;
@@ -509,17 +502,11 @@ class RendezvousClient : public std::enable_shared_from_this<RendezvousClient> {
         resolver_(io),
         heartbeat_timer_(io),
         poll_timer_(io) {}
-
-  using OnConnectRequest = std::function<void(const ConnectRequest&)>;
   using OnFriendRequest = std::function<void(const std::string& from_id, const std::string& intro)>;
   using OnFriendAccept = std::function<void(const std::string& from_id)>;
 
-  void start(std::function<void()> on_registered,
-             OnConnectRequest on_connect_request,
-             OnFriendRequest on_friend_request,
-             OnFriendAccept on_friend_accept) {
+  void start(std::function<void()> on_registered, OnFriendRequest on_friend_request, OnFriendAccept on_friend_accept) {
     on_registered_ = std::move(on_registered);
-    on_connect_request_ = std::move(on_connect_request);
     on_friend_request_ = std::move(on_friend_request);
     on_friend_accept_ = std::move(on_friend_accept);
 
@@ -557,14 +544,6 @@ class RendezvousClient : public std::enable_shared_from_this<RendezvousClient> {
     j["type"] = "lookup";
     j["from_id"] = id_;
     j["target_id"] = pending_lookups_.back().target_id;
-    writer_->send(std::move(j));
-  }
-
-  void send_connect_request(const std::string& to_id) {
-    json j;
-    j["type"] = "connect_request";
-    j["from_id"] = id_;
-    j["to_id"] = to_id;
     writer_->send(std::move(j));
   }
 
@@ -750,23 +729,6 @@ class RendezvousClient : public std::enable_shared_from_this<RendezvousClient> {
     }
 
     if (type == "poll_result") {
-      if (j.contains("connect_requests") && j["connect_requests"].is_array()) {
-        for (const auto& req : j["connect_requests"]) {
-          if (!req.is_object()) continue;
-          if (!req.contains("from_id") || !req["from_id"].is_string()) continue;
-          if (!req.contains("ip") || !req["ip"].is_string()) continue;
-          if (!req.contains("port") || !req["port"].is_number_integer()) continue;
-          const int port_i = req["port"].get<int>();
-          if (port_i <= 0 || port_i > 65535) continue;
-          ConnectRequest r;
-          r.from_id = req["from_id"].get<std::string>();
-          r.ip = req["ip"].get<std::string>();
-          r.port = static_cast<uint16_t>(port_i);
-          r.reachable = true;
-          if (on_connect_request_) on_connect_request_(r);
-        }
-      }
-
       if (j.contains("friend_requests") && j["friend_requests"].is_array()) {
         for (const auto& fr : j["friend_requests"]) {
           if (!fr.is_object()) continue;
@@ -808,7 +770,6 @@ class RendezvousClient : public std::enable_shared_from_this<RendezvousClient> {
 
   std::vector<PendingLookup> pending_lookups_;
   std::function<void()> on_registered_;
-  OnConnectRequest on_connect_request_;
   OnFriendRequest on_friend_request_;
   OnFriendAccept on_friend_accept_;
 };
@@ -866,7 +827,6 @@ class App : public std::enable_shared_from_this<App> {
     rendezvous_ = std::make_shared<RendezvousClient>(io_, std::move(cfg));
     rendezvous_->start(
         [self = shared_from_this()]() { self->on_registered(); },
-        [self = shared_from_this()](const ConnectRequest& req) { self->on_connect_request(req); },
         [self = shared_from_this()](const std::string& from_id, const std::string& intro) {
           self->on_friend_request(from_id, intro);
         },
@@ -1026,12 +986,6 @@ class App : public std::enable_shared_from_this<App> {
         [self]() {
       self->active_peer_.reset();
       common::log("returned to idle");
-      if (self->rendezvous_ && !self->rendezvous_->reachable() && !self->pending_requests_.empty()) {
-        auto req = self->pending_requests_.front();
-        self->pending_requests_.erase(self->pending_requests_.begin());
-        common::log("processing queued connect request from " + req.from_id);
-        self->connect_to_peer(req.from_id, req.ip, req.port);
-      }
     });
   }
 
@@ -1071,14 +1025,7 @@ class App : public std::enable_shared_from_this<App> {
         self->connect_to_peer(r.target_id, r.ip, r.port);
         return;
       }
-
-      if (self->rendezvous_ && self->rendezvous_->reachable()) {
-        self->rendezvous_->send_connect_request(r.target_id);
-        common::log("sent connect request to " + r.target_id + "; waiting for inbound connection");
-        return;
-      }
-
-      common::log("direct connection not possible: both you and peer are unreachable (client-only)");
+      common::log("direct connection not possible: peer is not reachable (no UDP in CLI build)");
     });
   }
 
@@ -1134,21 +1081,6 @@ class App : public std::enable_shared_from_this<App> {
     registered_ = true;
 
     common::log(std::string("reachability (server): ") + (reachable ? "reachable" : "unreachable"));
-  }
-
-  void on_connect_request(const ConnectRequest& req) {
-    // Only relevant if we are client-only; then auto-connect.
-    if (rendezvous_ && rendezvous_->reachable()) return;
-    if (!is_friend_accepted(req.from_id)) {
-      common::log("ignoring connect request from non-friend " + req.from_id);
-      return;
-    }
-    if (active_peer_) {
-      pending_requests_.push_back(req);
-      return;
-    }
-    common::log("received connect request from " + req.from_id + " -> connecting outbound");
-    connect_to_peer(req.from_id, req.ip, req.port);
   }
 
   void on_friend_request(const std::string& from_id, const std::string& intro) {
@@ -1355,7 +1287,6 @@ class App : public std::enable_shared_from_this<App> {
 
   std::string self_name_;
   std::shared_ptr<PeerSession> active_peer_;
-  std::vector<ConnectRequest> pending_requests_;
   std::unordered_map<std::string, FriendEntry> friends_;
   std::unordered_map<std::string, std::deque<std::string>> pending_outgoing_;
 

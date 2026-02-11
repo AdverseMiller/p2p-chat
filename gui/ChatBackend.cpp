@@ -34,13 +34,6 @@ constexpr auto kUdpPunchInterval = std::chrono::milliseconds(250);
 constexpr auto kUdpHandshakeResend = std::chrono::milliseconds(400);
 constexpr auto kUdpDataResend = std::chrono::milliseconds(500);
 
-struct ConnectRequest {
-  std::string from_id;
-  std::string ip;
-  uint16_t port = 0;
-  uint16_t udp_port = 0;
-};
-
 class PeerSession : public std::enable_shared_from_this<PeerSession> {
 public:
   enum class Role { Initiator, Acceptor };
@@ -488,7 +481,8 @@ public:
         punch_timer_(socket_.get_executor()),
         hs_timer_(socket_.get_executor()),
         data_timer_(socket_.get_executor()),
-        deadline_timer_(socket_.get_executor()) {}
+        deadline_timer_(socket_.get_executor()),
+        keepalive_timer_(socket_.get_executor()) {}
 
   void start(OnReady on_ready, OnName on_name, OnChat on_chat, OnClosed on_closed) {
     on_ready_ = std::move(on_ready);
@@ -517,7 +511,14 @@ public:
   void handle_datagram(const json& j, const udp::endpoint& from) {
     if (closed_) return;
     // Lock peer endpoint once we have it (initiator already has it; acceptor learns it from first packet).
-    if (peer_ep_.port() != 0 && from != peer_ep_) return;
+    if (peer_ep_.port() != 0 && from != peer_ep_) {
+      // Before the handshake is confirmed, allow the peer's NAT mapping to "settle" to a final port.
+      if (!ready_confirmed_ && from.address() == peer_ep_.address()) {
+        peer_ep_ = from;
+      } else {
+        return;
+      }
+    }
 
     if (!j.contains("type") || !j["type"].is_string()) return;
     const std::string type = j["type"].get<std::string>();
@@ -553,6 +554,7 @@ public:
     hs_timer_.cancel();
     data_timer_.cancel();
     deadline_timer_.cancel();
+    keepalive_timer_.cancel();
     if (on_closed_) on_closed_();
   }
 
@@ -620,6 +622,18 @@ private:
       if (ec) return;
       if (self->closed_) return;
       if (!self->ready_confirmed_) self->close();
+    });
+  }
+
+  void schedule_keepalive() {
+    if (closed_ || !ready_confirmed_) return;
+    auto self = shared_from_this();
+    keepalive_timer_.expires_after(std::chrono::seconds(15));
+    keepalive_timer_.async_wait([self](const boost::system::error_code& ec) {
+      if (ec) return;
+      if (self->closed_) return;
+      if (self->ready_confirmed_) self->send_punch_once();
+      self->schedule_keepalive();
     });
   }
 
@@ -741,6 +755,7 @@ private:
     ready_ = true;
     if (on_ready_) on_ready_(peer_id_, peer_name_);
     send_name_update();
+    try_send_next();
     // Keep resending finish until the peer proves readiness (ack/secure_msg).
     schedule_hs_resend();
   }
@@ -760,6 +775,7 @@ private:
     last_hs_msg_ = json{};
     hs_timer_.cancel();
     deadline_timer_.cancel();
+    schedule_keepalive();
     if (on_ready_) on_ready_(peer_id_, peer_name_);
     send_name_update();
     try_send_next();
@@ -823,9 +839,11 @@ private:
   }
 
   void enqueue_secure(json inner) {
-    if (!ready_) return;
+    if (closed_) return;
     send_queue_.push_back(std::move(inner));
-    try_send_next();
+    // Cap pre-handshake queue size.
+    if (send_queue_.size() > 256) send_queue_.pop_front();
+    if (ready_) try_send_next();
   }
 
   void try_send_next() {
@@ -944,6 +962,7 @@ private:
     hs_timer_.cancel();
     deadline_timer_.cancel();
     data_timer_.cancel();
+    schedule_keepalive();
     try_send_next();
   }
 
@@ -976,6 +995,7 @@ private:
     last_hs_msg_ = json{};
     hs_timer_.cancel();
     deadline_timer_.cancel();
+    schedule_keepalive();
 
     try {
       const std::string s(reinterpret_cast<const char*>(pt->data()), pt->size());
@@ -1029,6 +1049,7 @@ private:
   boost::asio::steady_timer hs_timer_;
   boost::asio::steady_timer data_timer_;
   boost::asio::steady_timer deadline_timer_;
+  boost::asio::steady_timer keepalive_timer_;
   int punch_remaining_ = 24;
   int hs_retries_ = 0;
 
@@ -1078,7 +1099,6 @@ public:
   };
 
   using OnLookup = std::function<void(LookupResult)>;
-  using OnConnectRequest = std::function<void(const ConnectRequest&)>;
   using OnFriendRequest = std::function<void(const std::string& from_id, const std::string& intro)>;
   using OnFriendAccept = std::function<void(const std::string& from_id)>;
 
@@ -1091,12 +1111,8 @@ public:
         poll_timer_(io),
         reconnect_timer_(io) {}
 
-  void start(std::function<void()> on_registered,
-             OnConnectRequest on_connect_request,
-             OnFriendRequest on_friend_request,
-             OnFriendAccept on_friend_accept) {
+  void start(std::function<void()> on_registered, OnFriendRequest on_friend_request, OnFriendAccept on_friend_accept) {
     on_registered_ = std::move(on_registered);
-    on_connect_request_ = std::move(on_connect_request);
     on_friend_request_ = std::move(on_friend_request);
     on_friend_accept_ = std::move(on_friend_accept);
     schedule_reconnect(/*immediate*/ true);
@@ -1135,16 +1151,6 @@ public:
       j["type"] = "lookup";
       j["from_id"] = id_;
       j["target_id"] = tid;
-      writer_->send(std::move(j));
-    });
-  }
-
-  void send_connect_request(const std::string& to_id) {
-    enqueue_or_send([this, to_id] {
-      json j;
-      j["type"] = "connect_request";
-      j["from_id"] = id_;
-      j["to_id"] = to_id;
       writer_->send(std::move(j));
     });
   }
@@ -1384,24 +1390,6 @@ private:
     }
 
     if (type == "poll_result") {
-      if (j.contains("connect_requests") && j["connect_requests"].is_array()) {
-        for (const auto& req : j["connect_requests"]) {
-          if (!req.is_object()) continue;
-          if (!req.contains("from_id") || !req["from_id"].is_string()) continue;
-          if (!req.contains("ip") || !req["ip"].is_string()) continue;
-          const int port_i = (req.contains("port") && req["port"].is_number_integer()) ? req["port"].get<int>() : 0;
-          if (port_i < 0 || port_i > 65535) continue;
-          const int udp_i =
-              (req.contains("udp_port") && req["udp_port"].is_number_integer()) ? req["udp_port"].get<int>() : 0;
-          if (udp_i < 0 || udp_i > 65535) continue;
-          ConnectRequest r;
-          r.from_id = req["from_id"].get<std::string>();
-          r.ip = req["ip"].get<std::string>();
-          r.port = static_cast<uint16_t>(port_i);
-          r.udp_port = static_cast<uint16_t>(udp_i);
-          if (on_connect_request_) on_connect_request_(r);
-        }
-      }
       if (j.contains("friend_requests") && j["friend_requests"].is_array()) {
         for (const auto& fr : j["friend_requests"]) {
           if (!fr.is_object()) continue;
@@ -1446,7 +1434,6 @@ private:
   std::vector<PendingLookup> pending_lookups_;
   std::deque<std::function<void()>> pending_actions_;
   std::function<void()> on_registered_;
-  OnConnectRequest on_connect_request_;
   OnFriendRequest on_friend_request_;
   OnFriendAccept on_friend_accept_;
 
@@ -1493,8 +1480,13 @@ struct ChatBackend::Impl {
   uint16_t server_port = 0;
 
   std::shared_ptr<RendezvousClient> rendezvous;
-  std::shared_ptr<PeerSession> active_peer;
-  std::shared_ptr<UdpPeerSession> active_udp;
+  std::unordered_map<std::string, std::shared_ptr<PeerSession>> tcp_sessions;
+  std::unordered_map<std::string, std::shared_ptr<UdpPeerSession>> udp_sessions;
+  std::unordered_map<std::string, std::string> udp_ep_to_peer;
+  std::unordered_map<std::string, RendezvousClient::LookupResult> last_lookup;
+  std::unordered_map<std::string, std::chrono::steady_clock::time_point> last_connect_attempt;
+  boost::asio::steady_timer friend_connect_timer{io};
+  bool friend_connect_running = false;
 
   void postToQt(std::function<void()> fn) {
     QMetaObject::invokeMethod(q, [fn = std::move(fn)] { fn(); }, Qt::QueuedConnection);
@@ -1530,13 +1522,21 @@ struct ChatBackend::Impl {
       msgs = std::move(it->second);
       queued_outgoing.erase(it);
     }
-    const bool ok_tcp = active_peer && std::string(active_peer->peer_id()) == peer;
-    const bool ok_udp = active_udp && std::string(active_udp->peer_id()) == peer;
-    if (!ok_tcp && !ok_udp) return;
-    while (!msgs.empty()) {
-      if (ok_tcp) active_peer->send_chat(std::move(msgs.front()));
-      else active_udp->send_chat(std::move(msgs.front()));
-      msgs.pop_front();
+    auto u = udp_sessions.find(peer);
+    if (u != udp_sessions.end() && u->second) {
+      while (!msgs.empty()) {
+        u->second->send_chat(std::move(msgs.front()));
+        msgs.pop_front();
+      }
+      return;
+    }
+    auto t = tcp_sessions.find(peer);
+    if (t != tcp_sessions.end() && t->second) {
+      while (!msgs.empty()) {
+        t->second->send_chat(std::move(msgs.front()));
+        msgs.pop_front();
+      }
+      return;
     }
   }
 
@@ -1586,62 +1586,75 @@ struct ChatBackend::Impl {
       return;
     }
 
-    if (active_udp) {
-      active_udp->handle_datagram(j, from);
-      return;
-    }
-
-    if (type == "secure_hello") {
-      if (active_peer) {
-        json busy;
-        busy["type"] = "busy";
-        busy["message"] = "already in an active chat session";
-        send_udp_to(from, busy);
+    const std::string epkey = common::endpoint_to_string(from);
+    if (auto it = udp_ep_to_peer.find(epkey); it != udp_ep_to_peer.end()) {
+      const std::string& pid = it->second;
+      if (auto sit = udp_sessions.find(pid); sit != udp_sessions.end() && sit->second) {
+        sit->second->handle_datagram(j, from);
         return;
       }
-      // Incoming UDP session.
-      const std::string selfId = std::string(identity->public_id());
-      active_udp = std::make_shared<UdpPeerSession>(
-          udp_socket,
-          from,
-          UdpPeerSession::Role::Acceptor,
-          selfId,
-          identity,
-          [this] { return getSelfName(); },
-          [this](const std::string& pid) { return isAccepted(pid); });
-      active_udp->start_accept_with_first(
-          j,
-          from,
-          [this](const std::string& peer_id, const std::string& peer_name) {
-            {
-              std::lock_guard lk(m);
-              if (!peer_name.empty()) peer_names[peer_id] = peer_name;
-            }
-            postToQt([this, peer_id] { emit q->logLine("peer connected (udp): " + QString::fromStdString(peer_id)); });
-            flushOutgoing(peer_id);
-          },
-          [this](const std::string& peer_id, const std::string& peer_name) {
-            if (peer_name.empty()) return;
-            {
-              std::lock_guard lk(m);
-              peer_names[peer_id] = peer_name;
-            }
-            postToQt([this, peer_id, peer_name] {
-              emit q->peerNameUpdated(QString::fromStdString(peer_id), QString::fromStdString(peer_name));
+      udp_ep_to_peer.erase(it);
+    }
+
+    // Route by claimed peer ID for handshake packets (endpoint may not be mapped yet).
+    if ((type == "secure_hello" || type == "secure_hello_ack") && j.contains("id") && j["id"].is_string()) {
+      const std::string pid = j["id"].get<std::string>();
+      if (auto sit = udp_sessions.find(pid); sit != udp_sessions.end() && sit->second) {
+        udp_ep_to_peer[epkey] = pid;
+        sit->second->handle_datagram(j, from);
+        return;
+      }
+
+      if (type == "secure_hello") {
+        if (!isAccepted(pid)) return;
+        const std::string selfId = std::string(identity->public_id());
+        auto session = std::make_shared<UdpPeerSession>(
+            udp_socket, from, UdpPeerSession::Role::Acceptor, selfId, identity, [this] { return getSelfName(); },
+            [this](const std::string& x) { return isAccepted(x); });
+        udp_sessions[pid] = session;
+        udp_ep_to_peer[epkey] = pid;
+
+        std::weak_ptr<UdpPeerSession> weak = session;
+        session->start_accept_with_first(
+            j, from,
+            [this](const std::string& peer_id, const std::string& peer_name) {
+              {
+                std::lock_guard lk(m);
+                if (!peer_name.empty()) peer_names[peer_id] = peer_name;
+              }
+              postToQt([this, peer_id] {
+                emit q->logLine("peer connected (udp): " + QString::fromStdString(peer_id));
+              });
+              flushOutgoing(peer_id);
+            },
+            [this](const std::string& peer_id, const std::string& peer_name) {
+              if (peer_name.empty()) return;
+              {
+                std::lock_guard lk(m);
+                peer_names[peer_id] = peer_name;
+              }
+              postToQt([this, peer_id, peer_name] {
+                emit q->peerNameUpdated(QString::fromStdString(peer_id), QString::fromStdString(peer_name));
+              });
+            },
+            [this](const std::string& peer_id, const std::string& peer_name, const std::string& text) {
+              std::string label = peer_name.empty() ? peer_id : peer_name;
+              postToQt([this, peer_id, label, text] {
+                emit q->messageReceived(QString::fromStdString(peer_id), QString::fromStdString(label),
+                                        QString::fromStdString(text), true);
+              });
+            },
+            [this, pid, epkey, weak]() {
+              auto s = weak.lock();
+              if (!s) return;
+              auto it = udp_sessions.find(pid);
+              if (it != udp_sessions.end() && it->second == s) udp_sessions.erase(it);
+              if (auto mit = udp_ep_to_peer.find(epkey); mit != udp_ep_to_peer.end() && mit->second == pid) {
+                udp_ep_to_peer.erase(mit);
+              }
             });
-          },
-          [this](const std::string& peer_id, const std::string& peer_name, const std::string& text) {
-            std::string label = peer_name.empty() ? peer_id : peer_name;
-            postToQt([this, peer_id, label, text] {
-              emit q->messageReceived(QString::fromStdString(peer_id), QString::fromStdString(label),
-                                      QString::fromStdString(text), true);
-            });
-          },
-          [this]() {
-            active_udp.reset();
-            postToQt([this] { emit q->logLine("returned to idle"); });
-          });
-      return;
+        return;
+      }
     }
   }
 
@@ -1769,17 +1782,6 @@ struct ChatBackend::Impl {
       }
 
       if (type == "secure_hello") {
-        if (active_peer || active_udp) {
-          auto writer = std::make_shared<common::JsonWriteQueue<tcp::socket>>(*sock);
-          json busy;
-          busy["type"] = "busy";
-          busy["message"] = "already in an active chat session";
-          writer->send(std::move(busy));
-          boost::system::error_code ignored;
-          sock->shutdown(tcp::socket::shutdown_both, ignored);
-          sock->close(ignored);
-          return;
-        }
         startPeerAcceptWithFirst(std::move(*sock), std::move(j));
         return;
       }
@@ -1789,13 +1791,14 @@ struct ChatBackend::Impl {
   void startPeerAcceptWithFirst(tcp::socket socket, json first) {
     if (!rendezvous || rendezvous->id().empty()) return;
     auto selfId = std::string(rendezvous->id());
-    active_peer = std::make_shared<PeerSession>(
+    auto session = std::make_shared<PeerSession>(
         std::move(socket), PeerSession::Role::Acceptor, std::move(selfId), identity,
         [this] { return getSelfName(); }, [this](const std::string& pid) { return isAccepted(pid); });
-
-    active_peer->start_accept_with_first(
+    std::weak_ptr<PeerSession> weak = session;
+    session->start_accept_with_first(
         std::move(first),
-        [this](const std::string& peer_id, const std::string& peer_name) {
+        [this, weak](const std::string& peer_id, const std::string& peer_name) {
+          if (auto s = weak.lock()) tcp_sessions[peer_id] = std::move(s);
           {
             std::lock_guard lk(m);
             if (!peer_name.empty()) peer_names[peer_id] = peer_name;
@@ -1820,14 +1823,18 @@ struct ChatBackend::Impl {
                                     QString::fromStdString(text), true);
           });
         },
-        [this]() {
-          active_peer.reset();
-          postToQt([this] { emit q->logLine("returned to idle"); });
+        [this, weak]() {
+          auto s = weak.lock();
+          if (!s) return;
+          const std::string pid = std::string(s->peer_id());
+          if (pid.empty()) return;
+          auto it = tcp_sessions.find(pid);
+          if (it != tcp_sessions.end() && it->second == s) tcp_sessions.erase(it);
         });
   }
 
   void connectToPeer(const std::string& peer_id, const std::string& ip, uint16_t port, bool silent) {
-    if (active_peer || active_udp) return;
+    if (tcp_sessions.find(peer_id) != tcp_sessions.end()) return;
     auto sock = std::make_shared<tcp::socket>(io);
     auto timer = std::make_shared<boost::asio::steady_timer>(io);
     timer->expires_after(kConnectTimeout);
@@ -1857,22 +1864,28 @@ struct ChatBackend::Impl {
   }
 
   void connectToPeerUdp(const std::string& peer_id,
-                        const std::string& ip,
+                        const std::string& udp_ip,
                         uint16_t udp_port,
+                        const std::string& tcp_ip,
                         uint16_t tcp_port,
                         bool tcp_reachable,
                         bool silent) {
-    if (active_peer || active_udp) return;
     boost::system::error_code ec;
-    const auto addr = boost::asio::ip::make_address(ip, ec);
+    const auto addr = boost::asio::ip::make_address(udp_ip, ec);
     if (ec) return;
     udp::endpoint ep(addr, udp_port);
+
+    if (auto it = udp_sessions.find(peer_id); it != udp_sessions.end() && it->second) {
+      if (it->second->peer_endpoint() == ep) return;
+      it->second->close();
+      udp_sessions.erase(it);
+    }
 
     const std::string selfId = std::string(identity->public_id());
     const auto role = (selfId < peer_id) ? UdpPeerSession::Role::Initiator : UdpPeerSession::Role::Acceptor;
 
     auto udp_ready = std::make_shared<std::atomic<bool>>(false);
-    active_udp = std::make_shared<UdpPeerSession>(
+    auto session = std::make_shared<UdpPeerSession>(
         udp_socket,
         ep,
         role,
@@ -1882,7 +1895,12 @@ struct ChatBackend::Impl {
         [this](const std::string& pid) { return isAccepted(pid); },
         peer_id);
 
-    active_udp->start(
+    udp_sessions[peer_id] = session;
+    udp_ep_to_peer[common::endpoint_to_string(ep)] = peer_id;
+
+    const std::string epkey = common::endpoint_to_string(ep);
+    std::weak_ptr<UdpPeerSession> weak = session;
+    session->start(
         [this, udp_ready](const std::string& pid, const std::string& pname) {
           udp_ready->store(true);
           {
@@ -1909,12 +1927,18 @@ struct ChatBackend::Impl {
                                     QString::fromStdString(text), true);
           });
         },
-        [this, udp_ready, peer_id, ip, tcp_port, tcp_reachable, silent]() {
+        [this, weak, udp_ready, peer_id, epkey, tcp_ip, tcp_port, tcp_reachable, silent, role]() {
           const bool ok = udp_ready->load();
-          active_udp.reset();
-          postToQt([this] { emit q->logLine("returned to idle"); });
-          if (!ok) udp_failed_fallback(peer_id, ip, tcp_port, tcp_reachable, silent);
+          auto s = weak.lock();
+          if (auto it = udp_sessions.find(peer_id); it != udp_sessions.end() && it->second == s) udp_sessions.erase(it);
+          if (auto mit = udp_ep_to_peer.find(epkey); mit != udp_ep_to_peer.end() && mit->second == peer_id) {
+            udp_ep_to_peer.erase(mit);
+          }
+          if (!ok && role == UdpPeerSession::Role::Initiator) udp_failed_fallback(peer_id, tcp_ip, tcp_port, tcp_reachable, silent);
         });
+
+    // Flush queued messages into the session (session will send once ready).
+    flushOutgoing(peer_id);
   }
 
   void udp_failed_fallback(const std::string& peer_id,
@@ -1924,7 +1948,6 @@ struct ChatBackend::Impl {
                            bool silent) {
     // UDP is the default. If it fails, try direct TCP if the peer is reachable; otherwise attempt UPnP so the peer can
     // connect to us via TCP (classic rendezvous mode).
-    if (active_peer || active_udp) return;
     if (tcp_reachable && tcp_port != 0) {
       connectToPeer(peer_id, ip, tcp_port, silent);
       return;
@@ -1940,11 +1963,9 @@ struct ChatBackend::Impl {
         rendezvous->reprobe_with_external_port_hint(external_port_hint);
       }
     }
-    // Ask the peer to connect to us (will use TCP if we became reachable).
-    rendezvous->send_connect_request(peer_id);
     if (!silent) {
       postToQt([this, peer_id] {
-        emit q->deliveryError(QString::fromStdString(peer_id), "trying tcp/upnp fallback");
+        emit q->deliveryError(QString::fromStdString(peer_id), "delivery failed (udp/tcp unavailable)");
       });
     }
   }
@@ -1952,13 +1973,18 @@ struct ChatBackend::Impl {
   void startPeerInitiator(tcp::socket socket, std::string expected_peer_id) {
     if (!rendezvous || rendezvous->id().empty()) return;
     auto selfId = std::string(rendezvous->id());
-    active_peer = std::make_shared<PeerSession>(
+    const std::string peer_key = expected_peer_id;
+    auto session = std::make_shared<PeerSession>(
         std::move(socket), PeerSession::Role::Initiator, std::move(selfId), identity,
         [this] { return getSelfName(); }, [this](const std::string& pid) { return isAccepted(pid); },
         std::move(expected_peer_id));
 
-    active_peer->start(
-        [this](const std::string& peer_id, const std::string& peer_name) {
+    // Store by expected peer id so we don't attempt another connect while handshaking.
+    tcp_sessions[peer_key] = session;
+    std::weak_ptr<PeerSession> weak = session;
+    session->start(
+        [this, weak](const std::string& peer_id, const std::string& peer_name) {
+          if (auto s = weak.lock()) tcp_sessions[peer_id] = std::move(s);
           {
             std::lock_guard lk(m);
             if (!peer_name.empty()) peer_names[peer_id] = peer_name;
@@ -1983,16 +2009,22 @@ struct ChatBackend::Impl {
                                     QString::fromStdString(text), true);
           });
         },
-        [this]() {
-          active_peer.reset();
-          postToQt([this] { emit q->logLine("returned to idle"); });
+        [this, weak, peer_key]() {
+          auto s = weak.lock();
+          if (!s) return;
+          auto it = tcp_sessions.find(peer_key);
+          if (it != tcp_sessions.end() && it->second == s) tcp_sessions.erase(it);
         });
   }
 
   void attemptDelivery(const std::string& peer_id, bool silent) {
     if (!rendezvous) return;
-    if (active_peer || active_udp) return;
     if (!isAccepted(peer_id)) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (auto it = last_connect_attempt.find(peer_id); it != last_connect_attempt.end()) {
+      if (now - it->second < std::chrono::seconds(3)) return;
+    }
+    last_connect_attempt[peer_id] = now;
 
     rendezvous->send_lookup(peer_id, [this, silent](RendezvousClient::LookupResult r) {
       if (!r.ok) {
@@ -2003,11 +2035,11 @@ struct ChatBackend::Impl {
         }
         return;
       }
+      last_lookup[r.target_id] = r;
       if (r.udp_port != 0) {
         // UDP hole punching is the default (works even if both peers are NATed).
-        if (rendezvous) rendezvous->send_connect_request(r.target_id); // ask peer to start punching too
         const std::string udp_ip = r.udp_ip.empty() ? r.ip : r.udp_ip;
-        connectToPeerUdp(r.target_id, udp_ip, r.udp_port, r.port, r.reachable, silent);
+        connectToPeerUdp(r.target_id, udp_ip, r.udp_port, r.ip, r.port, r.reachable, silent);
         return;
       }
       // No UDP info. Try direct TCP if possible; otherwise request connect (may succeed if we become reachable later).
@@ -2016,6 +2048,40 @@ struct ChatBackend::Impl {
         return;
       }
       udp_failed_fallback(r.target_id, r.ip, r.port, r.reachable, silent);
+    });
+  }
+
+  void closePeerSessions(const std::string& peer_id) {
+    if (auto it = udp_sessions.find(peer_id); it != udp_sessions.end() && it->second) {
+      const auto epkey = common::endpoint_to_string(it->second->peer_endpoint());
+      it->second->close();
+      udp_sessions.erase(it);
+      if (auto mit = udp_ep_to_peer.find(epkey); mit != udp_ep_to_peer.end() && mit->second == peer_id) {
+        udp_ep_to_peer.erase(mit);
+      }
+    }
+    if (auto it = tcp_sessions.find(peer_id); it != tcp_sessions.end() && it->second) {
+      it->second->close();
+      tcp_sessions.erase(it);
+    }
+  }
+
+  void scheduleFriendConnect(bool immediate) {
+    if (immediate) {
+      if (friend_connect_running) return;
+      friend_connect_running = true;
+    }
+    const auto delay = immediate ? std::chrono::seconds(0) : std::chrono::seconds(5);
+    friend_connect_timer.expires_after(delay);
+    friend_connect_timer.async_wait([this](const boost::system::error_code& ec) {
+      if (ec) return;
+      std::vector<std::string> friends;
+      {
+        std::lock_guard lk(m);
+        friends.assign(accepted_friends.begin(), accepted_friends.end());
+      }
+      for (const auto& f : friends) attemptDelivery(f, /*silent*/ true);
+      scheduleFriendConnect(false);
     });
   }
 };
@@ -2076,19 +2142,7 @@ void ChatBackend::start(const Options& opt) {
         const auto extPort = static_cast<quint16>(impl_->rendezvous->external_port());
         emit registered(selfId, reachable, observedIp, extPort);
         impl_->rendezvous->enable_polling(true);
-      },
-      [this](const ConnectRequest& req) {
-        if (!impl_->isAccepted(req.from_id)) return;
-        if (impl_->active_peer || impl_->active_udp) return; // one session at a time
-        if (req.udp_port != 0) {
-          // Default to UDP hole punching; fall back to TCP/UPnP inside the UDP session if needed.
-          impl_->connectToPeerUdp(req.from_id, req.ip, req.udp_port, req.port, req.port != 0, /*silent*/ false);
-          return;
-        }
-        if (req.port != 0) {
-          impl_->connectToPeer(req.from_id, req.ip, req.port, /*silent*/ false);
-          return;
-        }
+        impl_->scheduleFriendConnect(/*immediate*/ true);
       },
       [this](const std::string& from_id, const std::string& intro) {
         emit friendRequestReceived(QString::fromStdString(from_id), QString::fromStdString(intro));
@@ -2105,14 +2159,19 @@ void ChatBackend::stop() {
   if (impl_->rendezvous) impl_->rendezvous->stop();
   boost::system::error_code ignored;
   impl_->acceptor.close(ignored);
+  impl_->friend_connect_timer.cancel();
   impl_->udp_announce_timer.cancel();
   impl_->udp_socket.close(ignored);
   impl_->io.stop();
   if (impl_->io_thread.joinable()) impl_->io_thread.join();
   impl_->io.restart();
   impl_->rendezvous.reset();
-  impl_->active_peer.reset();
-  impl_->active_udp.reset();
+  impl_->tcp_sessions.clear();
+  impl_->udp_sessions.clear();
+  impl_->udp_ep_to_peer.clear();
+  impl_->last_lookup.clear();
+  impl_->last_connect_attempt.clear();
+  impl_->friend_connect_running = false;
   if (impl_->owns_upnp_mapping) impl_->upnp.remove_mapping_best_effort();
   impl_->owns_upnp_mapping = false;
 }
@@ -2126,13 +2185,25 @@ void ChatBackend::setSelfName(const QString& name) {
 
   // Push updated name immediately to any active session (P2P).
   boost::asio::post(impl_->io, [impl = impl_, nm] {
-    if (impl->active_peer) impl->active_peer->send_name(nm);
-    if (impl->active_udp) impl->active_udp->send_name(nm);
+    for (auto& [_, s] : impl->tcp_sessions) {
+      if (s) s->send_name(nm);
+    }
+    for (auto& [_, s] : impl->udp_sessions) {
+      if (s) s->send_name(nm);
+    }
   });
 }
 
 void ChatBackend::setFriendAccepted(const QString& peerId, bool accepted) {
-  impl_->setAccepted(peerId.toStdString(), accepted);
+  const auto pid = peerId.toStdString();
+  impl_->setAccepted(pid, accepted);
+  boost::asio::post(impl_->io, [impl = impl_, pid, accepted] {
+    if (!accepted) {
+      impl->closePeerSessions(pid);
+      return;
+    }
+    impl->attemptDelivery(pid, /*silent*/ true);
+  });
 }
 
 void ChatBackend::sendFriendRequest(const QString& peerId, const QString& intro) {
@@ -2150,6 +2221,7 @@ void ChatBackend::acceptFriend(const QString& peerId) {
   boost::asio::post(impl_->io, [impl = impl_, pid] {
     if (!impl->rendezvous) return;
     impl->rendezvous->send_friend_accept(pid);
+    impl->attemptDelivery(pid, /*silent*/ true);
   });
 }
 
@@ -2164,7 +2236,7 @@ void ChatBackend::sendMessage(const QString& peerId, const QString& text) {
 
   boost::asio::post(impl_->io, [impl = impl_, pid] {
     if (!impl->rendezvous) return;
-    if (impl->active_peer && std::string(impl->active_peer->peer_id()) == pid) {
+    if (impl->udp_sessions.find(pid) != impl->udp_sessions.end()) {
       impl->flushOutgoing(pid);
       return;
     }
@@ -2175,9 +2247,7 @@ void ChatBackend::sendMessage(const QString& peerId, const QString& text) {
 void ChatBackend::disconnectPeer(const QString& peerId) {
   const auto pid = peerId.toStdString();
   boost::asio::post(impl_->io, [impl = impl_, pid] {
-    if (!impl->active_peer) return;
-    if (std::string(impl->active_peer->peer_id()) != pid) return;
-    impl->active_peer->close();
+    impl->closePeerSessions(pid);
   });
 }
 
@@ -2186,7 +2256,6 @@ void ChatBackend::warmConnect(const QString& peerId) {
   boost::asio::post(impl_->io, [impl = impl_, pid] {
     if (!impl->rendezvous) return;
     if (!impl->isAccepted(pid)) return;
-    if (impl->active_peer) return;
     impl->attemptDelivery(pid, /*silent*/ true);
   });
 }
