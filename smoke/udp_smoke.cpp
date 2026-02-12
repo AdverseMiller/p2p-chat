@@ -77,9 +77,6 @@ int main(int argc, char** argv) {
   oa.keyPath = QDir(dirA).filePath("identity.pem");
   oa.selfName = "smokeA";
   oa.listenPort = 41001;
-  oa.noUpnp = true;
-  // Force rendezvous TCP reachability probe to fail so only UDP hole punching can succeed.
-  oa.externalPort = 51001;
 
   ChatBackend::Options ob;
   ob.serverHost = hp->host;
@@ -87,9 +84,6 @@ int main(int argc, char** argv) {
   ob.keyPath = QDir(dirB).filePath("identity.pem");
   ob.selfName = "smokeB";
   ob.listenPort = 41002;
-  ob.noUpnp = true;
-  // Force rendezvous TCP reachability probe to fail so only UDP hole punching can succeed.
-  ob.externalPort = 51002;
 
   QString idA;
   QString idB;
@@ -103,11 +97,11 @@ int main(int argc, char** argv) {
     a.sendMessage(idB, "hello over udp");
   };
 
-  QObject::connect(&a, &ChatBackend::registered, &app, [&](QString selfId, bool, QString, quint16) {
+  QObject::connect(&a, &ChatBackend::registered, &app, [&](QString selfId, QString, quint16) {
     idA = selfId;
     maybeKick();
   });
-  QObject::connect(&b, &ChatBackend::registered, &app, [&](QString selfId, bool, QString, quint16) {
+  QObject::connect(&b, &ChatBackend::registered, &app, [&](QString selfId, QString, quint16) {
     idB = selfId;
     maybeKick();
   });

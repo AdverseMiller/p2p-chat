@@ -31,7 +31,6 @@ constexpr auto kCleanupInterval = std::chrono::seconds(5);
 
 struct FriendRequest {
   std::string from_id;
-  std::string intro;
   std::chrono::steady_clock::time_point created_at{};
 };
 
@@ -40,9 +39,7 @@ struct Registration {
   std::string raw_observed_ip;
   std::string observed_ip;
   std::string udp_ip;
-  uint16_t external_port = 0;
   uint16_t udp_port = 0;
-  bool reachable = false;
   std::chrono::steady_clock::time_point last_seen{};
   std::weak_ptr<void> owner_tag;
 };
@@ -92,12 +89,9 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
   // Registration/auth handshake
   struct PendingAuth {
     std::string id;
-    uint16_t listen_port = 0;
-    uint16_t external_port_hint = 0;
     std::string challenge_b64url;
   };
   std::optional<PendingAuth> pending_auth_;
-  uint16_t listen_port_ = 0;
 };
 
 class RendezvousServer {
@@ -289,18 +283,9 @@ class RendezvousServer {
 
   bool register_client(const std::shared_ptr<ClientSession>& session,
                        std::string id,
-                       uint16_t listen_port,
-                       uint16_t external_port,
-                       bool reachable,
                        std::string* out_final_id,
                        std::string* out_observed_ip,
-                       bool* out_reachable,
-                       uint16_t* out_external_port,
                        std::string* out_error) {
-    if (listen_port == 0) {
-      *out_error = "listen_port must be 1..65535";
-      return false;
-    }
     if (!common::is_valid_id(id)) {
       *out_error = "invalid id (allowed: [A-Za-z0-9_-], length 10..128)";
       return false;
@@ -327,8 +312,6 @@ class RendezvousServer {
     reg.raw_observed_ip = raw_ip;
     reg.observed_ip = observed_ip;
     reg.udp_ip = observed_ip;
-    reg.external_port = reachable ? external_port : 0;
-    reg.reachable = reachable;
     reg.last_seen = now;
     reg.owner_tag = session->owner_tag();
 
@@ -341,79 +324,10 @@ class RendezvousServer {
 
     *out_final_id = final_id;
     *out_observed_ip = observed_ip;
-    *out_reachable = reachable;
-    *out_external_port = reg.external_port;
-
     common::log("register id=" + final_id + " observed_ip=" + observed_ip +
-                " reachable=" + std::string(reachable ? "true" : "false") +
-                " external_port=" + std::to_string(reg.external_port) +
                 " udp_ip=" + reg.udp_ip +
                 " udp_port=" + std::to_string(reg.udp_port));
-    (void)listen_port; // reserved for future (might be useful for diagnostics)
     return true;
-  }
-
-  using ProbeCallback = std::function<void(bool reachable)>;
-
-  void probe_reachability(std::string id,
-                          std::string observed_ip,
-                          uint16_t external_port_hint,
-                          ProbeCallback cb) {
-    if (external_port_hint == 0) return cb(false);
-
-    auto sock = std::make_shared<tcp::socket>(io_);
-    auto timer = std::make_shared<boost::asio::steady_timer>(io_);
-    timer->expires_after(std::chrono::seconds(2));
-
-    auto challenge = std::make_shared<std::string>(random_challenge_b64url(32));
-    timer->async_wait([sock, cb](const boost::system::error_code& ec) {
-      if (ec) return;
-      boost::system::error_code ignored;
-      sock->close(ignored);
-      cb(false);
-    });
-
-    boost::system::error_code ec;
-    const auto addr = boost::asio::ip::make_address(observed_ip, ec);
-    if (ec) return cb(false);
-    tcp::endpoint ep(addr, external_port_hint);
-
-    sock->async_connect(ep, [sock, timer, id = std::move(id), challenge, cb = std::move(cb)](
-                                const boost::system::error_code& ec2) mutable {
-      if (ec2) {
-        timer->cancel();
-        return cb(false);
-      }
-
-      json p;
-      p["type"] = "probe";
-      p["challenge"] = *challenge;
-
-      common::async_write_json(*sock, p, [sock, timer, id, challenge, cb = std::move(cb)](
-                                         const boost::system::error_code& ecw) mutable {
-        if (ecw) {
-          timer->cancel();
-          return cb(false);
-        }
-        common::async_read_json(*sock, common::kMaxFrameSize, [timer, id, challenge, cb = std::move(cb)](
-                                                               const boost::system::error_code& ecr,
-                                                               json resp) mutable {
-          timer->cancel();
-          if (ecr) return cb(false);
-          if (!resp.contains("type") || !resp["type"].is_string()) return cb(false);
-          if (resp["type"].get<std::string>() != "probe_ok") return cb(false);
-          if (!resp.contains("id") || !resp["id"].is_string()) return cb(false);
-          if (!resp.contains("signature") || !resp["signature"].is_string()) return cb(false);
-          const std::string rid = resp["id"].get<std::string>();
-          if (rid != id) return cb(false);
-          const std::string sig = resp["signature"].get<std::string>();
-          const auto msg = common::base64url_decode(*challenge);
-          if (!msg) return cb(false);
-          const bool ok = common::ed25519_verify_bytes_b64url(id, *msg, sig);
-          cb(ok);
-        });
-      });
-    });
   }
 
   bool touch(std::string_view id, std::string* out_error) {
@@ -435,7 +349,6 @@ class RendezvousServer {
 
   void enqueue_friend_request(std::string from_id,
                               std::string to_id,
-                              std::string intro,
                               std::string* out_error) {
     if (!get_registration(from_id)) {
       *out_error = "from_id not registered";
@@ -445,13 +358,8 @@ class RendezvousServer {
       *out_error = "to_id not registered";
       return;
     }
-    if (intro.size() > 256) {
-      *out_error = "intro too long (max 256)";
-      return;
-    }
     FriendRequest fr;
     fr.from_id = std::move(from_id);
-    fr.intro = std::move(intro);
     fr.created_at = std::chrono::steady_clock::now();
     pending_friend_requests_[std::move(to_id)].push_back(std::move(fr));
   }
@@ -691,29 +599,8 @@ void ClientSession::handle_message(const json& msg) {
       send_error("invalid id format");
       return;
     }
-    if (!msg.contains("listen_port") || !msg["listen_port"].is_number_integer()) {
-      send_error("missing/invalid field: listen_port");
-      return;
-    }
-    const int lp = msg["listen_port"].get<int>();
-    if (lp <= 0 || lp > 65535) {
-      send_error("listen_port must be 1..65535");
-      return;
-    }
-    if (!msg.contains("external_port_hint") || !msg["external_port_hint"].is_number_integer()) {
-      send_error("missing/invalid field: external_port_hint");
-      return;
-    }
-    const int eph = msg["external_port_hint"].get<int>();
-    if (eph <= 0 || eph > 65535) {
-      send_error("external_port_hint must be 1..65535");
-      return;
-    }
-
     PendingAuth pa;
     pa.id = id;
-    pa.listen_port = static_cast<uint16_t>(lp);
-    pa.external_port_hint = static_cast<uint16_t>(eph);
     pa.challenge_b64url = random_challenge_b64url(32);
     pending_auth_ = pa;
 
@@ -752,50 +639,34 @@ void ClientSession::handle_message(const json& msg) {
       return;
     }
 
-    // Run reachability probe; only then commit registration and respond register_ok.
+    // Commit registration after challenge verification.
     auto self = shared_from_this();
     const auto pa = *pending_auth_;
     pending_auth_.reset();
 
-    auto do_probe_and_register = [self, pa]() mutable {
-      std::string probe_ip = self->observed_ip_;
-      if (common::is_private_ipv4(probe_ip) && !self->server_.public_ip().empty()) {
-        // Per user preference: treat local-LAN clients as using the server's public IP for reachability probing.
-        probe_ip = std::string(self->server_.public_ip());
+    auto do_register = [self, pa]() mutable {
+      std::string final_id;
+      std::string observed_ip;
+      std::string err;
+
+      const bool ok = self->server_.register_client(self,
+                                                    pa.id,
+                                                    &final_id,
+                                                    &observed_ip,
+                                                    &err);
+      if (!ok) {
+        self->send_error(err);
+        return;
       }
-
-      self->server_.probe_reachability(pa.id, probe_ip, pa.external_port_hint, [self, pa](bool reachable) mutable {
-        std::string final_id;
-        std::string observed_ip;
-        bool out_reachable = false;
-        uint16_t out_ext_port = 0;
-        std::string err;
-
-        const bool ok = self->server_.register_client(self,
-                                                      pa.id,
-                                                      pa.listen_port,
-                                                      pa.external_port_hint,
-                                                      reachable,
-                                                      &final_id,
-                                                      &observed_ip,
-                                                      &out_reachable,
-                                                      &out_ext_port,
-                                                      &err);
-        if (!ok) {
-          self->send_error(err);
-          return;
-        }
-        self->id_ = final_id;
-        self->listen_port_ = pa.listen_port;
-        self->send_register_ok();
-      });
+      self->id_ = final_id;
+      self->send_register_ok();
     };
 
     if (common::is_private_ipv4(observed_ip_) && self->server_.public_ip().empty()) {
       // Try to learn the server's public IP before finalizing registration so observed_ip can be rewritten.
-      self->server_.ensure_public_ip_fresh(std::move(do_probe_and_register));
+      self->server_.ensure_public_ip_fresh(std::move(do_register));
     } else {
-      do_probe_and_register();
+      do_register();
     }
     return;
   }
@@ -832,15 +703,11 @@ void ClientSession::handle_message(const json& msg) {
     if (!reg) {
       resp["ok"] = false;
       resp["ip"] = "";
-      resp["port"] = 0;
       resp["udp_port"] = 0;
       resp["udp_ip"] = "";
-      resp["reachable"] = false;
     } else {
       resp["ok"] = true;
       resp["ip"] = reg->observed_ip;
-      resp["reachable"] = reg->reachable;
-      resp["port"] = reg->reachable ? reg->external_port : 0;
       resp["udp_port"] = reg->udp_port;
       resp["udp_ip"] = server_.best_udp_ip_for(*reg, observed_ip_);
     }
@@ -862,10 +729,8 @@ void ClientSession::handle_message(const json& msg) {
       send_error("from_id mismatch for this connection");
       return;
     }
-    std::string intro;
-    if (msg.contains("intro") && msg["intro"].is_string()) intro = msg["intro"].get<std::string>();
     std::string err;
-    server_.enqueue_friend_request(from_id, to_id, std::move(intro), &err);
+    server_.enqueue_friend_request(from_id, to_id, &err);
     if (!err.empty()) {
       send_error(err);
       return;
@@ -921,7 +786,6 @@ void ClientSession::handle_message(const json& msg) {
     for (const auto& fr : friend_reqs) {
       json jf;
       jf["from_id"] = fr.from_id;
-      jf["intro"] = fr.intro;
       resp["friend_requests"].push_back(std::move(jf));
     }
     resp["friend_accepts"] = json::array();
@@ -944,8 +808,6 @@ void ClientSession::send_register_ok() {
   resp["type"] = "register_ok";
   resp["id"] = reg->id;
   resp["observed_ip"] = reg->observed_ip;
-  resp["reachable"] = reg->reachable;
-  resp["external_port"] = reg->external_port;
   resp["udp_ip"] = reg->udp_ip;
   resp["udp_port"] = reg->udp_port;
   send(std::move(resp));

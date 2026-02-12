@@ -15,8 +15,6 @@ public:
     QString keyPath;
     QString selfName;
     quint16 listenPort = 0;
-    bool noUpnp = false;
-    quint16 externalPort = 0;
   };
 
   struct VoiceSettings {
@@ -37,7 +35,7 @@ public:
   void setSelfName(const QString& name);
   void setSelfAvatarPng(const QByteArray& pngBytes);
 
-  void sendFriendRequest(const QString& peerId, const QString& intro);
+  void sendFriendRequest(const QString& peerId);
   void acceptFriend(const QString& peerId);
   void sendMessage(const QString& peerId, const QString& text);
   void disconnectPeer(const QString& peerId);
@@ -53,9 +51,9 @@ public:
   void updateVoiceSettings(const VoiceSettings& settings);
 
 signals:
-  void registered(QString selfId, bool reachable, QString observedIp, quint16 externalPort);
+  void registered(QString selfId, QString observedIp, quint16 udpPort);
   void logLine(QString line);
-  void friendRequestReceived(QString fromId, QString intro);
+  void friendRequestReceived(QString fromId);
   void friendAccepted(QString peerId);
   void presenceUpdated(QString peerId, bool online);
   void peerAvatarUpdated(QString peerId, QByteArray pngBytes);

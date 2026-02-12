@@ -3,7 +3,7 @@
 Two small terminal programs:
 
 - `rendezvous_server`: presence/discovery server (never relays chat content)
-- `p2p_chat_gui`: Qt6 desktop chat client (friends list + chat pane), with optional UPnP via `miniupnpc`
+- `p2p_chat_gui`: Qt6 desktop chat client (friends list + chat pane)
 
 ## Build (Ubuntu/Debian)
 
@@ -11,18 +11,22 @@ Suggested packages:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential pkg-config libboost-system-dev libminiupnpc-dev libssl-dev
+sudo apt-get install -y build-essential pkg-config libboost-system-dev libssl-dev
 ```
 
 Notes:
 - JSON uses a vendored `nlohmann/json.hpp` in `third_party/nlohmann/json.hpp` (no system package required).
-- If `miniupnpc` headers/libs are missing, the build succeeds with UPnP disabled.
 
 Build:
 
 ```bash
 make -j
 ```
+
+`-march=native`:
+- Enabled by default for local `make` builds.
+- Auto-disabled on GitHub Actions (`GITHUB_ACTIONS=true`).
+- Override with `make NATIVE_ARCH=0 -j` (disable) or `make NATIVE_ARCH=1 -j` (enable).
 
 Qt GUI build (Qt6 Widgets):
 
@@ -33,13 +37,16 @@ cmake --build build -j
 ./build/p2p_chat_gui
 ```
 
+CMake also enables `-march=native` by default for local non-CI, non-cross builds.
+Override with `-DP2PCHAT_ENABLE_MARCH_NATIVE=OFF`.
+
 ## Cross-compile to Windows (from Linux)
 
 Most reliable: build on Windows (or CI Windows runner). Cross-compiling from Linux works best with **MXE** (MinGW + Qt).
 
 High-level MXE steps:
 
-1) Build MXE toolchain + deps (Qt6, OpenSSL, Boost, miniupnpc).
+1) Build MXE toolchain + deps (Qt6, OpenSSL, Boost).
 2) Configure this project with MXE’s `mxe-conf.cmake`.
 3) Build `p2p_chat_gui.exe` (and optionally `rendezvous_server.exe`).
 4) Bundle Qt DLLs via `windeployqt` (from the same Qt toolchain).
@@ -49,7 +56,7 @@ Example (MXE, 64-bit, shared):
 ```bash
 git clone https://github.com/mxe/mxe.git ~/mxe
 cd ~/mxe
-make MXE_TARGETS='x86_64-w64-mingw32.shared' qt6-qtbase openssl boost miniupnpc
+make MXE_TARGETS='x86_64-w64-mingw32.shared' qt6-qtbase openssl boost
 
 cd /path/to/p2p-chat
 cmake -S . -B build-win \
@@ -73,7 +80,7 @@ pacman -S --needed \
   mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja \
   mingw-w64-x86_64-qt6-base mingw-w64-x86_64-qt6-multimedia mingw-w64-x86_64-opus \
   mingw-w64-x86_64-boost mingw-w64-x86_64-openssl \
-  mingw-w64-x86_64-miniupnpc mingw-w64-x86_64-pkgconf
+  mingw-w64-x86_64-pkgconf
 ```
 
 3) Build + bundle:
@@ -98,6 +105,10 @@ Clients:
 
 ```bash
 ./build/p2p_chat_gui
+# or force runtime debug logs
+P2PCHAT_DEBUG=1 ./build/p2p_chat_gui
+# or
+./build/p2p_chat_gui --debug
 ```
 
 The GUI defaults to `learn.fairuse.org:5555` as the rendezvous server (editable in the profile JSON for now).
@@ -115,6 +126,6 @@ Encryption:
 - P2P traffic is end-to-end encrypted and authenticated (X25519 + HKDF-SHA256 + ChaCha20-Poly1305), with peer authentication via Ed25519 signatures (your ID).
 - The rendezvous server channel is not encrypted (it never relays chat content, only discovery + requests).
 
-UPnP / reachability:
-- Reachability is determined by the rendezvous server (it probes your observed public IP + the external port hint).
-- The GUI can run without UPnP; if you manually forwarded a port, set `externalPort` in the profile JSON.
+Discovery / UDP:
+- Clients publish their current UDP endpoint to rendezvous and connect peer-to-peer via UDP hole punching.
+- Rendezvous stores observed address + UDP mapping only; it does not maintain a TCP reachability flag.

@@ -4,7 +4,6 @@
 #include "common/crypto.hpp"
 #include "common/framing.hpp"
 #include "common/identity.hpp"
-#include "common/upnp.hpp"
 #include "common/util.hpp"
 
 #include <QCoreApplication>
@@ -15,7 +14,9 @@
 
 #include <atomic>
 #include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -54,12 +55,32 @@ constexpr auto kConnectTimeout = std::chrono::seconds(10);
 constexpr auto kUdpPunchInterval = std::chrono::milliseconds(250);
 constexpr auto kUdpHandshakeResend = std::chrono::milliseconds(400);
 constexpr auto kUdpDataResend = std::chrono::milliseconds(500);
+constexpr int kVoiceJitterStartFrames = 3;
+constexpr int kVoiceJitterTargetFrames = 2;
+constexpr int kVoiceJitterMaxFrames = 8;
 
+bool debug_logs_enabled() {
+  static const bool enabled = [] {
 #if !defined(NDEBUG)
-constexpr bool kDebugLogs = true;
+    const bool default_enabled = true;
 #else
-constexpr bool kDebugLogs = false;
+    const bool default_enabled = false;
 #endif
+    const char* raw = std::getenv("P2PCHAT_DEBUG");
+    if (!raw || !*raw) return default_enabled;
+
+    std::string value(raw);
+    value.erase(std::remove_if(value.begin(), value.end(), [](unsigned char c) { return std::isspace(c) != 0; }),
+                value.end());
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    if (value == "1" || value == "true" || value == "yes" || value == "on") return true;
+    if (value == "0" || value == "false" || value == "no" || value == "off") return false;
+    return default_enabled;
+  }();
+  return enabled;
+}
 
 #if defined(P2PCHAT_VOICE)
 constexpr uint32_t kVoiceMagic = 0x50325056u; // "P2PV"
@@ -136,7 +157,7 @@ public:
   qint64 writeData(const char*, qint64) override { return -1; }
 
 private:
-  static constexpr int kMaxBytes = 48000 * 2 * 1; // ~1s @48kHz mono s16
+  static constexpr int kMaxBytes = 48000 * 2 / 6; // ~166ms @48kHz mono s16
   mutable std::mutex m_;
   QByteArray buf_;
 };
@@ -783,7 +804,7 @@ public:
     return;
 #else
     if (!voice_ready()) {
-      if (kDebugLogs) {
+      if (debug_logs_enabled()) {
         voice_tx_drop_not_ready_++;
         if ((voice_tx_drop_not_ready_ % 200) == 1) {
           dlog("voice tx drop: not ready (ready=" + std::to_string(ready_) + " confirmed=" +
@@ -794,11 +815,11 @@ public:
     }
     if (opus_frame.empty()) return;
     if (opus_frame.size() > 1200) {
-      if (kDebugLogs) dlog("voice tx drop: opus_frame too big=" + std::to_string(opus_frame.size()));
+      if (debug_logs_enabled()) dlog("voice tx drop: opus_frame too big=" + std::to_string(opus_frame.size()));
       return; // conservative MTU-ish cap
     }
     if (peer_ep_.port() == 0) {
-      if (kDebugLogs) dlog("voice tx drop: peer_ep port=0");
+      if (debug_logs_enabled()) dlog("voice tx drop: peer_ep port=0");
       return;
     }
 
@@ -811,7 +832,7 @@ public:
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(aad.data()), aad.size()),
         std::span<const uint8_t>(opus_frame.data(), opus_frame.size()));
     if (!ct) {
-      if (kDebugLogs) dlog("voice tx encrypt failed seq=" + std::to_string(seq));
+      if (debug_logs_enabled()) dlog("voice tx encrypt failed seq=" + std::to_string(seq));
       return;
     }
 
@@ -830,7 +851,7 @@ public:
     std::memcpy(pkt.data() + 20, ct->data(), ct_len);
 
     auto buf = std::make_shared<std::vector<uint8_t>>(std::move(pkt));
-    if (kDebugLogs) {
+    if (debug_logs_enabled()) {
       voice_tx_ok_++;
       if ((voice_tx_ok_ % 50) == 1) {
         dlog("voice tx ok seq=" + std::to_string(seq) + " ts=" + std::to_string(ts) + " ct_len=" +
@@ -876,7 +897,7 @@ public:
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(aad.data()), aad.size()),
         ct);
     if (!pt) {
-      if (kDebugLogs) {
+      if (debug_logs_enabled()) {
         voice_rx_decrypt_fail_++;
         if ((voice_rx_decrypt_fail_ % 200) == 1) {
           dlog("voice rx decrypt failed count=" + std::to_string(voice_rx_decrypt_fail_) + " seq=" + std::to_string(seq) +
@@ -886,7 +907,7 @@ public:
       return;
     }
     if (pt->size() > 1200) return;
-    if (kDebugLogs) {
+    if (debug_logs_enabled()) {
       voice_rx_ok_++;
       if ((voice_rx_ok_ % 50) == 1) {
         dlog("voice rx ok seq=" + std::to_string(seq) + " ts=" + std::to_string(ts) + " opus_len=" +
@@ -1422,7 +1443,7 @@ private:
   }
 
   void dlog(const std::string& msg) const {
-    if (!kDebugLogs) return;
+    if (!debug_logs_enabled()) return;
     if (!debug_log_) return;
     const std::string who = !peer_id_.empty() ? peer_id_ : expected_peer_id_;
     debug_log_("udp[" + who + "] " + msg);
@@ -1500,8 +1521,6 @@ public:
     std::string server_host;
     uint16_t server_port = 0;
     std::string id;
-    uint16_t listen_port = 0;
-    uint16_t external_port_hint = 0;
     std::function<std::string(std::string_view)> sign_challenge;
     std::function<void(std::string)> log;
   };
@@ -1511,13 +1530,11 @@ public:
     std::string target_id;
     std::string ip;
     std::string udp_ip;
-    uint16_t port = 0;
     uint16_t udp_port = 0;
-    bool reachable = false;
   };
 
   using OnLookup = std::function<void(LookupResult)>;
-  using OnFriendRequest = std::function<void(const std::string& from_id, const std::string& intro)>;
+  using OnFriendRequest = std::function<void(const std::string& from_id)>;
   using OnFriendAccept = std::function<void(const std::string& from_id)>;
 
   RendezvousClient(boost::asio::io_context& io, Config cfg)
@@ -1547,8 +1564,6 @@ public:
   }
 
   std::string_view id() const { return id_; }
-  bool reachable() const { return reachable_; }
-  uint16_t external_port() const { return external_port_; }
   uint16_t udp_port() const { return udp_port_; }
   std::string_view observed_ip() const { return observed_ip_; }
 
@@ -1573,13 +1588,12 @@ public:
     });
   }
 
-  void send_friend_request(const std::string& to_id, std::string intro) {
-    enqueue_or_send([this, to_id, intro = std::move(intro)]() mutable {
+  void send_friend_request(const std::string& to_id) {
+    enqueue_or_send([this, to_id] {
       json j;
       j["type"] = "friend_request";
       j["from_id"] = id_;
       j["to_id"] = to_id;
-      j["intro"] = std::move(intro);
       writer_->send(std::move(j));
     });
   }
@@ -1640,8 +1654,6 @@ private:
     id_.clear();
     observed_ip_.clear();
     udp_ip_.clear();
-    reachable_ = false;
-    external_port_ = 0;
     udp_port_ = 0;
 
     const int delay = immediate ? 0 : reconnect_backoff_secs_;
@@ -1695,8 +1707,6 @@ private:
     json j;
     j["type"] = "register_init";
     j["id"] = cfg_.id;
-    j["listen_port"] = cfg_.listen_port;
-    j["external_port_hint"] = cfg_.external_port_hint;
     writer_->send(std::move(j));
   }
 
@@ -1762,10 +1772,6 @@ private:
       if (!j.contains("id") || !j["id"].is_string()) return;
       id_ = j["id"].get<std::string>();
       observed_ip_ = (j.contains("observed_ip") && j["observed_ip"].is_string()) ? j["observed_ip"].get<std::string>() : "";
-      reachable_ = j.contains("reachable") && j["reachable"].is_boolean() ? j["reachable"].get<bool>() : false;
-      external_port_ = j.contains("external_port") && j["external_port"].is_number_integer()
-                           ? static_cast<uint16_t>(j["external_port"].get<int>())
-                           : 0;
       // udp_ip is the best contact address for UDP punching.
       if (j.contains("udp_ip") && j["udp_ip"].is_string()) udp_ip_ = j["udp_ip"].get<std::string>();
       udp_port_ = j.contains("udp_port") && j["udp_port"].is_number_integer()
@@ -1791,8 +1797,6 @@ private:
       r.target_id = (j.contains("target_id") && j["target_id"].is_string()) ? j["target_id"].get<std::string>() : "";
       r.ip = (j.contains("ip") && j["ip"].is_string()) ? j["ip"].get<std::string>() : "";
       r.udp_ip = (j.contains("udp_ip") && j["udp_ip"].is_string()) ? j["udp_ip"].get<std::string>() : "";
-      r.reachable = j.contains("reachable") && j["reachable"].is_boolean() ? j["reachable"].get<bool>() : false;
-      r.port = j.contains("port") && j["port"].is_number_integer() ? static_cast<uint16_t>(j["port"].get<int>()) : 0;
       r.udp_port = j.contains("udp_port") && j["udp_port"].is_number_integer()
                        ? static_cast<uint16_t>(j["udp_port"].get<int>())
                        : 0;
@@ -1812,9 +1816,7 @@ private:
         for (const auto& fr : j["friend_requests"]) {
           if (!fr.is_object()) continue;
           if (!fr.contains("from_id") || !fr["from_id"].is_string()) continue;
-          std::string intro;
-          if (fr.contains("intro") && fr["intro"].is_string()) intro = fr["intro"].get<std::string>();
-          if (on_friend_request_) on_friend_request_(fr["from_id"].get<std::string>(), intro);
+          if (on_friend_request_) on_friend_request_(fr["from_id"].get<std::string>());
         }
       }
       if (j.contains("friend_accepts") && j["friend_accepts"].is_array()) {
@@ -1844,8 +1846,6 @@ private:
   std::string id_;
   std::string observed_ip_;
   std::string udp_ip_;
-  bool reachable_ = false;
-  uint16_t external_port_ = 0;
   uint16_t udp_port_ = 0;
   int reconnect_backoff_secs_ = 1;
 
@@ -1855,12 +1855,6 @@ private:
   OnFriendRequest on_friend_request_;
   OnFriendAccept on_friend_accept_;
 
-public:
-  // Change external port hint and force a re-register (so server can re-probe reachability).
-  void reprobe_with_external_port_hint(uint16_t hint) {
-    cfg_.external_port_hint = hint;
-    schedule_reconnect(/*immediate*/ true);
-  }
 };
 
 } // namespace
@@ -1925,12 +1919,7 @@ struct ChatBackend::Impl {
   std::thread io_thread;
 
   std::shared_ptr<common::Identity> identity;
-  common::UpnpManager upnp;
-  bool owns_upnp_mapping = false;
-  uint16_t external_port_hint = 0;
   uint16_t listen_port = 0;
-  bool upnp_attempted = false;
-  bool no_upnp = false;
 
   tcp::acceptor acceptor{io};
   udp::socket udp_socket{io};
@@ -1988,7 +1977,7 @@ struct ChatBackend::Impl {
 #if defined(P2PCHAT_VOICE)
   void stopVoiceQt() {
     if (!voice) return;
-    if (kDebugLogs) {
+    if (debug_logs_enabled()) {
       emit q->logLine("[dbg] voice stop peer=" + voice->peerId + " capBytes=" + QString::number(voice->capBytes) +
                       " encFrames=" + QString::number(voice->encFrames) + " rxFrames=" + QString::number(voice->rxFrames) +
                       " decFrames=" + QString::number(voice->decFrames));
@@ -2088,7 +2077,7 @@ struct ChatBackend::Impl {
     vr->dec = dec;
     vr->logTimer.start();
 
-    if (kDebugLogs) {
+    if (debug_logs_enabled()) {
       const bool inOk = inDev.isNull() ? false : inDev.isFormatSupported(fmt);
       const bool outOk = outDev.isNull() ? false : outDev.isFormatSupported(fmt);
       emit q->logLine("[dbg] voice init peer=" + vr->peerId + " frameMs=" + QString::number(frameMs) +
@@ -2114,9 +2103,10 @@ struct ChatBackend::Impl {
     vr->sinkDev = new PcmRingBufferIODevice(q);
     vr->sinkDev->start();
     vr->sink = new QAudioSink(outDev, fmt, q);
+    vr->sink->setBufferSize(frameSamples * static_cast<int>(sizeof(opus_int16)) * 4);
     vr->sink->setVolume(std::clamp(callSettings.speakerVolume, 0, 100) / 100.0);
     vr->sink->start(vr->sinkDev.data());
-    if (kDebugLogs) {
+    if (debug_logs_enabled()) {
       QObject::connect(vr->sink.data(), &QAudioSink::stateChanged, q, [this, stateName](QAudio::State st) {
         emit q->logLine("[dbg] voice sink state=" + QString::fromLatin1(stateName(st)) +
                         " err=" + QString::number(static_cast<int>(voice && voice->sink ? voice->sink->error() : 0)));
@@ -2126,9 +2116,10 @@ struct ChatBackend::Impl {
     }
 
     vr->source = new QAudioSource(inDev, fmt, q);
+    vr->source->setBufferSize(frameSamples * static_cast<int>(sizeof(opus_int16)) * 4);
     vr->source->setVolume(std::clamp(callSettings.micVolume, 0, 100) / 100.0);
     vr->sourceDev = vr->source->start();
-    if (kDebugLogs) {
+    if (debug_logs_enabled()) {
       QObject::connect(vr->source.data(), &QAudioSource::stateChanged, q, [this, stateName](QAudio::State st) {
         emit q->logLine("[dbg] voice source state=" + QString::fromLatin1(stateName(st)) +
                         " err=" + QString::number(static_cast<int>(voice && voice->source ? voice->source->error() : 0)));
@@ -2145,8 +2136,23 @@ struct ChatBackend::Impl {
       if (!voice->sinkDev) return;
       if (!voice->playoutStarted) return;
 
+      if (voice->jitter.size() > kVoiceJitterMaxFrames) {
+        const quint64 newest = voice->jitter.lastKey();
+        const quint64 want = (newest >= static_cast<quint64>(kVoiceJitterTargetFrames - 1))
+                                 ? (newest - static_cast<quint64>(kVoiceJitterTargetFrames - 1))
+                                 : newest;
+        if (want > voice->expectedSeq) {
+          if (debug_logs_enabled()) {
+            emit q->logLine("[dbg] voice catch-up expected=" + QString::number(voice->expectedSeq) +
+                            " -> " + QString::number(want) +
+                            " jitter=" + QString::number(voice->jitter.size()));
+          }
+          voice->expectedSeq = want;
+        }
+      }
+
       // Drop overly old packets.
-      while (!voice->jitter.isEmpty() && voice->jitter.firstKey() + 100 < voice->expectedSeq) {
+      while (!voice->jitter.isEmpty() && voice->jitter.firstKey() < voice->expectedSeq) {
         voice->jitter.erase(voice->jitter.begin());
       }
 
@@ -2160,7 +2166,7 @@ struct ChatBackend::Impl {
       pcm.resize(static_cast<std::size_t>(48000 * voice->frameMs / 1000));
       int outSamples = 0;
       if (!frame.isEmpty()) {
-        if (kDebugLogs) voice->rxFrames++;
+        if (debug_logs_enabled()) voice->rxFrames++;
         outSamples = opus_decode(voice->dec,
                                  reinterpret_cast<const unsigned char*>(frame.constData()),
                                  frame.size(),
@@ -2172,7 +2178,7 @@ struct ChatBackend::Impl {
         outSamples = opus_decode(voice->dec, nullptr, 0, pcm.data(), static_cast<int>(pcm.size()), 0);
       }
       if (outSamples <= 0) return;
-      if (kDebugLogs) {
+      if (debug_logs_enabled()) {
         voice->decFrames++;
         if (voice->logTimer.elapsed() > 1000 && (voice->decFrames % 50) == 1) {
           emit q->logLine("[dbg] voice playout decFrames=" + QString::number(voice->decFrames) +
@@ -2201,13 +2207,13 @@ struct ChatBackend::Impl {
                                   out.data(),
                                   static_cast<opus_int32>(out.size()));
         if (n <= 0) continue;
-        if (kDebugLogs) voice->encFrames++;
+        if (debug_logs_enabled()) voice->encFrames++;
         std::vector<uint8_t> pkt(out.data(), out.data() + n);
         const auto peer = voice->peerId.toStdString();
         boost::asio::post(io, [this, peer, pkt = std::move(pkt)]() mutable {
           auto it = udp_sessions.find(peer);
           if (it == udp_sessions.end() || !it->second) return;
-          if (kDebugLogs) {
+          if (debug_logs_enabled()) {
             postToQt([this, peer] {
               static uint64_t once = 0;
               if ((++once % 200) == 1) emit q->logLine("[dbg] voice tx path using udp session peer=" + QString::fromStdString(peer));
@@ -2215,7 +2221,7 @@ struct ChatBackend::Impl {
           }
           it->second->send_voice_frame(std::move(pkt));
         });
-        if (kDebugLogs && voice->logTimer.elapsed() > 1000 && (voice->encFrames % 50) == 1) {
+        if (debug_logs_enabled() && voice->logTimer.elapsed() > 1000 && (voice->encFrames % 50) == 1) {
           emit q->logLine("[dbg] voice capture capBytes=" + QString::number(voice->capBytes) +
                           " encFrames=" + QString::number(voice->encFrames) +
                           " buf=" + QString::number(voice->captureBuf.size()));
@@ -2240,7 +2246,7 @@ struct ChatBackend::Impl {
     if (voice->peerId != peerId) return;
     if (opusFrame.isEmpty()) return;
 
-    if (kDebugLogs) {
+    if (debug_logs_enabled()) {
       voice->rxFrames++;
       if (voice->logTimer.elapsed() > 1000 && (voice->rxFrames % 50) == 1) {
         emit q->logLine("[dbg] voice rx frame seq=" + QString::number(seq) + " len=" + QString::number(opusFrame.size()) +
@@ -2250,11 +2256,18 @@ struct ChatBackend::Impl {
     }
     if (!voice->jitter.contains(seq)) voice->jitter.insert(seq, opusFrame);
 
-    if (!voice->playoutStarted && voice->jitter.size() >= 3) {
-      voice->expectedSeq = voice->jitter.firstKey();
+    if (!voice->playoutStarted && voice->jitter.size() >= kVoiceJitterStartFrames) {
+      const quint64 newest = voice->jitter.lastKey();
+      const quint64 startAt = (newest >= static_cast<quint64>(kVoiceJitterTargetFrames - 1))
+                                  ? (newest - static_cast<quint64>(kVoiceJitterTargetFrames - 1))
+                                  : newest;
+      voice->expectedSeq = startAt;
+      while (!voice->jitter.isEmpty() && voice->jitter.firstKey() < voice->expectedSeq) {
+        voice->jitter.erase(voice->jitter.begin());
+      }
       voice->playoutStarted = true;
       voice->playoutTimer->start();
-      if (kDebugLogs) {
+      if (debug_logs_enabled()) {
         emit q->logLine("[dbg] voice playout started expectedSeq=" + QString::number(voice->expectedSeq) +
                         " jitter=" + QString::number(voice->jitter.size()));
       }
@@ -2324,7 +2337,7 @@ struct ChatBackend::Impl {
       callRemoteAccepted = true;
       callFrameMs = (frameMs == 10) ? 10 : 20;
       callBitrate = std::clamp(bitrate, 8000, 128000);
-      if (kDebugLogs) {
+      if (debug_logs_enabled()) {
         emit q->logLine("[dbg] incoming call offer peer=" + callPeerId + " call_id=" + callId +
                         " frameMs=" + QString::number(callFrameMs) + " bitrate=" + QString::number(callBitrate));
       }
@@ -2345,7 +2358,7 @@ struct ChatBackend::Impl {
         return;
       }
       callRemoteAccepted = true;
-      if (kDebugLogs) {
+      if (debug_logs_enabled()) {
         emit q->logLine("[dbg] call_answer accepted by peer=" + peerId + " call_id=" + callId);
       }
       emit q->callStateChanged(callPeerId, "connecting");
@@ -2513,14 +2526,14 @@ struct ChatBackend::Impl {
 #if defined(P2PCHAT_VOICE)
   void handle_udp_voice_packet(std::span<const uint8_t> pkt, const udp::endpoint& from) {
     if (pkt.size() < 20) {
-      if (kDebugLogs && (++udp_voice_drop_bad_frame % 200) == 1) {
+      if (debug_logs_enabled() && (++udp_voice_drop_bad_frame % 200) == 1) {
         postToQt([this] { emit q->logLine("[dbg] udp voice drop: short packet"); });
       }
       return;
     }
     if (read_u32be(pkt.data()) != kVoiceMagic) return;
     if (pkt[4] != kVoiceVersion) {
-      if (kDebugLogs && (++udp_voice_drop_bad_frame % 200) == 1) {
+      if (debug_logs_enabled() && (++udp_voice_drop_bad_frame % 200) == 1) {
         postToQt([this] { emit q->logLine("[dbg] udp voice drop: bad version"); });
       }
       return;
@@ -2529,7 +2542,7 @@ struct ChatBackend::Impl {
     const uint32_t ts = read_u32be(pkt.data() + 14);
     const uint16_t ct_len = read_u16be(pkt.data() + 18);
     if (20u + static_cast<std::size_t>(ct_len) != pkt.size()) {
-      if (kDebugLogs && (++udp_voice_drop_bad_frame % 200) == 1) {
+      if (debug_logs_enabled() && (++udp_voice_drop_bad_frame % 200) == 1) {
         postToQt([this, got = pkt.size(), want = 20u + static_cast<std::size_t>(ct_len)] {
           emit q->logLine("[dbg] udp voice drop: length mismatch got=" + QString::number(got) + " want=" +
                           QString::number(want));
@@ -2542,7 +2555,7 @@ struct ChatBackend::Impl {
     const std::string epkey = common::endpoint_to_string(from);
     auto it = udp_ep_to_peer.find(epkey);
     if (it == udp_ep_to_peer.end()) {
-      if (kDebugLogs && (++udp_voice_drop_no_map % 200) == 1) {
+      if (debug_logs_enabled() && (++udp_voice_drop_no_map % 200) == 1) {
         postToQt([this, epkey] { emit q->logLine("[dbg] udp voice drop: no ep map for " + QString::fromStdString(epkey)); });
       }
       return;
@@ -2550,14 +2563,14 @@ struct ChatBackend::Impl {
     const std::string& pid = it->second;
     auto sit = udp_sessions.find(pid);
     if (sit == udp_sessions.end() || !sit->second) {
-      if (kDebugLogs && (++udp_voice_drop_no_session % 200) == 1) {
+      if (debug_logs_enabled() && (++udp_voice_drop_no_session % 200) == 1) {
         postToQt([this, pid] {
           emit q->logLine("[dbg] udp voice drop: no session for " + QString::fromStdString(pid));
         });
       }
       return;
     }
-    if (kDebugLogs) {
+    if (debug_logs_enabled()) {
       udp_voice_routed++;
       if ((udp_voice_routed % 200) == 1) {
         postToQt([this, pid, seq, ts, ct_len] {
@@ -2609,7 +2622,7 @@ struct ChatBackend::Impl {
             [this](const std::string& x) { return isAccepted(x); },
             std::string{},
             [this](const std::string& s) {
-              if (!kDebugLogs) return;
+              if (!debug_logs_enabled()) return;
               postToQt([this, s] { emit q->logLine("[dbg] " + QString::fromStdString(s)); });
             });
         udp_sessions[pid] = session;
@@ -2900,9 +2913,6 @@ struct ChatBackend::Impl {
   void connectToPeerUdp(const std::string& peer_id,
                         const std::string& udp_ip,
                         uint16_t udp_port,
-                        const std::string& tcp_ip,
-                        uint16_t tcp_port,
-                        bool tcp_reachable,
                         bool silent) {
     boost::system::error_code ec;
     const auto addr = boost::asio::ip::make_address(udp_ip, ec);
@@ -2910,9 +2920,12 @@ struct ChatBackend::Impl {
     udp::endpoint ep(addr, udp_port);
 
     if (auto it = udp_sessions.find(peer_id); it != udp_sessions.end() && it->second) {
-      if (it->second->peer_endpoint() == ep) return;
-      it->second->close();
-      udp_sessions.erase(it);
+      auto old_session = it->second;
+      if (old_session->peer_endpoint() == ep) return;
+      old_session->close();
+      if (auto cur = udp_sessions.find(peer_id); cur != udp_sessions.end() && cur->second == old_session) {
+        udp_sessions.erase(cur);
+      }
     }
 
     const std::string selfId = std::string(identity->public_id());
@@ -2930,7 +2943,7 @@ struct ChatBackend::Impl {
         [this](const std::string& pid) { return isAccepted(pid); },
         peer_id,
         [this](const std::string& s) {
-          if (!kDebugLogs) return;
+          if (!debug_logs_enabled()) return;
           postToQt([this, s] { emit q->logLine("[dbg] " + QString::fromStdString(s)); });
         });
 
@@ -2983,45 +2996,24 @@ struct ChatBackend::Impl {
             handleVoiceFrameQt(qpid, seq, bytes);
           });
         },
-        [this, weak, udp_ready, peer_id, epkey, tcp_ip, tcp_port, tcp_reachable, silent, role]() {
+        [this, weak, udp_ready, peer_id, epkey, silent, role]() {
           const bool ok = udp_ready->load();
           auto s = weak.lock();
           if (auto it = udp_sessions.find(peer_id); it != udp_sessions.end() && it->second == s) udp_sessions.erase(it);
           if (auto mit = udp_ep_to_peer.find(epkey); mit != udp_ep_to_peer.end() && mit->second == peer_id) {
             udp_ep_to_peer.erase(mit);
           }
-          if (!ok && role == UdpPeerSession::Role::Initiator) udp_failed_fallback(peer_id, tcp_ip, tcp_port, tcp_reachable, silent);
+          if (!ok && role == UdpPeerSession::Role::Initiator) udp_failed_fallback(peer_id, silent);
         });
 
     // Flush queued messages into the session (session will send once ready).
     flushOutgoing(peer_id);
   }
 
-  void udp_failed_fallback(const std::string& peer_id,
-                           const std::string& ip,
-                           uint16_t tcp_port,
-                           bool tcp_reachable,
-                           bool silent) {
-    // UDP is the default. If it fails, try direct TCP if the peer is reachable; otherwise attempt UPnP so the peer can
-    // connect to us via TCP (classic rendezvous mode).
-    if (tcp_reachable && tcp_port != 0) {
-      connectToPeer(peer_id, ip, tcp_port, silent);
-      return;
-    }
-    if (!rendezvous) return;
-    if (!no_upnp && !upnp_attempted) {
-      upnp_attempted = true;
-      // Try UPnP only after UDP failed.
-      const auto map = upnp.try_map(listen_port, "p2p_chat_gui (miniupnpc)");
-      owns_upnp_mapping = map.ok;
-      if (map.ok) {
-        external_port_hint = map.external_port;
-        rendezvous->reprobe_with_external_port_hint(external_port_hint);
-      }
-    }
+  void udp_failed_fallback(const std::string& peer_id, bool silent) {
     if (!silent) {
       postToQt([this, peer_id] {
-        emit q->deliveryError(QString::fromStdString(peer_id), "delivery failed (udp/tcp unavailable)");
+        emit q->deliveryError(QString::fromStdString(peer_id), "delivery failed (udp session unavailable)");
       });
     }
   }
@@ -3111,30 +3103,31 @@ struct ChatBackend::Impl {
       if (r.udp_port != 0) {
         // UDP hole punching is the default (works even if both peers are NATed).
         const std::string udp_ip = r.udp_ip.empty() ? r.ip : r.udp_ip;
-        connectToPeerUdp(r.target_id, udp_ip, r.udp_port, r.ip, r.port, r.reachable, silent);
+        connectToPeerUdp(r.target_id, udp_ip, r.udp_port, silent);
         return;
       }
-      // No UDP info. Try direct TCP if possible; otherwise request connect (may succeed if we become reachable later).
-      if (r.reachable && r.port != 0) {
-        connectToPeer(r.target_id, r.ip, r.port, silent);
-        return;
-      }
-      udp_failed_fallback(r.target_id, r.ip, r.port, r.reachable, silent);
+      udp_failed_fallback(r.target_id, silent);
     });
   }
 
   void closePeerSessions(const std::string& peer_id) {
     if (auto it = udp_sessions.find(peer_id); it != udp_sessions.end() && it->second) {
-      const auto epkey = common::endpoint_to_string(it->second->peer_endpoint());
-      it->second->close();
-      udp_sessions.erase(it);
+      auto session = it->second;
+      const auto epkey = common::endpoint_to_string(session->peer_endpoint());
+      session->close();
+      if (auto cur = udp_sessions.find(peer_id); cur != udp_sessions.end() && cur->second == session) {
+        udp_sessions.erase(cur);
+      }
       if (auto mit = udp_ep_to_peer.find(epkey); mit != udp_ep_to_peer.end() && mit->second == peer_id) {
         udp_ep_to_peer.erase(mit);
       }
     }
     if (auto it = tcp_sessions.find(peer_id); it != tcp_sessions.end() && it->second) {
-      it->second->close();
-      tcp_sessions.erase(it);
+      auto session = it->second;
+      session->close();
+      if (auto cur = tcp_sessions.find(peer_id); cur != tcp_sessions.end() && cur->second == session) {
+        tcp_sessions.erase(cur);
+      }
     }
   }
 
@@ -3173,6 +3166,9 @@ void ChatBackend::start(const Options& opt) {
   const QString keyPath = opt.keyPath.isEmpty() ? Profile::defaultKeyPath() : opt.keyPath;
   common::log("identity key: " + keyPath.toStdString());
   emit logLine(QString("identity key: %1").arg(keyPath));
+  if (debug_logs_enabled()) {
+    emit logLine("[dbg] runtime debug logging enabled");
+  }
   impl_->identity = common::Identity::load_or_create(keyPath.toStdString());
   {
     std::lock_guard lk(impl_->m);
@@ -3183,22 +3179,16 @@ void ChatBackend::start(const Options& opt) {
   const uint16_t listenPort = opt.listenPort ? static_cast<uint16_t>(opt.listenPort)
                                              : common::choose_default_listen_port();
   impl_->listen_port = listenPort;
-  impl_->no_upnp = opt.noUpnp;
   impl_->bindAcceptor(listenPort);
   impl_->acceptLoop();
   impl_->bindUdp(listenPort);
 
-  // Default to UDP hole-punching; only attempt UPnP after UDP fails.
-  impl_->upnp_attempted = false;
-  impl_->owns_upnp_mapping = false;
-  impl_->external_port_hint = opt.externalPort ? opt.externalPort : listenPort;
+  // UDP hole-punching mode only.
 
   RendezvousClient::Config cfg;
   cfg.server_host = opt.serverHost.toStdString();
   cfg.server_port = opt.serverPort;
   cfg.id = std::string(impl_->identity->public_id());
-  cfg.listen_port = listenPort;
-  cfg.external_port_hint = impl_->external_port_hint;
   cfg.sign_challenge = [id = impl_->identity](std::string_view c) { return id->sign_challenge_b64url(c); };
 
   impl_->server_host = cfg.server_host;
@@ -3209,19 +3199,17 @@ void ChatBackend::start(const Options& opt) {
   impl_->rendezvous->start(
       [impl = impl_]() {
         const auto selfId = QString::fromStdString(std::string(impl->rendezvous->id()));
-        const auto reachable = impl->rendezvous->reachable();
         const auto observedIp = QString::fromStdString(std::string(impl->rendezvous->observed_ip()));
-        const auto extPort = static_cast<quint16>(impl->rendezvous->external_port());
-        impl->postToQt([impl, selfId, reachable, observedIp, extPort] {
-          emit impl->q->registered(selfId, reachable, observedIp, extPort);
+        const auto udpPort = static_cast<quint16>(impl->rendezvous->udp_port());
+        impl->postToQt([impl, selfId, observedIp, udpPort] {
+          emit impl->q->registered(selfId, observedIp, udpPort);
         });
         impl->rendezvous->enable_polling(true);
         impl->scheduleFriendConnect(/*immediate*/ true);
       },
-      [impl = impl_](const std::string& from_id, const std::string& intro) {
+      [impl = impl_](const std::string& from_id) {
         const auto fromId = QString::fromStdString(from_id);
-        const auto in = QString::fromStdString(intro);
-        impl->postToQt([impl, fromId, in] { emit impl->q->friendRequestReceived(fromId, in); });
+        impl->postToQt([impl, fromId] { emit impl->q->friendRequestReceived(fromId); });
       },
       [impl = impl_](const std::string& from_id) {
         const auto fromId = QString::fromStdString(from_id);
@@ -3251,8 +3239,6 @@ void ChatBackend::stop() {
   impl_->last_lookup.clear();
   impl_->last_connect_attempt.clear();
   impl_->friend_connect_running = false;
-  if (impl_->owns_upnp_mapping) impl_->upnp.remove_mapping_best_effort();
-  impl_->owns_upnp_mapping = false;
 }
 
 void ChatBackend::setSelfName(const QString& name) {
@@ -3309,12 +3295,11 @@ void ChatBackend::setFriendAccepted(const QString& peerId, bool accepted) {
   });
 }
 
-void ChatBackend::sendFriendRequest(const QString& peerId, const QString& intro) {
+void ChatBackend::sendFriendRequest(const QString& peerId) {
   const auto pid = peerId.toStdString();
-  const auto in = intro.toStdString();
-  boost::asio::post(impl_->io, [impl = impl_, pid, in] {
+  boost::asio::post(impl_->io, [impl = impl_, pid] {
     if (!impl->rendezvous) return;
-    impl->rendezvous->send_friend_request(pid, in);
+    impl->rendezvous->send_friend_request(pid);
   });
 }
 
@@ -3405,7 +3390,7 @@ void ChatBackend::startCall(const QString& peerId, const VoiceSettings& settings
   impl_->callBitrate = std::clamp(settings.bitrate, 8000, 128000);
 
   emit callStateChanged(peerId, "calling");
-  if (kDebugLogs) {
+  if (debug_logs_enabled()) {
     emit logLine("[dbg] call start outgoing peer=" + peerId + " call_id=" + impl_->callId +
                  " frameMs=" + QString::number(impl_->callFrameMs) + " bitrate=" + QString::number(impl_->callBitrate));
   }
@@ -3473,7 +3458,7 @@ void ChatBackend::answerCall(const QString& peerId, bool accept, const VoiceSett
   impl_->callLocalAccepted = true;
 
   emit callStateChanged(peerId, "connecting");
-  if (kDebugLogs) {
+  if (debug_logs_enabled()) {
     emit logLine("[dbg] call answer accept peer=" + peerId + " call_id=" + impl_->callId +
                  " frameMs=" + QString::number(impl_->callFrameMs) + " bitrate=" + QString::number(impl_->callBitrate));
   }
@@ -3558,6 +3543,7 @@ void ChatBackend::updateVoiceSettings(const VoiceSettings& settings) {
       impl_->voice->sink = nullptr;
     }
     impl_->voice->sink = new QAudioSink(outDev, fmt, this);
+    impl_->voice->sink->setBufferSize(frameSamples * static_cast<int>(sizeof(opus_int16)) * 4);
     impl_->voice->sink->setVolume(std::clamp(settings.speakerVolume, 0, 100) / 100.0);
     if (impl_->voice->sinkDev) impl_->voice->sink->start(impl_->voice->sinkDev.data());
     emit logLine("Output device updated");
@@ -3579,6 +3565,7 @@ void ChatBackend::updateVoiceSettings(const VoiceSettings& settings) {
     impl_->voice->captureBuf.clear();
 
     impl_->voice->source = new QAudioSource(inDev, fmt, this);
+    impl_->voice->source->setBufferSize(frameSamples * static_cast<int>(sizeof(opus_int16)) * 4);
     impl_->voice->source->setVolume(std::clamp(settings.micVolume, 0, 100) / 100.0);
     impl_->voice->sourceDev = impl_->voice->source->start();
     if (impl_->voice->sourceDev) {
@@ -3600,7 +3587,7 @@ void ChatBackend::updateVoiceSettings(const VoiceSettings& settings) {
                                     out.data(),
                                     static_cast<opus_int32>(out.size()));
           if (n <= 0) continue;
-          if (kDebugLogs) impl->voice->encFrames++;
+          if (debug_logs_enabled()) impl->voice->encFrames++;
           std::vector<uint8_t> pkt(out.data(), out.data() + n);
           const auto peer = impl->voice->peerId.toStdString();
           boost::asio::post(impl->io, [impl, peer, pkt = std::move(pkt)]() mutable {

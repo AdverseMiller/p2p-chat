@@ -36,6 +36,8 @@
 #include <QTextBrowser>
 #include <QVBoxLayout>
 
+#include <iostream>
+#include <ctime>
 #include <functional>
 
 namespace {
@@ -155,8 +157,32 @@ QString renderLine(const QString& stamp, const QString& who, const QString& text
   return QString("[%1] <b>%2</b>: %3").arg(stamp, who.toHtmlEscaped(), text.toHtmlEscaped());
 }
 
+QString makeStamp(int hh, int mm) {
+  if (hh < 0) hh = 0;
+  if (hh > 23) hh = 23;
+  if (mm < 0) mm = 0;
+  if (mm > 59) mm = 59;
+
+  char out[6];
+  out[0] = static_cast<char>('0' + (hh / 10));
+  out[1] = static_cast<char>('0' + (hh % 10));
+  out[2] = ':';
+  out[3] = static_cast<char>('0' + (mm / 10));
+  out[4] = static_cast<char>('0' + (mm % 10));
+  out[5] = '\0';
+  return QString::fromLatin1(out, 5);
+}
+
 QString nowStamp() {
-  return QDateTime::currentDateTime().toString("HH:mm");
+  const std::time_t now = std::time(nullptr);
+  if (now <= 0) return makeStamp(0, 0);
+  std::tm tm {};
+#if defined(_WIN32)
+  if (localtime_s(&tm, &now) != 0) return makeStamp(0, 0);
+#else
+  if (!localtime_r(&now, &tm)) return makeStamp(0, 0);
+#endif
+  return makeStamp(tm.tm_hour, tm.tm_min);
 }
 
 QString stampFromUtcMs(qint64 tsMs) {
@@ -172,7 +198,7 @@ QString stampFromUtcMs(qint64 tsMs) {
   const qint64 daySecs = totalSecs % 86400;
   const int hh = static_cast<int>(daySecs / 3600);
   const int mm = static_cast<int>((daySecs % 3600) / 60);
-  return QString("%1:%2").arg(hh, 2, 10, QLatin1Char('0')).arg(mm, 2, 10, QLatin1Char('0'));
+  return makeStamp(hh, mm);
 }
 
 QString friendDisplay(const Profile::FriendEntry& e) {
@@ -211,26 +237,28 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   refreshSelfProfileWidget();
 
   connect(&backend_, &ChatBackend::registered, this,
-          [this](QString selfId, bool reachable, QString observedIp, quint16 externalPort) {
+          [this](QString selfId, QString observedIp, quint16 udpPort) {
             selfId_ = selfId;
             if (myIdEdit_) myIdEdit_->setText(selfId_);
             setWindowTitle(QString("p2p_chat_gui - %1").arg(selfId.left(12)));
-            statusBar()->showMessage(QString("Reachable: %1  Observed: %2  External port: %3")
-                                         .arg(reachable ? "true" : "false")
+            statusBar()->showMessage(QString("Observed: %1  UDP port: %2")
                                          .arg(observedIp)
-                                         .arg(externalPort),
+                                         .arg(udpPort),
                                      10000);
             refreshSelfProfileWidget();
           });
 
+  connect(&backend_, &ChatBackend::logLine, this, [](const QString& line) {
+    std::cout << line.toStdString() << std::endl;
+  });
+
   connect(&backend_, &ChatBackend::friendRequestReceived, this,
-          [this](QString fromId, QString intro) {
+          [this](QString fromId) {
             auto* fe = profile_.findFriend(fromId);
             Profile::FriendEntry e;
             if (fe) e = *fe;
             e.id = fromId;
             e.status = Profile::FriendStatus::IncomingPending;
-            e.lastIntro = intro;
             profile_.upsertFriend(e);
             saveProfile();
             rebuildFriendList();
@@ -345,8 +373,6 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   opt.keyPath = profile_.keyPath;
   opt.selfName = profile_.selfName;
   opt.listenPort = profile_.listenPort;
-  opt.noUpnp = profile_.noUpnp;
-  opt.externalPort = profile_.externalPort;
   backend_.start(opt);
 
   // Load and announce our avatar to peers (P2P only; not via rendezvous).
@@ -492,10 +518,6 @@ void MainWindow::buildUi() {
   addIdEdit_->setPlaceholderText("Friend ID");
   friendsLayout->addWidget(addIdEdit_);
 
-  addIntroEdit_ = new QLineEdit(friendsTab);
-  addIntroEdit_->setPlaceholderText("Intro (optional)");
-  friendsLayout->addWidget(addIntroEdit_);
-
   sendReqBtn_ = new QPushButton("Send Request", friendsTab);
   friendsLayout->addWidget(sendReqBtn_);
   connect(sendReqBtn_, &QPushButton::clicked, this, [this] {
@@ -510,7 +532,7 @@ void MainWindow::buildUi() {
     saveProfile();
     rebuildFriendList();
     rebuildFriendsTab();
-    backend_.sendFriendRequest(id, addIntroEdit_->text().trimmed());
+    backend_.sendFriendRequest(id);
     statusBar()->showMessage("Friend request sent", 5000);
   });
 
@@ -695,33 +717,22 @@ void MainWindow::saveProfile() {
 }
 
 void MainWindow::applyTheme(bool dark) {
-  // Use Fusion for more consistent palettes across platforms.
-  QApplication::setStyle(QStyleFactory::create("Fusion"));
-
   if (!dark) {
-    qApp->setPalette(QApplication::style()->standardPalette());
     qApp->setStyleSheet({});
     return;
   }
 
-  QPalette p;
-  p.setColor(QPalette::Window, QColor(30, 30, 30));
-  p.setColor(QPalette::WindowText, QColor(220, 220, 220));
-  p.setColor(QPalette::Base, QColor(20, 20, 20));
-  p.setColor(QPalette::AlternateBase, QColor(35, 35, 35));
-  p.setColor(QPalette::ToolTipBase, QColor(255, 255, 255));
-  p.setColor(QPalette::ToolTipText, QColor(0, 0, 0));
-  p.setColor(QPalette::Text, QColor(220, 220, 220));
-  p.setColor(QPalette::Button, QColor(45, 45, 45));
-  p.setColor(QPalette::ButtonText, QColor(220, 220, 220));
-  p.setColor(QPalette::BrightText, Qt::red);
-  p.setColor(QPalette::Link, QColor(42, 130, 218));
-  p.setColor(QPalette::Highlight, QColor(42, 130, 218));
-  p.setColor(QPalette::HighlightedText, QColor(0, 0, 0));
-
-  qApp->setPalette(p);
-  // Improve readability for some controls that ignore palette colors (e.g., tooltips).
+  // Use stylesheet-only dark mode to avoid Qt style/palette mutation paths that have crashed on some systems.
   qApp->setStyleSheet(
+      "QWidget { background-color: #1e1e1e; color: #dcdcdc; }"
+      "QLineEdit, QTextEdit, QTextBrowser, QListWidget { background-color: #141414; color: #dcdcdc; border: 1px solid #3a3a3a; }"
+      "QPushButton { background-color: #2d2d2d; color: #dcdcdc; border: 1px solid #555; padding: 4px 8px; }"
+      "QPushButton:hover { background-color: #3a3a3a; }"
+      "QMenuBar, QMenu { background-color: #252525; color: #dcdcdc; }"
+      "QMenu::item:selected { background-color: #2a82da; color: #000; }"
+      "QTabBar::tab { background: #2d2d2d; color: #dcdcdc; padding: 6px 10px; border: 1px solid #555; }"
+      "QTabBar::tab:selected { background: #2a82da; color: #000; }"
+      "QHeaderView::section { background-color: #2d2d2d; color: #dcdcdc; }"
       "QToolTip { color: #000; background-color: #fff; border: 1px solid #aaa; }");
 }
 
@@ -744,7 +755,6 @@ void MainWindow::rebuildFriendList() {
     item->setData(kRoleOnline, online_.value(f.id, false));
     item->setIcon(QIcon(loadAvatarOrPlaceholder(f.id, f.avatarPath, 28)));
     item->setSizeHint(QSize(0, 46));
-    if (!f.lastIntro.isEmpty()) item->setToolTip(f.lastIntro);
     friendList_->addItem(item);
   }
   // Restore selection if possible.
@@ -765,7 +775,6 @@ void MainWindow::rebuildFriendsTab() {
     if (f.status != Profile::FriendStatus::IncomingPending) continue;
     auto* item = new QListWidgetItem(f.id.left(14) + "…");
     item->setData(Qt::UserRole, f.id);
-    if (!f.lastIntro.isEmpty()) item->setToolTip(f.lastIntro);
     requestsList_->addItem(item);
   }
   if (myIdEdit_ && !selfId_.isEmpty()) myIdEdit_->setText(selfId_);
@@ -876,12 +885,6 @@ void MainWindow::showProfilePopup(const QString& peerId) {
   keyRowLayout->addWidget(keyEdit, 1);
   keyRowLayout->addWidget(copyBtn, 0);
   form->addRow("Public key:", keyRow);
-
-  if (f && !f->lastIntro.isEmpty()) {
-    auto* introLabel = new QLabel(f->lastIntro, &dlg);
-    introLabel->setWordWrap(true);
-    form->addRow("Intro:", introLabel);
-  }
 
   root->addLayout(form);
 
@@ -1016,10 +1019,7 @@ void MainWindow::addFriendDialog() {
 
   QLineEdit idEdit;
   idEdit.setPlaceholderText("Friend ID (base64url public key)");
-  QLineEdit introEdit;
-  introEdit.setPlaceholderText("Optional intro");
   form.addRow("ID:", &idEdit);
-  form.addRow("Intro:", &introEdit);
 
   QDialogButtonBox buttons(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
   form.addRow(&buttons);
@@ -1039,6 +1039,6 @@ void MainWindow::addFriendDialog() {
   saveProfile();
   rebuildFriendList();
 
-  backend_.sendFriendRequest(id, introEdit.text().trimmed());
+  backend_.sendFriendRequest(id);
   statusBar()->showMessage("Friend request sent", 5000);
 }

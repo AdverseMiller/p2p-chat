@@ -19,14 +19,17 @@ endif
 CXXFLAGS += -ffunction-sections -fdata-sections
 LDFLAGS += -Wl,--gc-sections
 
+ifeq ($(GITHUB_ACTIONS),true)
+  NATIVE_ARCH ?= 0
+else
+  NATIVE_ARCH ?= 1
+endif
+ifeq ($(NATIVE_ARCH),1)
+  CXXFLAGS += -march=native
+endif
+
 LDLIBS += -lboost_system -lpthread
 LDLIBS += -lssl -lcrypto
-
-HAVE_UPNP := $(shell pkg-config --exists miniupnpc && echo 1 || echo 0)
-ifeq ($(HAVE_UPNP),1)
-  CXXFLAGS += $(shell pkg-config --cflags miniupnpc) -DHAVE_UPNP
-  LDLIBS += $(shell pkg-config --libs miniupnpc)
-endif
 
 all: rendezvous_server
 

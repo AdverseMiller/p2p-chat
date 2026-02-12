@@ -53,7 +53,6 @@ private:
   QLineEdit* myIdEdit_ = nullptr;
   QPushButton* copyIdBtn_ = nullptr;
   QLineEdit* addIdEdit_ = nullptr;
-  QLineEdit* addIntroEdit_ = nullptr;
   QPushButton* sendReqBtn_ = nullptr;
   QListWidget* requestsList_ = nullptr;
   QPushButton* acceptBtn_ = nullptr;

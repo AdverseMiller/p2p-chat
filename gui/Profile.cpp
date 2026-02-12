@@ -176,7 +176,6 @@ Profile Profile::load(const QString& path, QString* errorOut) {
     e.name = o.value("name").toString();
     e.avatarPath = o.value("avatarPath").toString();
     e.status = statusFromString(o.value("status").toString());
-    e.lastIntro = o.value("lastIntro").toString();
     if (!e.id.isEmpty()) p.friends.push_back(e);
   }
 
@@ -256,7 +255,6 @@ bool Profile::save(QString* errorOut) const {
     o["name"] = e.name;
     o["avatarPath"] = e.avatarPath;
     o["status"] = statusToString(e.status);
-    o["lastIntro"] = e.lastIntro;
     arr.push_back(o);
   }
   root["friends"] = arr;

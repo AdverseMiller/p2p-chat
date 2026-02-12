@@ -19,7 +19,6 @@ public:
     QString name;    // learned from peer after handshake
     QString avatarPath; // local cached avatar image path (png)
     FriendStatus status = FriendStatus::None;
-    QString lastIntro;
   };
 
   struct ChatMessage {
