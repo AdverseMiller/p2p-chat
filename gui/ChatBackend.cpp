@@ -29,7 +29,9 @@
 #include <unordered_set>
 #include <vector>
 
+#if !defined(_WIN32)
 #include <unistd.h>
+#endif
 
 #if defined(P2PCHAT_VOICE)
 #include <QAudioDevice>
@@ -80,6 +82,14 @@ bool debug_logs_enabled() {
     return default_enabled;
   }();
   return enabled;
+}
+
+bool running_as_root() {
+#if defined(_WIN32)
+  return false;
+#else
+  return ::geteuid() == 0;
+#endif
 }
 
 #if defined(P2PCHAT_VOICE)
@@ -3355,7 +3365,7 @@ void ChatBackend::startCall(const QString& peerId, const VoiceSettings& settings
   (void)settings;
   return;
 #else
-  if (::geteuid() == 0) {
+  if (running_as_root()) {
     emit deliveryError(peerId, "voice unavailable when running as root");
     emit callEnded(peerId, "voice unavailable (running as root)");
     (void)settings;
@@ -3438,7 +3448,7 @@ void ChatBackend::answerCall(const QString& peerId, bool accept, const VoiceSett
   (void)settings;
   return;
 #else
-  if (::geteuid() == 0) {
+  if (running_as_root()) {
     emit deliveryError(peerId, "voice unavailable when running as root");
     impl_->endCallQt("voice unavailable (running as root)", /*notifyPeer*/ false);
     (void)settings;

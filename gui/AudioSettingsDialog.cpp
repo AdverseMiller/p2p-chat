@@ -10,7 +10,9 @@
 #include <QSpinBox>
 #include <QVBoxLayout>
 
+#if !defined(_WIN32)
 #include <unistd.h>
+#endif
 
 #if defined(P2PCHAT_VOICE)
 #include <QMediaDevices>
@@ -24,6 +26,14 @@ constexpr int kRoleDeviceId = Qt::UserRole + 50;
 
 QString deviceIdHex(const QByteArray& id) {
   return QString::fromLatin1(id.toHex());
+}
+
+bool running_as_root() {
+#if defined(_WIN32)
+  return false;
+#else
+  return ::geteuid() == 0;
+#endif
 }
 
 #if defined(P2PCHAT_VOICE) && !defined(_WIN32)
@@ -115,7 +125,7 @@ void AudioSettingsDialog::rebuildDevices() {
 #else
   // QtMultimedia’s Linux audio backends (PipeWire/PulseAudio) expect a per-user runtime dir and usually
   // crash/abort when started as root (common when using setuid `ip netns exec ...`).
-  if (::geteuid() == 0) {
+  if (running_as_root()) {
     if (deviceWarningLabel_) {
       deviceWarningLabel_->setText(
           "Audio device enumeration is disabled because this program is running as root.\n"
