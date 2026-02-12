@@ -37,6 +37,9 @@ public:
 
   void sendFriendRequest(const QString& peerId);
   void acceptFriend(const QString& peerId);
+  // Send an end-to-end encrypted signed control envelope to an accepted friend.
+  // `payloadJsonCompact` must be valid JSON object text.
+  void sendSignedControl(const QString& peerId, const QString& kind, const QString& payloadJsonCompact);
   void sendMessage(const QString& peerId, const QString& text);
   void disconnectPeer(const QString& peerId);
   void warmConnect(const QString& peerId);
@@ -56,9 +59,11 @@ signals:
   void friendRequestReceived(QString fromId);
   void friendAccepted(QString peerId);
   void presenceUpdated(QString peerId, bool online);
+  void directPeerConnectionChanged(QString peerId, bool connected);
   void peerAvatarUpdated(QString peerId, QByteArray pngBytes);
   void peerNameUpdated(QString peerId, QString name);
   void messageReceived(QString peerId, QString displayName, QString text, bool incoming);
+  void signedControlReceived(QString peerId, QString kind, QString payloadJsonCompact, QString signature, QString fromId);
   void deliveryError(QString peerId, QString message);
 
   void incomingCall(QString peerId);

@@ -2173,7 +2173,9 @@ struct ChatBackend::Impl {
       voice->expectedSeq++;
 
       std::vector<opus_int16> pcm;
-      pcm.resize(static_cast<std::size_t>(48000 * voice->frameMs / 1000));
+      // Keep decode buffer at Opus max frame size (60 ms @ 48 kHz) so a temporary peer-side
+      // frame-size mismatch does not cause OPUS_BUFFER_TOO_SMALL.
+      pcm.resize(2880);
       int outSamples = 0;
       if (!frame.isEmpty()) {
         if (debug_logs_enabled()) voice->rxFrames++;
@@ -2312,6 +2314,33 @@ struct ChatBackend::Impl {
     if (!inner.contains("type") || !inner["type"].is_string()) return;
     const QString type = QString::fromStdString(inner["type"].get<std::string>());
 
+    if (type == "signed_control") {
+      if (!inner.contains("kind") || !inner["kind"].is_string()) return;
+      if (!inner.contains("from") || !inner["from"].is_string()) return;
+      if (!inner.contains("payload") || !inner["payload"].is_object()) return;
+      if (!inner.contains("sig") || !inner["sig"].is_string()) return;
+
+      const std::string from = inner["from"].get<std::string>();
+      const std::string kind = inner["kind"].get<std::string>();
+      const std::string sig = inner["sig"].get<std::string>();
+      const json& payload = inner["payload"];
+      const std::string payloadDump = payload.dump();
+      if (from != peerId.toStdString()) return;
+      if (!common::Identity::verify_bytes_b64url(
+              from,
+              std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(payloadDump.data()), payloadDump.size()),
+              sig)) {
+        return;
+      }
+
+      emit q->signedControlReceived(peerId,
+                                    QString::fromStdString(kind),
+                                    QString::fromStdString(payloadDump),
+                                    QString::fromStdString(sig),
+                                    QString::fromStdString(from));
+      return;
+    }
+
     if (type == "call_offer") {
       const QString cid = inner.contains("call_id") && inner["call_id"].is_string()
                               ? QString::fromStdString(inner["call_id"].get<std::string>())
@@ -2367,9 +2396,15 @@ struct ChatBackend::Impl {
         endCallQt("call rejected", /*notifyPeer*/ false);
         return;
       }
+      const int remoteFrameMs = inner.contains("frame_ms") && inner["frame_ms"].is_number_integer()
+                                    ? inner["frame_ms"].get<int>()
+                                    : callFrameMs;
+      const int negotiatedFrameMs = (remoteFrameMs == 10) ? 10 : 20;
+      callFrameMs = negotiatedFrameMs;
       callRemoteAccepted = true;
       if (debug_logs_enabled()) {
-        emit q->logLine("[dbg] call_answer accepted by peer=" + peerId + " call_id=" + callId);
+        emit q->logLine("[dbg] call_answer accepted by peer=" + peerId + " call_id=" + callId +
+                        " negotiatedFrameMs=" + QString::number(callFrameMs));
       }
       emit q->callStateChanged(callPeerId, "connecting");
       maybeStartVoiceQt();
@@ -2388,6 +2423,7 @@ struct ChatBackend::Impl {
   }
 
   void onPeerReadyQt(const QString& peerId) {
+    emit q->directPeerConnectionChanged(peerId, true);
     if (peerId != callPeerId) return;
     if (callPeerId.isEmpty()) return;
     if (callLocalAccepted && callRemoteAccepted) maybeStartVoiceQt();
@@ -2695,6 +2731,7 @@ struct ChatBackend::Impl {
               if (auto mit = udp_ep_to_peer.find(epkey); mit != udp_ep_to_peer.end() && mit->second == pid) {
                 udp_ep_to_peer.erase(mit);
               }
+              postToQt([this, pid] { emit q->directPeerConnectionChanged(QString::fromStdString(pid), false); });
             });
         return;
       }
@@ -2887,6 +2924,7 @@ struct ChatBackend::Impl {
           if (pid.empty()) return;
           auto it = tcp_sessions.find(pid);
           if (it != tcp_sessions.end() && it->second == s) tcp_sessions.erase(it);
+          postToQt([this, pid] { emit q->directPeerConnectionChanged(QString::fromStdString(pid), false); });
         });
   }
 
@@ -3013,6 +3051,7 @@ struct ChatBackend::Impl {
           if (auto mit = udp_ep_to_peer.find(epkey); mit != udp_ep_to_peer.end() && mit->second == peer_id) {
             udp_ep_to_peer.erase(mit);
           }
+          postToQt([this, peer_id] { emit q->directPeerConnectionChanged(QString::fromStdString(peer_id), false); });
           if (!ok && role == UdpPeerSession::Role::Initiator) udp_failed_fallback(peer_id, silent);
         });
 
@@ -3084,8 +3123,12 @@ struct ChatBackend::Impl {
         [this, weak, peer_key]() {
           auto s = weak.lock();
           if (!s) return;
+          const std::string pid = std::string(s->peer_id());
           auto it = tcp_sessions.find(peer_key);
           if (it != tcp_sessions.end() && it->second == s) tcp_sessions.erase(it);
+          if (!pid.empty()) {
+            postToQt([this, pid] { emit q->directPeerConnectionChanged(QString::fromStdString(pid), false); });
+          }
         });
   }
 
@@ -3139,6 +3182,7 @@ struct ChatBackend::Impl {
         tcp_sessions.erase(cur);
       }
     }
+    postToQt([this, peer_id] { emit q->directPeerConnectionChanged(QString::fromStdString(peer_id), false); });
   }
 
   void scheduleFriendConnect(bool immediate) {
@@ -3323,6 +3367,38 @@ void ChatBackend::acceptFriend(const QString& peerId) {
   });
 }
 
+void ChatBackend::sendSignedControl(const QString& peerId, const QString& kind, const QString& payloadJsonCompact) {
+  const auto pid = peerId.toStdString();
+  const auto k = kind.toStdString();
+  const auto payload = payloadJsonCompact.toStdString();
+  if (!impl_->isAccepted(pid)) {
+    emit deliveryError(peerId, "not friends");
+    return;
+  }
+  boost::asio::post(impl_->io, [impl = impl_, pid, k, payload] {
+    if (!impl->identity) return;
+    json payloadObj;
+    try {
+      payloadObj = json::parse(payload);
+    } catch (...) {
+      return;
+    }
+    if (!payloadObj.is_object()) return;
+    const auto payloadDump = payloadObj.dump();
+    const auto sig = impl->identity->sign_bytes_b64url(
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(payloadDump.data()), payloadDump.size()));
+    if (sig.empty()) return;
+
+    json inner;
+    inner["type"] = "signed_control";
+    inner["kind"] = k;
+    inner["from"] = std::string(impl->identity->public_id());
+    inner["payload"] = std::move(payloadObj);
+    inner["sig"] = sig;
+    impl->sendControlToPeer(pid, std::move(inner));
+  });
+}
+
 void ChatBackend::sendMessage(const QString& peerId, const QString& text) {
   const auto pid = peerId.toStdString();
   if (!impl_->isAccepted(pid)) {
@@ -3463,7 +3539,8 @@ void ChatBackend::answerCall(const QString& peerId, bool accept, const VoiceSett
   }
 #endif
   impl_->callSettings = settings;
-  impl_->callFrameMs = (settings.frameMs == 10) ? 10 : 20;
+  // Keep the frame size negotiated by the incoming call_offer for this call.
+  const int frameMs = impl_->callFrameMs;
   impl_->callBitrate = std::clamp(settings.bitrate, 8000, 128000);
   impl_->callLocalAccepted = true;
 
@@ -3473,7 +3550,6 @@ void ChatBackend::answerCall(const QString& peerId, bool accept, const VoiceSett
                  " frameMs=" + QString::number(impl_->callFrameMs) + " bitrate=" + QString::number(impl_->callBitrate));
   }
 
-  const int frameMs = impl_->callFrameMs;
   const int bitrate = impl_->callBitrate;
   boost::asio::post(impl_->io, [impl = impl_, pid, call_id, frameMs, bitrate] {
     json ans;

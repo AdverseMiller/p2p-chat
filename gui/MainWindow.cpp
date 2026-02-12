@@ -1,5 +1,7 @@
 #include "gui/MainWindow.hpp"
 #include "gui/AudioSettingsDialog.hpp"
+#include "common/identity.hpp"
+#include "common/json.hpp"
 
 #include <QAction>
 #include <QApplication>
@@ -15,6 +17,9 @@
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QInputDialog>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -34,6 +39,7 @@
 #include <QSplitter>
 #include <QTabWidget>
 #include <QTextBrowser>
+#include <QUuid>
 #include <QVBoxLayout>
 
 #include <iostream>
@@ -42,7 +48,20 @@
 
 namespace {
 constexpr int kRolePeerId = Qt::UserRole;
-constexpr int kRoleOnline = Qt::UserRole + 1;
+constexpr int kRolePresenceState = Qt::UserRole + 1;
+constexpr int kRoleServerItemType = Qt::UserRole + 10;
+constexpr int kRoleServerId = Qt::UserRole + 11;
+constexpr int kRoleServerChannelId = Qt::UserRole + 12;
+constexpr int kRoleServerChannelVoice = Qt::UserRole + 13;
+constexpr int kRoleIndentPx = Qt::UserRole + 14;
+
+constexpr int kServerHeaderItem = 1;
+constexpr int kServerChannelItem = 2;
+constexpr int kServerVoiceMemberItem = 3;
+
+constexpr int kPresenceOffline = 0;
+constexpr int kPresenceRendezvous = 1;
+constexpr int kPresenceDirect = 2;
 
 class ClickableLabel final : public QLabel {
 public:
@@ -65,14 +84,20 @@ public:
     initStyleOption(&opt, index);
 
     const bool selected = (opt.state & QStyle::State_Selected);
-    const bool online = index.data(kRoleOnline).toBool();
+    const int presence = index.data(kRolePresenceState).toInt();
 
-    const int dot = 10;
+    const bool isVoiceMember = index.data(kRoleServerItemType).toInt() == kServerVoiceMemberItem;
+    const bool hasPresence = index.data(kRolePresenceState).isValid();
+    const int dot = (isVoiceMember || !hasPresence) ? 0 : 10;
     const int margin = 8;
+    const int indentPx = index.data(kRoleIndentPx).toInt();
 
-    const int icon = opt.decorationSize.isValid() ? std::min(opt.decorationSize.width(), opt.decorationSize.height()) : 24;
+    const bool hasIcon = !opt.icon.isNull();
+    const int icon = hasIcon && opt.decorationSize.isValid()
+                         ? std::min(opt.decorationSize.width(), opt.decorationSize.height())
+                         : (hasIcon ? 24 : 0);
     QRect iconRect = opt.rect;
-    iconRect.setLeft(opt.rect.left() + margin);
+    iconRect.setLeft(opt.rect.left() + margin + indentPx);
     iconRect.setRight(iconRect.left() + icon);
     iconRect.setTop(opt.rect.center().y() - icon / 2);
     iconRect.setBottom(iconRect.top() + icon);
@@ -83,7 +108,8 @@ public:
     dotRect.setTop(opt.rect.center().y() - dot / 2);
     dotRect.setBottom(dotRect.top() + dot);
 
-    QRect textRect = opt.rect.adjusted(margin + icon + margin, 0, -(margin + dot + margin), 0);
+    const int textLeft = margin + indentPx + (hasIcon ? (icon + margin) : 0);
+    QRect textRect = opt.rect.adjusted(textLeft, 0, -(margin + (dot > 0 ? dot + margin : 0)), 0);
 
     // Draw background/selection without text.
     QStyleOptionViewItem bg(opt);
@@ -94,7 +120,7 @@ public:
     style->drawControl(QStyle::CE_ItemViewItem, &bg, painter, w);
 
     painter->save();
-    if (!opt.icon.isNull()) {
+    if (hasIcon) {
       opt.icon.paint(painter, iconRect, Qt::AlignCenter, selected ? QIcon::Selected : QIcon::Normal);
     }
 
@@ -104,11 +130,15 @@ public:
     const auto elided = fm.elidedText(opt.text, Qt::ElideRight, textRect.width());
     painter->drawText(textRect, Qt::AlignVCenter | Qt::AlignLeft, elided);
 
-    painter->setRenderHint(QPainter::Antialiasing, true);
-    const QColor c = online ? QColor(0, 200, 80) : QColor(120, 120, 120);
-    painter->setBrush(c);
-    painter->setPen(Qt::NoPen);
-    painter->drawEllipse(dotRect);
+    if (dot > 0) {
+      painter->setRenderHint(QPainter::Antialiasing, true);
+      QColor c(120, 120, 120);
+      if (presence == kPresenceRendezvous) c = QColor(225, 190, 0);
+      if (presence == kPresenceDirect) c = QColor(0, 200, 80);
+      painter->setBrush(c);
+      painter->setPen(Qt::NoPen);
+      painter->drawEllipse(dotRect);
+    }
     painter->restore();
   }
 };
@@ -228,6 +258,93 @@ ChatBackend::VoiceSettings voiceSettingsFromProfile(const Profile::AudioSettings
   v.frameMs = a.frameMs;
   return v;
 }
+
+QString makeServerObjectId() {
+  return QUuid::createUuid().toString(QUuid::WithoutBraces);
+}
+
+qint64 nowUtcMs() {
+  return QDateTime::currentDateTimeUtc().toMSecsSinceEpoch();
+}
+
+QByteArray compactJsonBytes(const QJsonObject& o) {
+  return QJsonDocument(o).toJson(QJsonDocument::Compact);
+}
+
+QString compactJsonString(const QJsonObject& o) {
+  return QString::fromUtf8(compactJsonBytes(o));
+}
+
+QJsonArray channelsToJson(const QVector<Profile::ServerChannel>& channels) {
+  QJsonArray arr;
+  for (const auto& c : channels) {
+    QJsonObject o;
+    o["id"] = c.id;
+    o["name"] = c.name;
+    o["voice"] = c.voice;
+    arr.push_back(o);
+  }
+  return arr;
+}
+
+QVector<Profile::ServerChannel> channelsFromJson(const QJsonArray& arr) {
+  QVector<Profile::ServerChannel> out;
+  for (const auto& v : arr) {
+    if (!v.isObject()) continue;
+    const auto o = v.toObject();
+    Profile::ServerChannel c;
+    c.id = o.value("id").toString();
+    c.name = o.value("name").toString();
+    c.voice = o.value("voice").toBool(false);
+    if (!c.id.isEmpty()) out.push_back(c);
+  }
+  return out;
+}
+
+QJsonArray membersToJson(const QVector<Profile::ServerMember>& members) {
+  QJsonArray arr;
+  for (const auto& m : members) {
+    QJsonObject o;
+    o["id"] = m.id;
+    o["name"] = m.name;
+    arr.push_back(o);
+  }
+  return arr;
+}
+
+QVector<Profile::ServerMember> membersFromJson(const QJsonArray& arr) {
+  QVector<Profile::ServerMember> out;
+  for (const auto& v : arr) {
+    if (!v.isObject()) continue;
+    const auto o = v.toObject();
+    Profile::ServerMember m;
+    m.id = o.value("id").toString();
+    m.name = o.value("name").toString();
+    if (!m.id.isEmpty()) out.push_back(m);
+  }
+  return out;
+}
+
+int findMemberIndex(const QVector<Profile::ServerMember>& members, const QString& id) {
+  for (int i = 0; i < members.size(); ++i) {
+    if (members[i].id == id) return i;
+  }
+  return -1;
+}
+
+bool verifyCanonicalJsonSignature(const QString& signerId, const QString& payloadJsonCompact, const QString& sig) {
+  std::string canonical;
+  try {
+    const auto j = common::json::parse(payloadJsonCompact.toStdString());
+    canonical = j.dump();
+  } catch (...) {
+    return false;
+  }
+  return common::Identity::verify_bytes_b64url(
+      signerId.toStdString(),
+      std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(canonical.data()), canonical.size()),
+      sig.toStdString());
+}
 } // namespace
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
@@ -290,6 +407,14 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
             appendMessage(peerId, displayName, text, incoming);
           });
 
+  connect(&backend_,
+          &ChatBackend::signedControlReceived,
+          this,
+          [this](QString peerId, QString kind, QString payloadJsonCompact, QString signature, QString fromId) {
+            if (fromId != peerId) return;
+            handleSignedControl(peerId, kind, payloadJsonCompact, signature, fromId);
+          });
+
   connect(&backend_, &ChatBackend::peerNameUpdated, this, [this](QString peerId, QString name) {
     if (name.isEmpty()) return;
     auto* f = profile_.findFriend(peerId);
@@ -309,6 +434,14 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     activeCallPeer_ = peerId;
     activeCallState_ = "incoming";
     refreshCallButton();
+    const bool inVoiceChannel = !joinedServerVoiceKey_.isEmpty();
+    if (inVoiceChannel) {
+      backend_.answerCall(peerId, true, voiceSettingsFromProfile(profile_.audio));
+      activeCallState_ = "connecting";
+      refreshCallButton();
+      statusBar()->showMessage("Voice channel call connected", 2500);
+      return;
+    }
     const auto* f = profile_.findFriend(peerId);
     const auto who = f ? friendDisplay(*f) : peerId.left(14) + "...";
     auto ret = QMessageBox::question(this, "Incoming call", QString("%1 is calling you. Accept?").arg(who));
@@ -334,6 +467,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
       refreshCallButton();
     }
     statusBar()->showMessage(QString("Call with %1 ended: %2").arg(peerId.left(12), reason), 8000);
+    maybeSyncVoiceCallForJoinedChannel();
   });
 
   connect(&backend_, &ChatBackend::peerAvatarUpdated, this, [this](QString peerId, QByteArray pngBytes) {
@@ -354,15 +488,27 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   });
 
   connect(&backend_, &ChatBackend::presenceUpdated, this, [this](QString peerId, bool online) {
-    online_[peerId] = online;
-    for (int i = 0; i < friendList_->count(); ++i) {
-      auto* item = friendList_->item(i);
-      if (!item) continue;
-      if (item->data(kRolePeerId).toString() != peerId) continue;
-      item->setData(kRoleOnline, online);
-      friendList_->viewport()->update();
-      break;
+    rendezvousOnline_[peerId] = online;
+    if (!online) {
+      directOnline_[peerId] = false;
+      for (auto it = voiceOccupantsByChannel_.begin(); it != voiceOccupantsByChannel_.end(); ++it) {
+        it.value().remove(peerId);
+      }
     }
+    refreshFriendPresenceRow(peerId);
+    rebuildServerList();
+    refreshServerMembersPane();
+    maybeSyncVoiceCallForJoinedChannel();
+    if (peerId == selectedPeerId_) refreshCallButton();
+  });
+
+  connect(&backend_, &ChatBackend::directPeerConnectionChanged, this, [this](QString peerId, bool connected) {
+    directOnline_[peerId] = connected;
+    if (connected) rendezvousOnline_[peerId] = true;
+    refreshFriendPresenceRow(peerId);
+    rebuildServerList();
+    refreshServerMembersPane();
+    maybeSyncVoiceCallForJoinedChannel();
     if (peerId == selectedPeerId_) refreshCallButton();
   });
 
@@ -395,6 +541,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 
   rebuildFriendList();
   rebuildFriendsTab();
+  rebuildServerList();
   refreshHeader();
 }
 
@@ -583,6 +730,44 @@ void MainWindow::buildUi() {
 
   leftTabs_->addTab(friendsTab, "Friends");
 
+  // Servers tab
+  auto* serversTab = new QWidget(leftTabs_);
+  auto* serversLayout = new QVBoxLayout(serversTab);
+  serversLayout->setContentsMargins(8, 8, 8, 8);
+  serversLayout->setSpacing(8);
+
+  serverList_ = new QListWidget(serversTab);
+  serverList_->setItemDelegate(new PresenceDotDelegate(serverList_));
+  serverList_->setIconSize(QSize(18, 18));
+  serverList_->setSpacing(1);
+  serverList_->setSelectionMode(QAbstractItemView::SingleSelection);
+  serverList_->setContextMenuPolicy(Qt::CustomContextMenu);
+  serversLayout->addWidget(serverList_, 1);
+
+  auto* addServerBtn = new QPushButton("Create Server", serversTab);
+  connect(addServerBtn, &QPushButton::clicked, this, [this] { addServerDialog(); });
+  serversLayout->addWidget(addServerBtn, 0);
+
+  serverInvitesBtn_ = new QPushButton("Pending Invites (0)", serversTab);
+  connect(serverInvitesBtn_, &QPushButton::clicked, this, [this] { reviewPendingServerInvites(); });
+  serversLayout->addWidget(serverInvitesBtn_, 0);
+
+  auto* clearInvitesBtn = new QPushButton("Clear Pending Invites", serversTab);
+  connect(clearInvitesBtn, &QPushButton::clicked, this, [this] {
+    if (profile_.pendingServerInvites.isEmpty()) return;
+    const auto ret = QMessageBox::question(
+        this,
+        "Clear pending invites",
+        QString("Remove all %1 pending invites?").arg(profile_.pendingServerInvites.size()));
+    if (ret != QMessageBox::Yes) return;
+    profile_.pendingServerInvites.clear();
+    saveProfile();
+    rebuildServerList();
+  });
+  serversLayout->addWidget(clearInvitesBtn, 0);
+
+  leftTabs_->addTab(serversTab, "Servers");
+
   auto* right = new QWidget(splitter);
   auto* rightLayout = new QVBoxLayout(right);
   rightLayout->setContentsMargins(8, 8, 8, 8);
@@ -602,9 +787,29 @@ void MainWindow::buildUi() {
 
   rightLayout->addWidget(headerRow);
 
-  chatView_ = new QTextBrowser(right);
+  auto* contentSplit = new QSplitter(Qt::Horizontal, right);
+  auto* chatPane = new QWidget(contentSplit);
+  auto* chatPaneLayout = new QVBoxLayout(chatPane);
+  chatPaneLayout->setContentsMargins(0, 0, 0, 0);
+  chatPaneLayout->setSpacing(0);
+
+  chatView_ = new QTextBrowser(chatPane);
   chatView_->setOpenExternalLinks(false);
-  rightLayout->addWidget(chatView_, /*stretch*/ 1);
+  chatPaneLayout->addWidget(chatView_, /*stretch*/ 1);
+  contentSplit->addWidget(chatPane);
+
+  serverMembersList_ = new QListWidget(contentSplit);
+  serverMembersList_->setItemDelegate(new PresenceDotDelegate(serverMembersList_));
+  serverMembersList_->setIconSize(QSize(22, 22));
+  serverMembersList_->setMinimumWidth(220);
+  serverMembersList_->setMaximumWidth(280);
+  serverMembersList_->setContextMenuPolicy(Qt::CustomContextMenu);
+  serverMembersList_->setVisible(false);
+  contentSplit->addWidget(serverMembersList_);
+  contentSplit->setStretchFactor(0, 4);
+  contentSplit->setStretchFactor(1, 1);
+
+  rightLayout->addWidget(contentSplit, /*stretch*/ 1);
 
   auto* bottom = new QWidget(right);
   auto* bottomLayout = new QHBoxLayout(bottom);
@@ -633,25 +838,90 @@ void MainWindow::buildUi() {
     showChatContextMenu(pos);
   });
 
+  connect(serverList_, &QListWidget::itemClicked, this, [this](QListWidgetItem* item) {
+    if (!item) return;
+    const int type = item->data(kRoleServerItemType).toInt();
+    if (type == kServerHeaderItem) {
+      const auto serverId = item->data(kRoleServerId).toString();
+      auto* s = profile_.findServer(serverId);
+      if (!s) return;
+      s->expanded = !s->expanded;
+      saveProfile();
+      rebuildServerList();
+      return;
+    }
+    if (type == kServerChannelItem) {
+      const auto serverId = item->data(kRoleServerId).toString();
+      const auto channelId = item->data(kRoleServerChannelId).toString();
+      const bool voice = item->data(kRoleServerChannelVoice).toBool();
+      selectServerChannel(serverId, channelId, voice);
+      return;
+    }
+    if (type == kServerVoiceMemberItem) return;
+  });
+
+  connect(serverList_, &QListWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
+    showServerContextMenu(pos);
+  });
+  connect(serverMembersList_, &QListWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
+    showServerMemberContextMenu(pos);
+  });
+
   auto sendNow = [this] {
-    const auto pid = currentPeerId();
-    if (pid.isEmpty()) return;
     const auto msg = input_->text().trimmed();
     if (msg.isEmpty()) return;
     input_->clear();
-    backend_.sendMessage(pid, msg);
+    const auto pid = currentPeerId();
+    if (!pid.isEmpty()) {
+      backend_.sendMessage(pid, msg);
+      return;
+    }
+    const auto key = currentChatKey();
+    if (key.isEmpty() || selectedServerChannelVoice_) return;
+    if (selectedServerId_.isEmpty() || selectedServerChannelId_.isEmpty()) return;
+    broadcastServerText(selectedServerId_, selectedServerChannelId_, msg);
   };
   connect(sendBtn, &QPushButton::clicked, this, sendNow);
   connect(input_, &QLineEdit::returnPressed, this, sendNow);
 
   connect(callBtn_, &QPushButton::clicked, this, [this] {
+    if (!selectedServerChannelId_.isEmpty()) {
+      if (!selectedServerChannelVoice_) return;
+      const auto key = serverChannelChatKey(selectedServerId_, selectedServerChannelId_);
+      if (joinedServerVoiceKey_ == key) {
+        broadcastVoicePresence(selectedServerId_, selectedServerChannelId_, false);
+        voiceOccupantsByChannel_[key].remove(selfId_);
+        joinedServerVoiceKey_.clear();
+        if (!activeCallPeer_.isEmpty()) backend_.endCall(activeCallPeer_);
+        statusBar()->showMessage("Left voice channel", 3000);
+      } else {
+        if (!joinedServerVoiceKey_.isEmpty()) {
+          const auto prevServer = joinedVoiceServerId();
+          const auto prevChannel = joinedVoiceChannelId();
+          if (!prevServer.isEmpty() && !prevChannel.isEmpty()) {
+            broadcastVoicePresence(prevServer, prevChannel, false);
+            voiceOccupantsByChannel_[joinedServerVoiceKey_].remove(selfId_);
+          }
+        }
+        joinedServerVoiceKey_ = key;
+        voiceOccupantsByChannel_[key].insert(selfId_);
+        broadcastVoicePresence(selectedServerId_, selectedServerChannelId_, true);
+        statusBar()->showMessage("Joined voice channel", 4000);
+      }
+      rebuildServerList();
+      refreshCallButton();
+      refreshHeader();
+      maybeSyncVoiceCallForJoinedChannel();
+      return;
+    }
+
     const auto pid = currentPeerId();
     if (pid.isEmpty()) return;
     if (!activeCallPeer_.isEmpty() && activeCallPeer_ == pid && !activeCallState_.isEmpty()) {
       backend_.endCall(pid);
       return;
     }
-    if (!online_.value(pid, false)) {
+    if (presenceStateFor(pid) == kPresenceOffline) {
       statusBar()->showMessage("Peer is offline", 4000);
       return;
     }
@@ -752,7 +1022,7 @@ void MainWindow::rebuildFriendList() {
     if (f.status == Profile::FriendStatus::None) continue;
     auto* item = new QListWidgetItem(friendDisplay(f) + statusTag(f.status));
     item->setData(kRolePeerId, f.id);
-    item->setData(kRoleOnline, online_.value(f.id, false));
+    item->setData(kRolePresenceState, presenceStateFor(f.id));
     item->setIcon(QIcon(loadAvatarOrPlaceholder(f.id, f.avatarPath, 28)));
     item->setSizeHint(QSize(0, 46));
     friendList_->addItem(item);
@@ -781,9 +1051,15 @@ void MainWindow::rebuildFriendsTab() {
 }
 
 void MainWindow::selectFriend(const QString& id) {
+  selectedServerId_.clear();
+  selectedServerChannelId_.clear();
+  selectedServerChannelVoice_ = false;
+  if (serverList_) serverList_->clearSelection();
+
   selectedPeerId_ = id;
   refreshHeader();
   chatView_->clear();
+  refreshServerMembersPane();
 
   if (!chatCache_.contains(id)) {
     QString err;
@@ -796,6 +1072,142 @@ void MainWindow::selectFriend(const QString& id) {
   const auto peerLabel = fe ? friendDisplay(*fe) : id.left(14) + "...";
   for (const auto& m : msgs) {
     const auto who = m.incoming ? peerLabel : "You";
+    chatView_->append(renderLine(stampFromUtcMs(m.tsMs), who, m.text));
+  }
+}
+
+QString MainWindow::serverChannelChatKey(const QString& serverId, const QString& channelId) const {
+  return QString("srv__%1__ch__%2").arg(serverId, channelId);
+}
+
+QString MainWindow::currentChatKey() const {
+  if (!selectedPeerId_.isEmpty()) return selectedPeerId_;
+  if (!selectedServerId_.isEmpty() && !selectedServerChannelId_.isEmpty()) {
+    return serverChannelChatKey(selectedServerId_, selectedServerChannelId_);
+  }
+  return {};
+}
+
+void MainWindow::rebuildServerList() {
+  if (!serverList_) return;
+  serverList_->clear();
+  if (serverInvitesBtn_) {
+    serverInvitesBtn_->setText(QString("Pending Invites (%1)").arg(profile_.pendingServerInvites.size()));
+  }
+
+  for (const auto& server : profile_.servers) {
+    const auto marker = server.expanded ? "v " : "> ";
+    auto* header = new QListWidgetItem(marker + (server.name.isEmpty() ? "Untitled Server" : server.name));
+    header->setData(kRoleServerItemType, kServerHeaderItem);
+    header->setData(kRoleServerId, server.id);
+    serverList_->addItem(header);
+
+    if (!server.expanded) continue;
+    for (const auto& ch : server.channels) {
+      const auto prefix = ch.voice ? "  [voice] " : "  # ";
+      auto* item = new QListWidgetItem(prefix + (ch.name.isEmpty() ? "channel" : ch.name));
+      item->setData(kRoleServerItemType, kServerChannelItem);
+      item->setData(kRoleServerId, server.id);
+      item->setData(kRoleServerChannelId, ch.id);
+      item->setData(kRoleServerChannelVoice, ch.voice);
+      serverList_->addItem(item);
+
+      if (!ch.voice) continue;
+      QStringList ids;
+      const auto key = serverChannelChatKey(server.id, ch.id);
+      for (const auto& id : voiceOccupantsByChannel_.value(key)) {
+        if (id.isEmpty()) continue;
+        if (server.revokedMemberIds.contains(id)) continue;
+        if (findMemberIndex(server.members, id) < 0) continue;
+        ids.push_back(id);
+      }
+      std::sort(ids.begin(), ids.end());
+      for (const auto& id : ids) {
+        const auto* f = profile_.findFriend(id);
+        QString display;
+        if (id == selfId_) {
+          const auto selfName = profile_.selfName.trimmed();
+          display = selfName.isEmpty() ? "Me" : selfName;
+        } else {
+          if (f) {
+            display = friendDisplay(*f);
+          } else {
+            auto mIdx = findMemberIndex(server.members, id);
+            if (mIdx >= 0 && !server.members[mIdx].name.trimmed().isEmpty()) {
+              display = server.members[mIdx].name.trimmed();
+            } else {
+              display = id.left(12) + "...";
+            }
+          }
+        }
+        auto* memberItem = new QListWidgetItem(display);
+        memberItem->setData(kRoleServerItemType, kServerVoiceMemberItem);
+        memberItem->setData(kRoleServerId, server.id);
+        memberItem->setData(kRoleServerChannelId, ch.id);
+        memberItem->setData(kRolePeerId, id);
+        memberItem->setData(kRoleIndentPx, 22);
+        memberItem->setData(kRolePresenceState, presenceStateFor(id));
+        const QString avatarPath = (id == selfId_) ? profile_.selfAvatarPath : (f ? f->avatarPath : QString());
+        memberItem->setIcon(QIcon(loadAvatarOrPlaceholder(id, avatarPath, 18)));
+        memberItem->setFlags(Qt::ItemIsEnabled);
+        memberItem->setSizeHint(QSize(0, 30));
+        serverList_->addItem(memberItem);
+      }
+    }
+  }
+
+  if (selectedServerId_.isEmpty() || selectedServerChannelId_.isEmpty()) {
+    refreshServerMembersPane();
+    return;
+  }
+  for (int i = 0; i < serverList_->count(); ++i) {
+    auto* item = serverList_->item(i);
+    if (!item) continue;
+    if (item->data(kRoleServerItemType).toInt() != kServerChannelItem) continue;
+    if (item->data(kRoleServerId).toString() != selectedServerId_) continue;
+    if (item->data(kRoleServerChannelId).toString() != selectedServerChannelId_) continue;
+    serverList_->setCurrentRow(i);
+    break;
+  }
+  refreshServerMembersPane();
+}
+
+void MainWindow::selectServerChannel(const QString& serverId, const QString& channelId, bool voice) {
+  selectedPeerId_.clear();
+  if (friendList_) friendList_->clearSelection();
+
+  selectedServerId_ = serverId;
+  selectedServerChannelId_ = channelId;
+  selectedServerChannelVoice_ = voice;
+
+  refreshHeader();
+  refreshServerMembersPane();
+  chatView_->clear();
+  if (voice) {
+    maybeSyncVoiceCallForJoinedChannel();
+    return;
+  }
+
+  const auto key = serverChannelChatKey(serverId, channelId);
+  if (!chatCache_.contains(key)) {
+    QString err;
+    chatCache_[key] = profile_.loadChat(key, &err);
+    if (!err.isEmpty()) statusBar()->showMessage(err, 8000);
+  }
+
+  const auto msgs = chatCache_.value(key);
+  for (const auto& m : msgs) {
+    QString who = "You";
+    if (m.incoming) {
+      if (!m.senderName.isEmpty()) {
+        who = m.senderName;
+      } else if (!m.senderId.isEmpty()) {
+        const auto* f = profile_.findFriend(m.senderId);
+        who = f ? friendDisplay(*f) : (m.senderId.left(12) + "...");
+      } else {
+        who = "Channel";
+      }
+    }
     chatView_->append(renderLine(stampFromUtcMs(m.tsMs), who, m.text));
   }
 }
@@ -834,6 +1246,958 @@ void MainWindow::showChatContextMenu(const QPoint& pos) {
     removeFriend(peerId);
     return;
   }
+}
+
+void MainWindow::showServerContextMenu(const QPoint& pos) {
+  if (!serverList_) return;
+  auto* item = serverList_->itemAt(pos);
+  if (!item) return;
+
+  const int type = item->data(kRoleServerItemType).toInt();
+  if (type == kServerVoiceMemberItem) return;
+  const auto serverId = item->data(kRoleServerId).toString();
+  if (serverId.isEmpty()) return;
+
+  QMenu menu(this);
+  QAction* addText = nullptr;
+  QAction* addVoice = nullptr;
+  QAction* inviteFriend = nullptr;
+  QAction* leaveServerAct = nullptr;
+  QAction* removeServerAct = nullptr;
+  QAction* removeChannelAct = nullptr;
+  QString channelId;
+  const auto* server = profile_.findServer(serverId);
+  const bool isOwner = (server && !selfId_.isEmpty() && server->ownerId == selfId_);
+
+  if (type == kServerHeaderItem) {
+    if (isOwner) {
+      inviteFriend = menu.addAction("Invite Friend...");
+      if (inviteFriend) menu.addSeparator();
+      addText = menu.addAction("Add Text Channel");
+      addVoice = menu.addAction("Add Voice Channel");
+      menu.addSeparator();
+      removeServerAct = menu.addAction("Delete Server");
+    } else {
+      leaveServerAct = menu.addAction("Leave Server");
+    }
+  } else if (type == kServerChannelItem) {
+    if (!isOwner) return;
+    channelId = item->data(kRoleServerChannelId).toString();
+    const bool voice = item->data(kRoleServerChannelVoice).toBool();
+    if (!voice) addText = menu.addAction("Add Text Channel");
+    addVoice = menu.addAction("Add Voice Channel");
+    menu.addSeparator();
+    removeChannelAct = menu.addAction("Delete Channel");
+  }
+
+  auto* chosen = menu.exec(serverList_->viewport()->mapToGlobal(pos));
+  if (!chosen) return;
+
+  if (chosen == inviteFriend) {
+    inviteFriendToServer(serverId);
+    return;
+  }
+  if (chosen == addText) {
+    addChannelToServer(serverId, false);
+    return;
+  }
+  if (chosen == addVoice) {
+    addChannelToServer(serverId, true);
+    return;
+  }
+  if (chosen == removeServerAct) {
+    removeServer(serverId);
+    return;
+  }
+  if (chosen == leaveServerAct) {
+    selectedServerId_ = serverId;
+    leaveSelectedServer();
+    return;
+  }
+  if (chosen == removeChannelAct) {
+    removeServerChannel(serverId, channelId);
+    return;
+  }
+}
+
+void MainWindow::showServerMemberContextMenu(const QPoint& pos) {
+  if (!serverMembersList_) return;
+  auto* item = serverMembersList_->itemAt(pos);
+  if (!item) return;
+  if (selectedServerId_.isEmpty()) return;
+
+  const auto memberId = item->data(kRolePeerId).toString();
+  if (memberId.isEmpty()) return;
+
+  auto* server = profile_.findServer(selectedServerId_);
+  if (!server) return;
+  const bool isOwner = (!selfId_.isEmpty() && server->ownerId == selfId_);
+
+  QMenu menu(this);
+  QAction* profileAct = nullptr;
+  QAction* kickAct = nullptr;
+  if (memberId != selfId_) {
+    profileAct = menu.addAction("View profile...");
+  }
+  if (isOwner && memberId != selfId_) {
+    if (profileAct) menu.addSeparator();
+    kickAct = menu.addAction("Kick user");
+  }
+  if (!profileAct && !kickAct) return;
+
+  auto* chosen = menu.exec(serverMembersList_->viewport()->mapToGlobal(pos));
+  if (!chosen) return;
+
+  if (chosen == profileAct) {
+    showProfilePopup(memberId);
+    return;
+  }
+  if (chosen == kickAct) {
+    const auto* f = profile_.findFriend(memberId);
+    const auto who = f ? friendDisplay(*f) : (memberId.left(12) + "...");
+    const auto confirm = QMessageBox::question(this,
+                                               "Kick user",
+                                               QString("Kick %1 from this server?").arg(who));
+    if (confirm != QMessageBox::Yes) return;
+    kickServerMember(selectedServerId_, memberId);
+    return;
+  }
+}
+
+void MainWindow::addServerDialog() {
+  bool ok = false;
+  const auto name =
+      QInputDialog::getText(this, "Create Server", "Server name:", QLineEdit::Normal, "New Server", &ok).trimmed();
+  if (!ok) return;
+
+  Profile::ServerEntry s;
+  s.id = makeServerObjectId();
+  s.name = name.isEmpty() ? "New Server" : name;
+  s.ownerId = selfId_;
+  s.expanded = true;
+  Profile::ServerChannel text;
+  text.id = makeServerObjectId();
+  text.name = "general";
+  text.voice = false;
+  Profile::ServerChannel voice;
+  voice.id = makeServerObjectId();
+  voice.name = "voice";
+  voice.voice = true;
+  s.channels.push_back(text);
+  s.channels.push_back(voice);
+  Profile::ServerMember selfMember;
+  selfMember.id = selfId_;
+  selfMember.name = profile_.selfName;
+  s.members.push_back(selfMember);
+  profile_.servers.push_back(s);
+  saveProfile();
+  rebuildServerList();
+  statusBar()->showMessage("Server created", 4000);
+}
+
+void MainWindow::addChannelToServer(const QString& serverId, bool voice) {
+  auto* s = profile_.findServer(serverId);
+  if (!s) return;
+
+  bool ok = false;
+  const auto defaultName = voice ? "voice" : "text";
+  const auto name =
+      QInputDialog::getText(this, "Add Channel", "Channel name:", QLineEdit::Normal, defaultName, &ok).trimmed();
+  if (!ok) return;
+
+  Profile::ServerChannel c;
+  c.id = makeServerObjectId();
+  c.name = name.isEmpty() ? defaultName : name;
+  c.voice = voice;
+  s->channels.push_back(c);
+  s->expanded = true;
+  if (s->ownerId == selfId_) broadcastServerMemberSync(*s);
+  saveProfile();
+  rebuildServerList();
+  statusBar()->showMessage("Channel added", 3000);
+}
+
+void MainWindow::inviteFriendToServer(const QString& serverId) {
+  auto* s = profile_.findServer(serverId);
+  if (!s) return;
+  if (selfId_.isEmpty()) {
+    QMessageBox::warning(this, "Not ready", "Still connecting; try again in a moment.");
+    return;
+  }
+  if (s->ownerId != selfId_) {
+    QMessageBox::warning(this, "Not owner", "Only the server owner can invite friends.");
+    return;
+  }
+
+  QStringList labels;
+  QVector<QString> ids;
+  for (const auto& f : profile_.friends) {
+    if (f.status != Profile::FriendStatus::Accepted) continue;
+    if (f.id == selfId_) continue;
+    labels.push_back(QString("%1 (%2...)").arg(friendDisplay(f), f.id.left(12)));
+    ids.push_back(f.id);
+  }
+  if (ids.isEmpty()) {
+    QMessageBox::information(this, "No friends", "You need at least one accepted friend to invite.");
+    return;
+  }
+
+  bool ok = false;
+  const auto chosen = QInputDialog::getItem(this, "Invite Friend", "Friend:", labels, 0, false, &ok);
+  if (!ok || chosen.isEmpty()) return;
+  const int idx = labels.indexOf(chosen);
+  if (idx < 0 || idx >= ids.size()) return;
+  const auto targetId = ids[idx];
+
+  QJsonObject payload;
+  payload["server_id"] = s->id;
+  payload["server_name"] = s->name;
+  payload["owner_id"] = s->ownerId;
+  payload["invited_id"] = targetId;
+  payload["issued_ms"] = static_cast<double>(nowUtcMs());
+  payload["nonce"] = makeServerObjectId();
+  payload["channels"] = channelsToJson(s->channels);
+
+  backend_.sendSignedControl(targetId, "server_invite", compactJsonString(payload));
+  statusBar()->showMessage("Server invite sent", 4000);
+}
+
+void MainWindow::reviewPendingServerInvites() {
+  if (profile_.pendingServerInvites.isEmpty()) {
+    QMessageBox::information(this, "Pending Invites", "No pending server invites.");
+    return;
+  }
+  if (selfId_.isEmpty()) {
+    QMessageBox::warning(this, "Not ready", "Still connecting; try again in a moment.");
+    return;
+  }
+
+  QStringList labels;
+  for (const auto& pi : profile_.pendingServerInvites) {
+    QString serverName = pi.serverId;
+    QJsonParseError pe;
+    const auto doc = QJsonDocument::fromJson(pi.payloadJson.toUtf8(), &pe);
+    if (pe.error == QJsonParseError::NoError && doc.isObject()) {
+      serverName = doc.object().value("server_name").toString(serverName);
+    }
+    labels.push_back(QString("%1 (owner %2...)").arg(serverName, pi.ownerId.left(10)));
+  }
+
+  bool ok = false;
+  const auto chosen = QInputDialog::getItem(this, "Pending Invites", "Invite:", labels, 0, false, &ok);
+  if (!ok || chosen.isEmpty()) return;
+  const int idx = labels.indexOf(chosen);
+  if (idx < 0 || idx >= profile_.pendingServerInvites.size()) return;
+  const auto invite = profile_.pendingServerInvites[idx];
+
+  QJsonParseError pe;
+  const auto doc = QJsonDocument::fromJson(invite.payloadJson.toUtf8(), &pe);
+  if (pe.error != QJsonParseError::NoError || !doc.isObject()) {
+    QMessageBox::warning(this, "Invite invalid", "This invite payload is corrupted.");
+    return;
+  }
+  const auto payload = doc.object();
+  const auto serverName = payload.value("server_name").toString(invite.serverId);
+  const auto ownerId = payload.value("owner_id").toString(invite.ownerId);
+  const auto serverId = payload.value("server_id").toString(invite.serverId);
+
+  auto decision = QMessageBox::question(this,
+                                        "Accept Server Invite",
+                                        QString("Accept invite to \"%1\" from %2...?").arg(serverName, ownerId.left(12)));
+  if (decision != QMessageBox::Yes) {
+    profile_.pendingServerInvites.removeAt(idx);
+    saveProfile();
+    rebuildServerList();
+    return;
+  }
+
+  QJsonObject req;
+  req["server_id"] = serverId;
+  req["owner_id"] = ownerId;
+  req["invite_payload"] = invite.payloadJson;
+  req["invite_sig"] = invite.signature;
+  req["requester_id"] = selfId_;
+  req["requester_name"] = profile_.selfName;
+  req["issued_ms"] = static_cast<double>(nowUtcMs());
+  req["nonce"] = makeServerObjectId();
+  backend_.sendSignedControl(ownerId, "server_join_request", compactJsonString(req));
+  profile_.pendingServerInvites.removeAt(idx);
+  saveProfile();
+  rebuildServerList();
+  statusBar()->showMessage("Join request sent to server owner", 5000);
+}
+
+void MainWindow::handleSignedControl(const QString& peerId,
+                                     const QString& kind,
+                                     const QString& payloadJsonCompact,
+                                     const QString& signature,
+                                     const QString& fromId) {
+  if (peerId != fromId) return;
+  QJsonParseError pe;
+  const auto doc = QJsonDocument::fromJson(payloadJsonCompact.toUtf8(), &pe);
+  if (pe.error != QJsonParseError::NoError || !doc.isObject()) return;
+  const auto payload = doc.object();
+
+  if (kind == "server_invite") {
+    handleServerInvite(peerId, payload, signature);
+    return;
+  }
+  if (kind == "server_join_request") {
+    handleServerJoinRequest(peerId, payload);
+    return;
+  }
+  if (kind == "server_membership_cert") {
+    handleServerMembershipCert(peerId, payload, signature);
+    return;
+  }
+  if (kind == "server_member_sync") {
+    handleServerMemberSync(peerId, payload, signature);
+    return;
+  }
+  if (kind == "server_leave") {
+    handleServerLeave(peerId, payload, signature);
+    return;
+  }
+  if (kind == "server_revocation") {
+    handleServerRevocation(peerId, payload, signature);
+    return;
+  }
+  if (kind == "server_channel_text") {
+    handleServerChannelText(peerId, payload, signature);
+    return;
+  }
+  if (kind == "server_voice_presence") {
+    handleServerVoicePresence(peerId, payload, signature);
+    return;
+  }
+}
+
+void MainWindow::handleServerInvite(const QString& peerId, const QJsonObject& payload, const QString& signature) {
+  const auto ownerId = payload.value("owner_id").toString();
+  const auto invitedId = payload.value("invited_id").toString();
+  const auto serverId = payload.value("server_id").toString();
+  if (ownerId.isEmpty() || invitedId.isEmpty() || serverId.isEmpty()) return;
+  if (ownerId != peerId) return;
+  if (invitedId != selfId_) return;
+  const auto payloadJson = compactJsonString(payload);
+  if (!verifyCanonicalJsonSignature(ownerId, payloadJson, signature)) return;
+
+  auto* existing = profile_.findPendingServerInvite(serverId, ownerId);
+  if (!existing) {
+    Profile::PendingServerInvite pi;
+    pi.serverId = serverId;
+    pi.ownerId = ownerId;
+    pi.payloadJson = payloadJson;
+    pi.signature = signature;
+    profile_.pendingServerInvites.push_back(pi);
+  } else {
+    existing->payloadJson = payloadJson;
+    existing->signature = signature;
+  }
+  saveProfile();
+  rebuildServerList();
+
+  const auto serverName = payload.value("server_name").toString(serverId);
+  statusBar()->showMessage(QString("Server invite received: %1").arg(serverName), 6000);
+}
+
+void MainWindow::handleServerJoinRequest(const QString& peerId, const QJsonObject& payload) {
+  const auto ownerId = payload.value("owner_id").toString();
+  const auto requesterId = payload.value("requester_id").toString();
+  const auto serverId = payload.value("server_id").toString();
+  const auto invitePayloadRaw = payload.value("invite_payload").toString();
+  const auto inviteSig = payload.value("invite_sig").toString();
+  if (ownerId.isEmpty() || requesterId.isEmpty() || serverId.isEmpty()) return;
+  if (ownerId != selfId_) return;
+  if (requesterId != peerId) return;
+  if (invitePayloadRaw.isEmpty() || inviteSig.isEmpty()) return;
+
+  QJsonParseError pe;
+  const auto inviteDoc = QJsonDocument::fromJson(invitePayloadRaw.toUtf8(), &pe);
+  if (pe.error != QJsonParseError::NoError || !inviteDoc.isObject()) return;
+  const auto invitePayload = inviteDoc.object();
+  if (invitePayload.value("owner_id").toString() != selfId_) return;
+  if (invitePayload.value("invited_id").toString() != requesterId) return;
+  if (invitePayload.value("server_id").toString() != serverId) return;
+  if (!verifyCanonicalJsonSignature(selfId_, invitePayloadRaw, inviteSig)) return;
+
+  auto* server = profile_.findServer(serverId);
+  if (!server) return;
+  if (!server->ownerId.isEmpty() && server->ownerId != selfId_) return;
+  if (server->ownerId.isEmpty()) server->ownerId = selfId_;
+  if (server->revokedMemberIds.contains(requesterId)) return;
+
+  const auto requesterName = payload.value("requester_name").toString();
+  const int existing = findMemberIndex(server->members, requesterId);
+  if (existing < 0) {
+    Profile::ServerMember m;
+    m.id = requesterId;
+    m.name = requesterName;
+    server->members.push_back(m);
+  } else if (!requesterName.isEmpty()) {
+    server->members[existing].name = requesterName;
+  }
+  if (findMemberIndex(server->members, selfId_) < 0) {
+    Profile::ServerMember selfMember;
+    selfMember.id = selfId_;
+    selfMember.name = profile_.selfName;
+    server->members.push_back(selfMember);
+  }
+
+  QJsonObject cert;
+  cert["server_id"] = server->id;
+  cert["server_name"] = server->name;
+  cert["owner_id"] = selfId_;
+  cert["member_id"] = requesterId;
+  cert["issued_ms"] = static_cast<double>(nowUtcMs());
+  cert["nonce"] = makeServerObjectId();
+  cert["channels"] = channelsToJson(server->channels);
+  cert["members"] = membersToJson(server->members);
+
+  backend_.sendSignedControl(requesterId, "server_membership_cert", compactJsonString(cert));
+  broadcastServerMemberSync(*server);
+  saveProfile();
+  refreshServerMembersPane();
+  statusBar()->showMessage(QString("Approved server join for %1...").arg(requesterId.left(12)), 5000);
+}
+
+void MainWindow::handleServerMembershipCert(const QString& peerId,
+                                            const QJsonObject& payload,
+                                            const QString& signature) {
+  const auto ownerId = payload.value("owner_id").toString();
+  const auto memberId = payload.value("member_id").toString();
+  const auto serverId = payload.value("server_id").toString();
+  if (ownerId.isEmpty() || memberId.isEmpty() || serverId.isEmpty()) return;
+  if (ownerId != peerId) return;
+  if (memberId != selfId_) return;
+
+  auto* server = profile_.findServer(serverId);
+  if (!server) {
+    Profile::ServerEntry s;
+    s.id = serverId;
+    s.name = payload.value("server_name").toString(serverId);
+    s.ownerId = ownerId;
+    s.expanded = true;
+    s.channels = channelsFromJson(payload.value("channels").toArray());
+    s.members = membersFromJson(payload.value("members").toArray());
+    if (findMemberIndex(s.members, selfId_) < 0) {
+      Profile::ServerMember selfMember;
+      selfMember.id = selfId_;
+      selfMember.name = profile_.selfName;
+      s.members.push_back(selfMember);
+    }
+    s.membershipCertPayload = compactJsonString(payload);
+    s.membershipCertSignature = signature;
+    profile_.servers.push_back(s);
+  } else {
+    server->name = payload.value("server_name").toString(server->name);
+    server->ownerId = ownerId;
+    server->channels = channelsFromJson(payload.value("channels").toArray());
+    const auto members = membersFromJson(payload.value("members").toArray());
+    if (!members.isEmpty()) server->members = members;
+    if (findMemberIndex(server->members, selfId_) < 0) {
+      Profile::ServerMember selfMember;
+      selfMember.id = selfId_;
+      selfMember.name = profile_.selfName;
+      server->members.push_back(selfMember);
+    }
+    server->membershipCertPayload = compactJsonString(payload);
+    server->membershipCertSignature = signature;
+  }
+  sanitizeVoiceOccupantsForServer(serverId);
+
+  for (int i = 0; i < profile_.pendingServerInvites.size(); ++i) {
+    if (profile_.pendingServerInvites[i].serverId == serverId &&
+        profile_.pendingServerInvites[i].ownerId == ownerId) {
+      profile_.pendingServerInvites.removeAt(i);
+      break;
+    }
+  }
+
+  saveProfile();
+  rebuildServerList();
+  refreshServerMembersPane();
+  statusBar()->showMessage(QString("Joined server %1").arg(payload.value("server_name").toString(serverId)), 5000);
+}
+
+void MainWindow::broadcastServerMemberSync(const Profile::ServerEntry& server) {
+  if (server.ownerId != selfId_) return;
+  QJsonObject payload;
+  payload["server_id"] = server.id;
+  payload["server_name"] = server.name;
+  payload["owner_id"] = selfId_;
+  payload["members"] = membersToJson(server.members);
+  QJsonArray revoked;
+  for (const auto& r : server.revokedMemberIds) revoked.push_back(r);
+  payload["revoked_member_ids"] = revoked;
+  payload["issued_ms"] = static_cast<double>(nowUtcMs());
+  payload["nonce"] = makeServerObjectId();
+
+  for (const auto& m : server.members) {
+    if (m.id.isEmpty() || m.id == selfId_) continue;
+    if (server.revokedMemberIds.contains(m.id)) continue;
+    backend_.sendSignedControl(m.id, "server_member_sync", compactJsonString(payload));
+  }
+}
+
+void MainWindow::handleServerMemberSync(const QString& peerId, const QJsonObject& payload, const QString& signature) {
+  const auto ownerId = payload.value("owner_id").toString();
+  const auto serverId = payload.value("server_id").toString();
+  if (ownerId.isEmpty() || serverId.isEmpty()) return;
+  if (ownerId != peerId) return;
+
+  auto* server = profile_.findServer(serverId);
+  if (!server) return;
+  if (!server->ownerId.isEmpty() && server->ownerId != ownerId) return;
+  server->ownerId = ownerId;
+  server->name = payload.value("server_name").toString(server->name);
+  server->members = membersFromJson(payload.value("members").toArray());
+  if (findMemberIndex(server->members, selfId_) < 0) {
+    Profile::ServerMember selfMember;
+    selfMember.id = selfId_;
+    selfMember.name = profile_.selfName;
+    server->members.push_back(selfMember);
+  }
+  server->revokedMemberIds.clear();
+  for (const auto& rv : payload.value("revoked_member_ids").toArray()) {
+    if (rv.isString() && !rv.toString().isEmpty()) server->revokedMemberIds.push_back(rv.toString());
+  }
+  sanitizeVoiceOccupantsForServer(serverId);
+  saveProfile();
+  rebuildServerList();
+  refreshServerMembersPane();
+  maybeSyncVoiceCallForJoinedChannel();
+}
+
+void MainWindow::handleServerLeave(const QString& peerId, const QJsonObject& payload, const QString&) {
+  const auto ownerId = payload.value("owner_id").toString();
+  const auto serverId = payload.value("server_id").toString();
+  const auto memberId = payload.value("member_id").toString();
+  if (ownerId != selfId_) return;
+  if (serverId.isEmpty() || memberId.isEmpty()) return;
+  if (memberId != peerId) return;
+
+  auto* server = profile_.findServer(serverId);
+  if (!server) return;
+  if (!server->ownerId.isEmpty() && server->ownerId != selfId_) return;
+
+  for (int i = 0; i < server->members.size(); ++i) {
+    if (server->members[i].id == memberId) {
+      server->members.removeAt(i);
+      break;
+    }
+  }
+  if (!server->revokedMemberIds.contains(memberId)) server->revokedMemberIds.push_back(memberId);
+  sanitizeVoiceOccupantsForServer(serverId);
+
+  QJsonObject rev;
+  rev["server_id"] = serverId;
+  rev["owner_id"] = selfId_;
+  rev["member_id"] = memberId;
+  rev["reason"] = "left";
+  rev["issued_ms"] = static_cast<double>(nowUtcMs());
+  rev["nonce"] = makeServerObjectId();
+  const auto revCompact = compactJsonString(rev);
+
+  backend_.sendSignedControl(memberId, "server_revocation", revCompact);
+  for (const auto& m : server->members) {
+    if (m.id.isEmpty() || m.id == selfId_) continue;
+    backend_.sendSignedControl(m.id, "server_revocation", revCompact);
+  }
+  broadcastServerMemberSync(*server);
+
+  saveProfile();
+  rebuildServerList();
+  refreshServerMembersPane();
+  maybeSyncVoiceCallForJoinedChannel();
+  statusBar()->showMessage(QString("%1 left server").arg(memberId.left(12)), 4000);
+}
+
+void MainWindow::handleServerRevocation(const QString& peerId, const QJsonObject& payload, const QString& signature) {
+  const auto ownerId = payload.value("owner_id").toString();
+  const auto serverId = payload.value("server_id").toString();
+  const auto memberId = payload.value("member_id").toString();
+  if (ownerId.isEmpty() || serverId.isEmpty() || memberId.isEmpty()) return;
+  if (ownerId != peerId) return;
+
+  auto* server = profile_.findServer(serverId);
+  if (!server) return;
+  if (!server->ownerId.isEmpty() && server->ownerId != ownerId) return;
+
+  if (memberId == selfId_) {
+    removeServer(serverId);
+    statusBar()->showMessage("You were removed from server", 5000);
+    return;
+  }
+
+  for (int i = 0; i < server->members.size(); ++i) {
+    if (server->members[i].id == memberId) {
+      server->members.removeAt(i);
+      break;
+    }
+  }
+  if (!server->revokedMemberIds.contains(memberId)) server->revokedMemberIds.push_back(memberId);
+  sanitizeVoiceOccupantsForServer(serverId);
+  saveProfile();
+  rebuildServerList();
+  refreshServerMembersPane();
+  maybeSyncVoiceCallForJoinedChannel();
+}
+
+void MainWindow::broadcastServerText(const QString& serverId, const QString& channelId, const QString& text) {
+  if (text.isEmpty()) return;
+  auto* s = profile_.findServer(serverId);
+  if (!s) return;
+  bool channelOk = false;
+  for (const auto& ch : s->channels) {
+    if (ch.id == channelId && !ch.voice) {
+      channelOk = true;
+      break;
+    }
+  }
+  if (!channelOk) return;
+  if (s->revokedMemberIds.contains(selfId_)) return;
+
+  QJsonObject payload;
+  payload["server_id"] = serverId;
+  payload["channel_id"] = channelId;
+  payload["member_id"] = selfId_;
+  payload["member_name"] = profile_.selfName;
+  payload["text"] = text;
+  payload["issued_ms"] = static_cast<double>(nowUtcMs());
+  payload["nonce"] = makeServerObjectId();
+
+  for (const auto& m : s->members) {
+    if (m.id.isEmpty() || m.id == selfId_) continue;
+    if (s->revokedMemberIds.contains(m.id)) continue;
+    backend_.sendSignedControl(m.id, "server_channel_text", compactJsonString(payload));
+  }
+  appendServerChannelMessage(serverId, channelId, selfId_, profile_.selfName, text, false);
+}
+
+void MainWindow::broadcastVoicePresence(const QString& serverId, const QString& channelId, bool joined) {
+  auto* s = profile_.findServer(serverId);
+  if (!s) return;
+  bool channelOk = false;
+  for (const auto& ch : s->channels) {
+    if (ch.id == channelId && ch.voice) {
+      channelOk = true;
+      break;
+    }
+  }
+  if (!channelOk) return;
+  if (s->revokedMemberIds.contains(selfId_)) return;
+
+  QJsonObject payload;
+  payload["server_id"] = serverId;
+  payload["channel_id"] = channelId;
+  payload["member_id"] = selfId_;
+  payload["joined"] = joined;
+  payload["issued_ms"] = static_cast<double>(nowUtcMs());
+  payload["nonce"] = makeServerObjectId();
+
+  for (const auto& m : s->members) {
+    if (m.id.isEmpty() || m.id == selfId_) continue;
+    if (s->revokedMemberIds.contains(m.id)) continue;
+    backend_.sendSignedControl(m.id, "server_voice_presence", compactJsonString(payload));
+  }
+}
+
+void MainWindow::appendServerChannelMessage(const QString& serverId,
+                                            const QString& channelId,
+                                            const QString& senderId,
+                                            const QString& senderName,
+                                            const QString& text,
+                                            bool incoming) {
+  const auto key = serverChannelChatKey(serverId, channelId);
+  if (!chatCache_.contains(key)) {
+    QString err;
+    chatCache_[key] = profile_.loadChat(key, &err);
+    if (!err.isEmpty()) statusBar()->showMessage(err, 8000);
+  }
+
+  auto& msgs = chatCache_[key];
+  Profile::ChatMessage m;
+  m.tsMs = QDateTime::currentDateTimeUtc().toMSecsSinceEpoch();
+  m.incoming = incoming;
+  m.senderId = senderId;
+  m.senderName = senderName;
+  m.text = text;
+  msgs.push_back(m);
+  while (msgs.size() > 500) msgs.removeFirst();
+
+  QString err;
+  profile_.saveChat(key, msgs, &err);
+  if (!err.isEmpty()) statusBar()->showMessage(err, 8000);
+
+  QString who = "You";
+  if (incoming) {
+    const auto* f = profile_.findFriend(senderId);
+    who = f ? friendDisplay(*f) : (!senderName.isEmpty() ? senderName : (senderId.left(12) + "..."));
+  }
+  if (key == currentChatKey()) chatView_->append(renderLine(stampFromUtcMs(m.tsMs), who, text));
+}
+
+void MainWindow::handleServerChannelText(const QString& peerId, const QJsonObject& payload, const QString&) {
+  const auto serverId = payload.value("server_id").toString();
+  const auto channelId = payload.value("channel_id").toString();
+  const auto memberId = payload.value("member_id").toString();
+  const auto memberName = payload.value("member_name").toString();
+  const auto text = payload.value("text").toString();
+  if (serverId.isEmpty() || channelId.isEmpty() || memberId.isEmpty() || text.isEmpty()) return;
+  if (memberId != peerId) return;
+
+  auto* s = profile_.findServer(serverId);
+  if (!s) return;
+  if (s->revokedMemberIds.contains(memberId)) return;
+  if (findMemberIndex(s->members, memberId) < 0) return;
+  bool channelOk = false;
+  for (const auto& ch : s->channels) {
+    if (ch.id == channelId && !ch.voice) {
+      channelOk = true;
+      break;
+    }
+  }
+  if (!channelOk) return;
+  appendServerChannelMessage(serverId, channelId, memberId, memberName, text, true);
+}
+
+void MainWindow::handleServerVoicePresence(const QString& peerId, const QJsonObject& payload, const QString&) {
+  const auto serverId = payload.value("server_id").toString();
+  const auto channelId = payload.value("channel_id").toString();
+  const auto memberId = payload.value("member_id").toString();
+  const bool joined = payload.value("joined").toBool(false);
+  if (serverId.isEmpty() || channelId.isEmpty() || memberId.isEmpty()) return;
+  if (memberId != peerId) return;
+
+  auto* s = profile_.findServer(serverId);
+  if (!s) return;
+  if (s->revokedMemberIds.contains(memberId)) return;
+  if (findMemberIndex(s->members, memberId) < 0) return;
+  bool channelOk = false;
+  for (const auto& ch : s->channels) {
+    if (ch.id == channelId && ch.voice) {
+      channelOk = true;
+      break;
+    }
+  }
+  if (!channelOk) return;
+
+  const auto key = serverChannelChatKey(serverId, channelId);
+  if (joined) {
+    voiceOccupantsByChannel_[key].insert(memberId);
+  } else {
+    voiceOccupantsByChannel_[key].remove(memberId);
+  }
+  rebuildServerList();
+  refreshServerMembersPane();
+  maybeSyncVoiceCallForJoinedChannel();
+}
+
+QString MainWindow::joinedVoiceServerId() const {
+  if (!joinedServerVoiceKey_.startsWith("srv__")) return {};
+  const int sep = joinedServerVoiceKey_.indexOf("__ch__");
+  if (sep <= 5) return {};
+  return joinedServerVoiceKey_.mid(5, sep - 5);
+}
+
+QString MainWindow::joinedVoiceChannelId() const {
+  const int sep = joinedServerVoiceKey_.indexOf("__ch__");
+  if (sep < 0) return {};
+  return joinedServerVoiceKey_.mid(sep + 6);
+}
+
+void MainWindow::sanitizeVoiceOccupantsForServer(const QString& serverId) {
+  auto* s = profile_.findServer(serverId);
+  if (!s) return;
+  QSet<QString> allowed;
+  for (const auto& m : s->members) {
+    if (m.id.isEmpty()) continue;
+    if (s->revokedMemberIds.contains(m.id)) continue;
+    allowed.insert(m.id);
+  }
+
+  const QString prefix = QString("srv__%1__ch__").arg(serverId);
+  for (auto it = voiceOccupantsByChannel_.begin(); it != voiceOccupantsByChannel_.end(); ++it) {
+    if (!it.key().startsWith(prefix)) continue;
+    QSet<QString> next;
+    for (const auto& id : it.value()) {
+      if (allowed.contains(id)) next.insert(id);
+    }
+    it.value() = next;
+  }
+}
+
+void MainWindow::maybeSyncVoiceCallForJoinedChannel() {
+  if (joinedServerVoiceKey_.isEmpty()) {
+    if (!activeCallPeer_.isEmpty()) backend_.endCall(activeCallPeer_);
+    return;
+  }
+
+  auto peers = voiceOccupantsByChannel_.value(joinedServerVoiceKey_);
+  peers.remove(selfId_);
+  for (auto it = peers.begin(); it != peers.end();) {
+    if (presenceStateFor(*it) == kPresenceOffline) {
+      it = peers.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
+  if (peers.isEmpty()) {
+    if (!activeCallPeer_.isEmpty()) backend_.endCall(activeCallPeer_);
+    return;
+  }
+
+  QStringList sortedPeers;
+  for (const auto& p : peers) sortedPeers.push_back(p);
+  std::sort(sortedPeers.begin(), sortedPeers.end());
+  const auto target = sortedPeers.front();
+
+  if (!activeCallPeer_.isEmpty() && activeCallPeer_ != target) {
+    backend_.endCall(activeCallPeer_);
+    return;
+  }
+  if (!activeCallPeer_.isEmpty() && activeCallPeer_ == target && !activeCallState_.isEmpty()) {
+    return;
+  }
+
+  // Deterministic initiator avoids simultaneous call_offer collisions.
+  if (selfId_ >= target) {
+    activeCallPeer_ = target;
+    activeCallState_.clear();
+    refreshCallButton();
+    return;
+  }
+
+  activeCallPeer_ = target;
+  activeCallState_ = "calling";
+  refreshCallButton();
+  backend_.startCall(target, voiceSettingsFromProfile(profile_.audio));
+}
+
+void MainWindow::leaveSelectedServer() {
+  if (selectedServerId_.isEmpty()) return;
+  auto* s = profile_.findServer(selectedServerId_);
+  if (!s) return;
+  if (s->ownerId == selfId_) {
+    removeServer(selectedServerId_);
+    return;
+  }
+  if (!s->ownerId.isEmpty() && !selfId_.isEmpty()) {
+    QJsonObject leave;
+    leave["server_id"] = s->id;
+    leave["owner_id"] = s->ownerId;
+    leave["member_id"] = selfId_;
+    leave["issued_ms"] = static_cast<double>(nowUtcMs());
+    leave["nonce"] = makeServerObjectId();
+    backend_.sendSignedControl(s->ownerId, "server_leave", compactJsonString(leave));
+  }
+  removeServer(selectedServerId_);
+}
+
+void MainWindow::removeServer(const QString& serverId) {
+  const QString prefix = QString("srv__%1__ch__").arg(serverId);
+  for (auto it = voiceOccupantsByChannel_.begin(); it != voiceOccupantsByChannel_.end();) {
+    if (it.key().startsWith(prefix)) {
+      it = voiceOccupantsByChannel_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (int i = 0; i < profile_.servers.size(); ++i) {
+    if (profile_.servers[i].id != serverId) continue;
+    profile_.servers.removeAt(i);
+    break;
+  }
+  if (selectedServerId_ == serverId) {
+    if (!joinedServerVoiceKey_.isEmpty() && joinedVoiceServerId() == serverId) {
+      joinedServerVoiceKey_.clear();
+      if (!activeCallPeer_.isEmpty()) backend_.endCall(activeCallPeer_);
+    }
+    selectedServerId_.clear();
+    selectedServerChannelId_.clear();
+    selectedServerChannelVoice_ = false;
+    chatView_->clear();
+  }
+  saveProfile();
+  rebuildServerList();
+  refreshServerMembersPane();
+  refreshHeader();
+  statusBar()->showMessage("Server deleted", 3000);
+}
+
+void MainWindow::removeServerChannel(const QString& serverId, const QString& channelId) {
+  auto* s = profile_.findServer(serverId);
+  if (!s) return;
+  const auto key = serverChannelChatKey(serverId, channelId);
+  voiceOccupantsByChannel_.remove(key);
+  for (int i = 0; i < s->channels.size(); ++i) {
+    if (s->channels[i].id == channelId) {
+      s->channels.removeAt(i);
+      break;
+    }
+  }
+  if (s->ownerId == selfId_) broadcastServerMemberSync(*s);
+
+  if (selectedServerId_ == serverId && selectedServerChannelId_ == channelId) {
+    if (joinedServerVoiceKey_ == key) {
+      joinedServerVoiceKey_.clear();
+      if (!activeCallPeer_.isEmpty()) backend_.endCall(activeCallPeer_);
+    }
+    selectedServerChannelId_.clear();
+    selectedServerChannelVoice_ = false;
+    chatView_->clear();
+  }
+
+  saveProfile();
+  rebuildServerList();
+  refreshServerMembersPane();
+  refreshHeader();
+  statusBar()->showMessage("Channel deleted", 3000);
+}
+
+void MainWindow::kickServerMember(const QString& serverId, const QString& memberId) {
+  if (serverId.isEmpty() || memberId.isEmpty()) return;
+  if (memberId == selfId_) return;
+
+  auto* server = profile_.findServer(serverId);
+  if (!server) return;
+  if (server->ownerId != selfId_) return;
+
+  bool wasMember = false;
+  for (int i = 0; i < server->members.size(); ++i) {
+    if (server->members[i].id != memberId) continue;
+    server->members.removeAt(i);
+    wasMember = true;
+    break;
+  }
+  if (!wasMember) return;
+
+  if (!server->revokedMemberIds.contains(memberId)) server->revokedMemberIds.push_back(memberId);
+  sanitizeVoiceOccupantsForServer(serverId);
+
+  QJsonObject rev;
+  rev["server_id"] = serverId;
+  rev["owner_id"] = selfId_;
+  rev["member_id"] = memberId;
+  rev["reason"] = "kicked";
+  rev["issued_ms"] = static_cast<double>(nowUtcMs());
+  rev["nonce"] = makeServerObjectId();
+  const auto revCompact = compactJsonString(rev);
+
+  backend_.sendSignedControl(memberId, "server_revocation", revCompact);
+  for (const auto& m : server->members) {
+    if (m.id.isEmpty() || m.id == selfId_) continue;
+    backend_.sendSignedControl(m.id, "server_revocation", revCompact);
+  }
+  broadcastServerMemberSync(*server);
+
+  saveProfile();
+  rebuildServerList();
+  refreshServerMembersPane();
+  maybeSyncVoiceCallForJoinedChannel();
+  statusBar()->showMessage(QString("Kicked %1 from server").arg(memberId.left(12)), 4000);
 }
 
 void MainWindow::showProfilePopup(const QString& peerId) {
@@ -932,11 +2296,86 @@ void MainWindow::removeFriend(const QString& peerId) {
 }
 
 QString MainWindow::currentPeerId() const {
+  if (!selectedServerId_.isEmpty()) return {};
   return selectedPeerId_;
+}
+
+int MainWindow::presenceStateFor(const QString& peerId) const {
+  if (!selfId_.isEmpty() && peerId == selfId_) return kPresenceDirect;
+  if (directOnline_.value(peerId, false)) return kPresenceDirect;
+  if (rendezvousOnline_.value(peerId, false)) return kPresenceRendezvous;
+  return kPresenceOffline;
+}
+
+void MainWindow::refreshFriendPresenceRow(const QString& peerId) {
+  if (!friendList_) return;
+  for (int i = 0; i < friendList_->count(); ++i) {
+    auto* item = friendList_->item(i);
+    if (!item) continue;
+    if (item->data(kRolePeerId).toString() != peerId) continue;
+    item->setData(kRolePresenceState, presenceStateFor(peerId));
+    friendList_->viewport()->update();
+    return;
+  }
+}
+
+void MainWindow::refreshServerMembersPane() {
+  if (!serverMembersList_) return;
+  if (selectedServerId_.isEmpty()) {
+    serverMembersList_->clear();
+    serverMembersList_->setVisible(false);
+    return;
+  }
+  const auto* s = profile_.findServer(selectedServerId_);
+  if (!s) {
+    serverMembersList_->clear();
+    serverMembersList_->setVisible(false);
+    return;
+  }
+  serverMembersList_->setVisible(true);
+  serverMembersList_->clear();
+  const auto vcKey = (selectedServerChannelVoice_ && !selectedServerChannelId_.isEmpty())
+                         ? serverChannelChatKey(selectedServerId_, selectedServerChannelId_)
+                         : QString();
+  for (const auto& m : s->members) {
+    auto* item = new QListWidgetItem();
+    const auto* f = profile_.findFriend(m.id);
+    QString display;
+    if (m.id == selfId_) {
+      const auto selfName = profile_.selfName.trimmed();
+      display = selfName.isEmpty() ? "Me" : selfName;
+    } else {
+      display = f ? friendDisplay(*f) : (!m.name.isEmpty() ? m.name : (m.id.left(12) + "..."));
+    }
+    if (!vcKey.isEmpty() && voiceOccupantsByChannel_.value(vcKey).contains(m.id)) {
+      display += " [vc]";
+    }
+    item->setText(display);
+    item->setData(kRolePeerId, m.id);
+    item->setData(kRolePresenceState, presenceStateFor(m.id));
+    const QString avatarPath = (m.id == selfId_) ? profile_.selfAvatarPath : (f ? f->avatarPath : QString());
+    item->setIcon(QIcon(loadAvatarOrPlaceholder(m.id, avatarPath, 22)));
+    item->setSizeHint(QSize(0, 38));
+    serverMembersList_->addItem(item);
+  }
 }
 
 void MainWindow::refreshCallButton() {
   if (!callBtn_) return;
+
+  if (!selectedServerId_.isEmpty() && !selectedServerChannelId_.isEmpty()) {
+    if (!selectedServerChannelVoice_) {
+      callBtn_->setEnabled(false);
+      callBtn_->setText("Call");
+      return;
+    }
+    const auto key = serverChannelChatKey(selectedServerId_, selectedServerChannelId_);
+    const bool joined = (joinedServerVoiceKey_ == key);
+    callBtn_->setEnabled(true);
+    callBtn_->setText(joined ? "Leave Voice" : "Join Voice");
+    return;
+  }
+
   const auto pid = currentPeerId();
   if (pid.isEmpty()) {
     callBtn_->setEnabled(false);
@@ -954,7 +2393,7 @@ void MainWindow::refreshCallButton() {
 
   const auto* f = profile_.findFriend(pid);
   const bool accepted = (f && f->status == Profile::FriendStatus::Accepted);
-  const bool online = online_.value(pid, false);
+  const bool online = presenceStateFor(pid) != kPresenceOffline;
   callBtn_->setEnabled(accepted && online);
   callBtn_->setText("Call");
 }
@@ -997,10 +2436,33 @@ void MainWindow::appendMessage(const QString& peerId, const QString& label, cons
     who = f ? friendDisplay(*f) : label;
   }
   const auto line = renderLine(stampFromUtcMs(m.tsMs), who, text);
-  if (peerId == selectedPeerId_) chatView_->append(line);
+  if (peerId == currentChatKey()) chatView_->append(line);
 }
 
 void MainWindow::refreshHeader() {
+  if (!selectedServerId_.isEmpty() && !selectedServerChannelId_.isEmpty()) {
+    const auto* server = profile_.findServer(selectedServerId_);
+    QString channelName = selectedServerChannelId_;
+    if (server) {
+      for (const auto& ch : server->channels) {
+        if (ch.id == selectedServerChannelId_) {
+          channelName = ch.name.isEmpty() ? "channel" : ch.name;
+          break;
+        }
+      }
+    }
+    const auto serverName = (server && !server->name.isEmpty()) ? server->name : QString("Server");
+    if (selectedServerChannelVoice_) {
+      const auto key = serverChannelChatKey(selectedServerId_, selectedServerChannelId_);
+      const auto joined = joinedServerVoiceKey_ == key ? " [joined]" : "";
+      headerLabel_->setText(QString("%1 / %2 (voice)%3").arg(serverName, channelName, joined));
+    } else {
+      headerLabel_->setText(QString("%1 / #%2").arg(serverName, channelName));
+    }
+    refreshCallButton();
+    return;
+  }
+
   if (selectedPeerId_.isEmpty()) {
     headerLabel_->setText("No chat selected");
     refreshCallButton();

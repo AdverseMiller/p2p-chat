@@ -179,6 +179,57 @@ Profile Profile::load(const QString& path, QString* errorOut) {
     if (!e.id.isEmpty()) p.friends.push_back(e);
   }
 
+  const auto srvArr = root.value("servers").toArray();
+  for (const auto& v : srvArr) {
+    if (!v.isObject()) continue;
+    const auto so = v.toObject();
+    ServerEntry s;
+    s.id = so.value("id").toString();
+    s.name = so.value("name").toString();
+    s.ownerId = so.value("ownerId").toString();
+    s.membershipCertPayload = so.value("membershipCertPayload").toString();
+    s.membershipCertSignature = so.value("membershipCertSignature").toString();
+    s.expanded = so.value("expanded").toBool(true);
+    const auto chArr = so.value("channels").toArray();
+    for (const auto& cv : chArr) {
+      if (!cv.isObject()) continue;
+      const auto co = cv.toObject();
+      ServerChannel c;
+      c.id = co.value("id").toString();
+      c.name = co.value("name").toString();
+      c.voice = co.value("voice").toBool(false);
+      if (!c.id.isEmpty()) s.channels.push_back(c);
+    }
+    const auto memArr = so.value("members").toArray();
+    for (const auto& mv : memArr) {
+      if (!mv.isObject()) continue;
+      const auto mo = mv.toObject();
+      ServerMember m;
+      m.id = mo.value("id").toString();
+      m.name = mo.value("name").toString();
+      if (!m.id.isEmpty()) s.members.push_back(m);
+    }
+    const auto revokedArr = so.value("revokedMemberIds").toArray();
+    for (const auto& rv : revokedArr) {
+      if (!rv.isString()) continue;
+      const auto id = rv.toString();
+      if (!id.isEmpty()) s.revokedMemberIds.push_back(id);
+    }
+    if (!s.id.isEmpty()) p.servers.push_back(s);
+  }
+
+  const auto invArr = root.value("pendingServerInvites").toArray();
+  for (const auto& v : invArr) {
+    if (!v.isObject()) continue;
+    const auto o = v.toObject();
+    PendingServerInvite pi;
+    pi.serverId = o.value("serverId").toString();
+    pi.ownerId = o.value("ownerId").toString();
+    pi.payloadJson = o.value("payloadJson").toString();
+    pi.signature = o.value("signature").toString();
+    if (!pi.serverId.isEmpty() && !pi.ownerId.isEmpty()) p.pendingServerInvites.push_back(pi);
+  }
+
   // Normalize/migrate identity key path:
   // - Legacy GUI default:  <AppConfigLocation>/identity.pem  (typically ~/.config/p2p-chat/p2p_chat/identity.pem)
   // - Legacy CLI default:  ~/.config/p2p_chat/identity.pem
@@ -259,6 +310,52 @@ bool Profile::save(QString* errorOut) const {
   }
   root["friends"] = arr;
 
+  QJsonArray srvArr;
+  for (const auto& s : servers) {
+    QJsonObject so;
+    so["id"] = s.id;
+    so["name"] = s.name;
+    so["ownerId"] = s.ownerId;
+    so["membershipCertPayload"] = s.membershipCertPayload;
+    so["membershipCertSignature"] = s.membershipCertSignature;
+    so["expanded"] = s.expanded;
+    QJsonArray chArr;
+    for (const auto& c : s.channels) {
+      QJsonObject co;
+      co["id"] = c.id;
+      co["name"] = c.name;
+      co["voice"] = c.voice;
+      chArr.push_back(co);
+    }
+    so["channels"] = chArr;
+    QJsonArray memArr;
+    for (const auto& m : s.members) {
+      QJsonObject mo;
+      mo["id"] = m.id;
+      mo["name"] = m.name;
+      memArr.push_back(mo);
+    }
+    so["members"] = memArr;
+    QJsonArray revokedArr;
+    for (const auto& id : s.revokedMemberIds) {
+      revokedArr.push_back(id);
+    }
+    so["revokedMemberIds"] = revokedArr;
+    srvArr.push_back(so);
+  }
+  root["servers"] = srvArr;
+
+  QJsonArray invArr;
+  for (const auto& pi : pendingServerInvites) {
+    QJsonObject o;
+    o["serverId"] = pi.serverId;
+    o["ownerId"] = pi.ownerId;
+    o["payloadJson"] = pi.payloadJson;
+    o["signature"] = pi.signature;
+    invArr.push_back(o);
+  }
+  root["pendingServerInvites"] = invArr;
+
   f.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
   f.close();
   return true;
@@ -288,6 +385,35 @@ void Profile::upsertFriend(const FriendEntry& e) {
   friends.push_back(e);
 }
 
+Profile::ServerEntry* Profile::findServer(const QString& id) {
+  for (auto& s : servers) {
+    if (s.id == id) return &s;
+  }
+  return nullptr;
+}
+
+const Profile::ServerEntry* Profile::findServer(const QString& id) const {
+  for (const auto& s : servers) {
+    if (s.id == id) return &s;
+  }
+  return nullptr;
+}
+
+Profile::PendingServerInvite* Profile::findPendingServerInvite(const QString& serverId, const QString& ownerId) {
+  for (auto& p : pendingServerInvites) {
+    if (p.serverId == serverId && p.ownerId == ownerId) return &p;
+  }
+  return nullptr;
+}
+
+const Profile::PendingServerInvite* Profile::findPendingServerInvite(const QString& serverId,
+                                                                     const QString& ownerId) const {
+  for (const auto& p : pendingServerInvites) {
+    if (p.serverId == serverId && p.ownerId == ownerId) return &p;
+  }
+  return nullptr;
+}
+
 QVector<Profile::ChatMessage> Profile::loadChat(const QString& peerId, QString* errorOut) const {
   QVector<ChatMessage> out;
   const auto p = chatPathForPeer(peerId);
@@ -314,6 +440,8 @@ QVector<Profile::ChatMessage> Profile::loadChat(const QString& peerId, QString* 
     ChatMessage m;
     m.tsMs = static_cast<qint64>(o.value("tsMs").toVariant().toLongLong());
     m.incoming = o.value("incoming").toBool(false);
+    m.senderId = o.value("senderId").toString();
+    m.senderName = o.value("senderName").toString();
     m.text = o.value("text").toString();
     // Sanitize timestamps: corrupted chat logs should not crash rendering.
     constexpr qint64 kMin = 946684800000LL;   // 2000-01-01
@@ -338,6 +466,8 @@ bool Profile::saveChat(const QString& peerId, const QVector<ChatMessage>& msgs, 
     QJsonObject o;
     o["tsMs"] = static_cast<double>(m.tsMs);
     o["incoming"] = m.incoming;
+    if (!m.senderId.isEmpty()) o["senderId"] = m.senderId;
+    if (!m.senderName.isEmpty()) o["senderName"] = m.senderName;
     o["text"] = m.text;
     arr.push_back(o);
   }

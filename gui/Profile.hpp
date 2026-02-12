@@ -21,9 +21,41 @@ public:
     FriendStatus status = FriendStatus::None;
   };
 
+  struct ServerChannel {
+    QString id;
+    QString name;
+    bool voice = false;
+  };
+
+  struct ServerMember {
+    QString id;
+    QString name;
+  };
+
+  struct ServerEntry {
+    QString id;
+    QString name;
+    QString ownerId;
+    QString membershipCertPayload;   // compact JSON payload signed by owner
+    QString membershipCertSignature; // base64url Ed25519 over payload
+    bool expanded = true;
+    QVector<ServerChannel> channels;
+    QVector<ServerMember> members;
+    QVector<QString> revokedMemberIds;
+  };
+
+  struct PendingServerInvite {
+    QString serverId;
+    QString ownerId;
+    QString payloadJson; // compact JSON payload signed by owner
+    QString signature;   // owner signature over payloadJson
+  };
+
   struct ChatMessage {
     qint64 tsMs = 0;   // UTC ms since epoch
     bool incoming = false;
+    QString senderId;   // optional; used for multi-sender chats (server channels)
+    QString senderName; // optional display hint for multi-sender chats
     QString text;
   };
 
@@ -58,10 +90,17 @@ public:
   AudioSettings audio;
 
   QVector<FriendEntry> friends;
+  QVector<ServerEntry> servers;
+  QVector<PendingServerInvite> pendingServerInvites;
 
   FriendEntry* findFriend(const QString& id);
   const FriendEntry* findFriend(const QString& id) const;
   void upsertFriend(const FriendEntry& e);
+
+  ServerEntry* findServer(const QString& id);
+  const ServerEntry* findServer(const QString& id) const;
+  PendingServerInvite* findPendingServerInvite(const QString& serverId, const QString& ownerId);
+  const PendingServerInvite* findPendingServerInvite(const QString& serverId, const QString& ownerId) const;
 
   QVector<ChatMessage> loadChat(const QString& peerId, QString* errorOut = nullptr) const;
   bool saveChat(const QString& peerId, const QVector<ChatMessage>& msgs, QString* errorOut = nullptr) const;
