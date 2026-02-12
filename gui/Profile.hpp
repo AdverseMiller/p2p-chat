@@ -56,6 +56,8 @@ public:
     bool incoming = false;
     QString senderId;   // optional; used for multi-sender chats (server channels)
     QString senderName; // optional display hint for multi-sender chats
+    bool senderUnknown = false; // true when sender identity/name should not be disclosed
+    bool verified = false;      // true when message came from a verified signed control envelope
     QString text;
   };
 

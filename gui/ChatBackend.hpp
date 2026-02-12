@@ -3,6 +3,7 @@
 #include <QObject>
 #include <QByteArray>
 #include <QString>
+#include <QStringList>
 
 // Thin Qt wrapper around the existing CLI networking logic (Boost.Asio).
 // Runs the network stack on a background thread and emits Qt signals.
@@ -45,6 +46,7 @@ public:
   void warmConnect(const QString& peerId);
 
   void setFriendAccepted(const QString& peerId, bool accepted);
+  void setServerMembers(const QStringList& peerIds);
 
   // Voice calls (Opus over UDP hole-punching). Only one active call at a time.
   void startCall(const QString& peerId, const VoiceSettings& settings);

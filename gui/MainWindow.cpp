@@ -39,6 +39,7 @@
 #include <QSplitter>
 #include <QTabWidget>
 #include <QTextBrowser>
+#include <QUrl>
 #include <QUuid>
 #include <QVBoxLayout>
 
@@ -187,6 +188,19 @@ QString renderLine(const QString& stamp, const QString& who, const QString& text
   return QString("[%1] <b>%2</b>: %3").arg(stamp, who.toHtmlEscaped(), text.toHtmlEscaped());
 }
 
+QString renderServerLine(const QString& stamp,
+                         const QString& who,
+                         const QString& text,
+                         bool unknownUser,
+                         bool verified) {
+  QString whoHtml = unknownUser ? QString("<i>%1</i>").arg(who.toHtmlEscaped())
+                                : QString("<b>%1</b>").arg(who.toHtmlEscaped());
+  const QString marker = verified ? "&#10003;" : "&#9888;";
+  const QString markerColor = verified ? "#2e7d32" : "#d18a00";
+  return QString("[%1] <span style=\"color:%2;\">%3</span> %4: %5")
+      .arg(stamp, markerColor, marker, whoHtml, text.toHtmlEscaped());
+}
+
 QString makeStamp(int hh, int mm) {
   if (hh < 0) hh = 0;
   if (hh > 23) hh = 23;
@@ -307,6 +321,17 @@ QJsonArray membersToJson(const QVector<Profile::ServerMember>& members) {
     QJsonObject o;
     o["id"] = m.id;
     o["name"] = m.name;
+    arr.push_back(o);
+  }
+  return arr;
+}
+
+QJsonArray membersToJsonIdsOnly(const QVector<Profile::ServerMember>& members) {
+  QJsonArray arr;
+  for (const auto& m : members) {
+    QJsonObject o;
+    o["id"] = m.id;
+    o["name"] = "";
     arr.push_back(o);
   }
   return arr;
@@ -538,6 +563,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   for (const auto& f : profile_.friends) {
     if (f.status == Profile::FriendStatus::Accepted) backend_.setFriendAccepted(f.id, true);
   }
+  syncBackendServerMembers();
 
   rebuildFriendList();
   rebuildFriendsTab();
@@ -795,6 +821,8 @@ void MainWindow::buildUi() {
 
   chatView_ = new QTextBrowser(chatPane);
   chatView_->setOpenExternalLinks(false);
+  chatView_->setOpenLinks(false);
+  chatView_->document()->setDefaultStyleSheet("a { color: inherit; text-decoration: none; }");
   chatPaneLayout->addWidget(chatView_, /*stretch*/ 1);
   contentSplit->addWidget(chatPane);
 
@@ -857,7 +885,11 @@ void MainWindow::buildUi() {
       selectServerChannel(serverId, channelId, voice);
       return;
     }
-    if (type == kServerVoiceMemberItem) return;
+    if (type == kServerVoiceMemberItem) {
+      const auto peerId = item->data(kRolePeerId).toString();
+      if (!peerId.isEmpty()) showProfilePopup(peerId);
+      return;
+    }
   });
 
   connect(serverList_, &QListWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
@@ -865,6 +897,12 @@ void MainWindow::buildUi() {
   });
   connect(serverMembersList_, &QListWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
     showServerMemberContextMenu(pos);
+  });
+  connect(serverMembersList_, &QListWidget::itemClicked, this, [this](QListWidgetItem* item) {
+    if (!item) return;
+    const auto peerId = item->data(kRolePeerId).toString();
+    if (peerId.isEmpty()) return;
+    showProfilePopup(peerId);
   });
 
   auto sendNow = [this] {
@@ -883,7 +921,6 @@ void MainWindow::buildUi() {
   };
   connect(sendBtn, &QPushButton::clicked, this, sendNow);
   connect(input_, &QLineEdit::returnPressed, this, sendNow);
-
   connect(callBtn_, &QPushButton::clicked, this, [this] {
     if (!selectedServerChannelId_.isEmpty()) {
       if (!selectedServerChannelVoice_) return;
@@ -984,6 +1021,50 @@ void MainWindow::saveProfile() {
   QString err;
   profile_.save(&err);
   if (!err.isEmpty()) statusBar()->showMessage(err, 8000);
+}
+
+void MainWindow::syncBackendServerMembers() {
+  QSet<QString> ids;
+  for (const auto& s : profile_.servers) {
+    for (const auto& m : s.members) {
+      if (m.id.isEmpty()) continue;
+      if (!selfId_.isEmpty() && m.id == selfId_) continue;
+      if (s.revokedMemberIds.contains(m.id)) continue;
+      ids.insert(m.id);
+    }
+  }
+  for (const auto& pi : profile_.pendingServerInvites) {
+    if (pi.ownerId.isEmpty()) continue;
+    if (!selfId_.isEmpty() && pi.ownerId == selfId_) continue;
+    ids.insert(pi.ownerId);
+  }
+  for (const auto& ownerId : pendingJoinOwners_) {
+    if (ownerId.isEmpty()) continue;
+    if (!selfId_.isEmpty() && ownerId == selfId_) continue;
+    ids.insert(ownerId);
+  }
+  QStringList list;
+  list.reserve(ids.size());
+  for (const auto& id : ids) list.push_back(id);
+  backend_.setServerMembers(list);
+}
+
+bool MainWindow::isFriendAccepted(const QString& peerId) const {
+  const auto* f = profile_.findFriend(peerId);
+  return f && f->status == Profile::FriendStatus::Accepted;
+}
+
+QString MainWindow::serverPeerDisplayName(const QString& peerId, const QString& hintedName) const {
+  if (peerId == selfId_) {
+    const auto selfName = profile_.selfName.trimmed();
+    return selfName.isEmpty() ? QString("Me") : selfName;
+  }
+  if (isFriendAccepted(peerId)) {
+    const auto* f = profile_.findFriend(peerId);
+    if (f) return friendDisplay(*f);
+    if (!hintedName.trimmed().isEmpty()) return hintedName.trimmed();
+  }
+  return "Unknown User";
 }
 
 void MainWindow::applyTheme(bool dark) {
@@ -1090,6 +1171,7 @@ QString MainWindow::currentChatKey() const {
 
 void MainWindow::rebuildServerList() {
   if (!serverList_) return;
+  syncBackendServerMembers();
   serverList_->clear();
   if (serverInvitesBtn_) {
     serverInvitesBtn_->setText(QString("Pending Invites (%1)").arg(profile_.pendingServerInvites.size()));
@@ -1124,22 +1206,10 @@ void MainWindow::rebuildServerList() {
       std::sort(ids.begin(), ids.end());
       for (const auto& id : ids) {
         const auto* f = profile_.findFriend(id);
-        QString display;
-        if (id == selfId_) {
-          const auto selfName = profile_.selfName.trimmed();
-          display = selfName.isEmpty() ? "Me" : selfName;
-        } else {
-          if (f) {
-            display = friendDisplay(*f);
-          } else {
-            auto mIdx = findMemberIndex(server.members, id);
-            if (mIdx >= 0 && !server.members[mIdx].name.trimmed().isEmpty()) {
-              display = server.members[mIdx].name.trimmed();
-            } else {
-              display = id.left(12) + "...";
-            }
-          }
-        }
+        const auto mIdx = findMemberIndex(server.members, id);
+        const auto hinted = (mIdx >= 0) ? server.members[mIdx].name : QString();
+        const bool unknown = (id != selfId_ && !isFriendAccepted(id));
+        const QString display = serverPeerDisplayName(id, hinted);
         auto* memberItem = new QListWidgetItem(display);
         memberItem->setData(kRoleServerItemType, kServerVoiceMemberItem);
         memberItem->setData(kRoleServerId, server.id);
@@ -1151,6 +1221,11 @@ void MainWindow::rebuildServerList() {
         memberItem->setIcon(QIcon(loadAvatarOrPlaceholder(id, avatarPath, 18)));
         memberItem->setFlags(Qt::ItemIsEnabled);
         memberItem->setSizeHint(QSize(0, 30));
+        if (unknown) {
+          auto font = memberItem->font();
+          font.setItalic(true);
+          memberItem->setFont(font);
+        }
         serverList_->addItem(memberItem);
       }
     }
@@ -1197,18 +1272,23 @@ void MainWindow::selectServerChannel(const QString& serverId, const QString& cha
 
   const auto msgs = chatCache_.value(key);
   for (const auto& m : msgs) {
+    bool unknownUser = false;
     QString who = "You";
     if (m.incoming) {
-      if (!m.senderName.isEmpty()) {
-        who = m.senderName;
-      } else if (!m.senderId.isEmpty()) {
-        const auto* f = profile_.findFriend(m.senderId);
-        who = f ? friendDisplay(*f) : (m.senderId.left(12) + "...");
+      if (!m.senderId.isEmpty()) {
+        if (isFriendAccepted(m.senderId)) {
+          who = serverPeerDisplayName(m.senderId, m.senderName);
+        } else {
+          who = "Unknown User";
+          unknownUser = true;
+        }
       } else {
-        who = "Channel";
+        who = "Unknown User";
+        unknownUser = true;
       }
     }
-    chatView_->append(renderLine(stampFromUtcMs(m.tsMs), who, m.text));
+    const bool verified = m.verified && !m.senderId.isEmpty();
+    chatView_->append(renderServerLine(stampFromUtcMs(m.tsMs), who, m.text, unknownUser, verified));
   }
 }
 
@@ -1353,8 +1433,7 @@ void MainWindow::showServerMemberContextMenu(const QPoint& pos) {
     return;
   }
   if (chosen == kickAct) {
-    const auto* f = profile_.findFriend(memberId);
-    const auto who = f ? friendDisplay(*f) : (memberId.left(12) + "...");
+    const auto who = serverPeerDisplayName(memberId);
     const auto confirm = QMessageBox::question(this,
                                                "Kick user",
                                                QString("Kick %1 from this server?").arg(who));
@@ -1449,6 +1528,21 @@ void MainWindow::inviteFriendToServer(const QString& serverId) {
   if (idx < 0 || idx >= ids.size()) return;
   const auto targetId = ids[idx];
 
+  // Re-invite should explicitly clear any previous revocation state.
+  bool unrevoked = false;
+  for (int i = 0; i < s->revokedMemberIds.size(); ++i) {
+    if (s->revokedMemberIds[i] != targetId) continue;
+    s->revokedMemberIds.removeAt(i);
+    unrevoked = true;
+    break;
+  }
+  if (unrevoked) {
+    saveProfile();
+    broadcastServerMemberSync(*s);
+    rebuildServerList();
+    refreshServerMembersPane();
+  }
+
   QJsonObject payload;
   payload["server_id"] = s->id;
   payload["server_name"] = s->name;
@@ -1517,9 +1611,11 @@ void MainWindow::reviewPendingServerInvites() {
   req["invite_payload"] = invite.payloadJson;
   req["invite_sig"] = invite.signature;
   req["requester_id"] = selfId_;
-  req["requester_name"] = profile_.selfName;
+  req["requester_name"] = isFriendAccepted(ownerId) ? profile_.selfName : QString();
   req["issued_ms"] = static_cast<double>(nowUtcMs());
   req["nonce"] = makeServerObjectId();
+  pendingJoinOwners_.insert(ownerId);
+  syncBackendServerMembers();
   backend_.sendSignedControl(ownerId, "server_join_request", compactJsonString(req));
   profile_.pendingServerInvites.removeAt(idx);
   saveProfile();
@@ -1625,7 +1721,12 @@ void MainWindow::handleServerJoinRequest(const QString& peerId, const QJsonObjec
   if (!server) return;
   if (!server->ownerId.isEmpty() && server->ownerId != selfId_) return;
   if (server->ownerId.isEmpty()) server->ownerId = selfId_;
-  if (server->revokedMemberIds.contains(requesterId)) return;
+  // A valid fresh owner-signed invite is sufficient to re-admit a previously revoked user.
+  for (int i = 0; i < server->revokedMemberIds.size(); ++i) {
+    if (server->revokedMemberIds[i] != requesterId) continue;
+    server->revokedMemberIds.removeAt(i);
+    break;
+  }
 
   const auto requesterName = payload.value("requester_name").toString();
   const int existing = findMemberIndex(server->members, requesterId);
@@ -1652,8 +1753,9 @@ void MainWindow::handleServerJoinRequest(const QString& peerId, const QJsonObjec
   cert["issued_ms"] = static_cast<double>(nowUtcMs());
   cert["nonce"] = makeServerObjectId();
   cert["channels"] = channelsToJson(server->channels);
-  cert["members"] = membersToJson(server->members);
+  cert["members"] = membersToJsonIdsOnly(server->members);
 
+  syncBackendServerMembers();
   backend_.sendSignedControl(requesterId, "server_membership_cert", compactJsonString(cert));
   broadcastServerMemberSync(*server);
   saveProfile();
@@ -1713,8 +1815,10 @@ void MainWindow::handleServerMembershipCert(const QString& peerId,
       break;
     }
   }
+  pendingJoinOwners_.remove(ownerId);
 
   saveProfile();
+  syncBackendServerMembers();
   rebuildServerList();
   refreshServerMembersPane();
   statusBar()->showMessage(QString("Joined server %1").arg(payload.value("server_name").toString(serverId)), 5000);
@@ -1726,7 +1830,7 @@ void MainWindow::broadcastServerMemberSync(const Profile::ServerEntry& server) {
   payload["server_id"] = server.id;
   payload["server_name"] = server.name;
   payload["owner_id"] = selfId_;
-  payload["members"] = membersToJson(server.members);
+  payload["members"] = membersToJsonIdsOnly(server.members);
   QJsonArray revoked;
   for (const auto& r : server.revokedMemberIds) revoked.push_back(r);
   payload["revoked_member_ids"] = revoked;
@@ -1858,21 +1962,20 @@ void MainWindow::broadcastServerText(const QString& serverId, const QString& cha
   if (!channelOk) return;
   if (s->revokedMemberIds.contains(selfId_)) return;
 
-  QJsonObject payload;
-  payload["server_id"] = serverId;
-  payload["channel_id"] = channelId;
-  payload["member_id"] = selfId_;
-  payload["member_name"] = profile_.selfName;
-  payload["text"] = text;
-  payload["issued_ms"] = static_cast<double>(nowUtcMs());
-  payload["nonce"] = makeServerObjectId();
-
   for (const auto& m : s->members) {
     if (m.id.isEmpty() || m.id == selfId_) continue;
     if (s->revokedMemberIds.contains(m.id)) continue;
+    QJsonObject payload;
+    payload["server_id"] = serverId;
+    payload["channel_id"] = channelId;
+    payload["member_id"] = selfId_;
+    payload["member_name"] = isFriendAccepted(m.id) ? profile_.selfName : QString();
+    payload["text"] = text;
+    payload["issued_ms"] = static_cast<double>(nowUtcMs());
+    payload["nonce"] = makeServerObjectId();
     backend_.sendSignedControl(m.id, "server_channel_text", compactJsonString(payload));
   }
-  appendServerChannelMessage(serverId, channelId, selfId_, profile_.selfName, text, false);
+  appendServerChannelMessage(serverId, channelId, selfId_, profile_.selfName, text, false, true);
 }
 
 void MainWindow::broadcastVoicePresence(const QString& serverId, const QString& channelId, bool joined) {
@@ -1908,7 +2011,8 @@ void MainWindow::appendServerChannelMessage(const QString& serverId,
                                             const QString& senderId,
                                             const QString& senderName,
                                             const QString& text,
-                                            bool incoming) {
+                                            bool incoming,
+                                            bool verified) {
   const auto key = serverChannelChatKey(serverId, channelId);
   if (!chatCache_.contains(key)) {
     QString err;
@@ -1921,7 +2025,9 @@ void MainWindow::appendServerChannelMessage(const QString& serverId,
   m.tsMs = QDateTime::currentDateTimeUtc().toMSecsSinceEpoch();
   m.incoming = incoming;
   m.senderId = senderId;
-  m.senderName = senderName;
+  m.senderName = isFriendAccepted(senderId) ? senderName : QString();
+  m.senderUnknown = incoming && !senderId.isEmpty() && !isFriendAccepted(senderId);
+  m.verified = verified;
   m.text = text;
   msgs.push_back(m);
   while (msgs.size() > 500) msgs.removeFirst();
@@ -1931,11 +2037,19 @@ void MainWindow::appendServerChannelMessage(const QString& serverId,
   if (!err.isEmpty()) statusBar()->showMessage(err, 8000);
 
   QString who = "You";
+  bool unknownUser = false;
   if (incoming) {
-    const auto* f = profile_.findFriend(senderId);
-    who = f ? friendDisplay(*f) : (!senderName.isEmpty() ? senderName : (senderId.left(12) + "..."));
+    if (isFriendAccepted(senderId)) {
+      who = serverPeerDisplayName(senderId, senderName);
+    } else {
+      who = "Unknown User";
+      unknownUser = true;
+    }
   }
-  if (key == currentChatKey()) chatView_->append(renderLine(stampFromUtcMs(m.tsMs), who, text));
+  if (key == currentChatKey()) {
+    const bool msgVerified = m.verified && !m.senderId.isEmpty();
+    chatView_->append(renderServerLine(stampFromUtcMs(m.tsMs), who, text, unknownUser, msgVerified));
+  }
 }
 
 void MainWindow::handleServerChannelText(const QString& peerId, const QJsonObject& payload, const QString&) {
@@ -1959,7 +2073,7 @@ void MainWindow::handleServerChannelText(const QString& peerId, const QJsonObjec
     }
   }
   if (!channelOk) return;
-  appendServerChannelMessage(serverId, channelId, memberId, memberName, text, true);
+  appendServerChannelMessage(serverId, channelId, memberId, memberName, text, true, true);
 }
 
 void MainWindow::handleServerVoicePresence(const QString& peerId, const QJsonObject& payload, const QString&) {
@@ -2202,7 +2316,9 @@ void MainWindow::kickServerMember(const QString& serverId, const QString& member
 
 void MainWindow::showProfilePopup(const QString& peerId) {
   const auto* f = profile_.findFriend(peerId);
-  const auto display = f ? friendDisplay(*f) : (peerId.left(14) + "...");
+  const bool friendAccepted = isFriendAccepted(peerId);
+  const auto display = (peerId == selfId_) ? serverPeerDisplayName(peerId)
+                                            : (friendAccepted ? serverPeerDisplayName(peerId) : QString("Unknown User"));
 
   QDialog dlg(this);
   dlg.setWindowTitle("Profile");
@@ -2229,7 +2345,8 @@ void MainWindow::showProfilePopup(const QString& peerId) {
 
   auto* form = new QFormLayout();
 
-  auto* nameLabel = new QLabel(f ? f->name : QString(), &dlg);
+  const QString profileName = (peerId == selfId_) ? profile_.selfName : (friendAccepted && f ? f->name : QString("hidden"));
+  auto* nameLabel = new QLabel(profileName, &dlg);
   form->addRow("Name:", nameLabel);
 
   auto* aliasLabel = new QLabel(f ? f->alias : QString(), &dlg);
@@ -2340,13 +2457,8 @@ void MainWindow::refreshServerMembersPane() {
   for (const auto& m : s->members) {
     auto* item = new QListWidgetItem();
     const auto* f = profile_.findFriend(m.id);
-    QString display;
-    if (m.id == selfId_) {
-      const auto selfName = profile_.selfName.trimmed();
-      display = selfName.isEmpty() ? "Me" : selfName;
-    } else {
-      display = f ? friendDisplay(*f) : (!m.name.isEmpty() ? m.name : (m.id.left(12) + "..."));
-    }
+    const bool unknown = (m.id != selfId_ && !isFriendAccepted(m.id));
+    QString display = serverPeerDisplayName(m.id, m.name);
     if (!vcKey.isEmpty() && voiceOccupantsByChannel_.value(vcKey).contains(m.id)) {
       display += " [vc]";
     }
@@ -2356,6 +2468,11 @@ void MainWindow::refreshServerMembersPane() {
     const QString avatarPath = (m.id == selfId_) ? profile_.selfAvatarPath : (f ? f->avatarPath : QString());
     item->setIcon(QIcon(loadAvatarOrPlaceholder(m.id, avatarPath, 22)));
     item->setSizeHint(QSize(0, 38));
+    if (unknown) {
+      auto font = item->font();
+      font.setItalic(true);
+      item->setFont(font);
+    }
     serverMembersList_->addItem(item);
   }
 }

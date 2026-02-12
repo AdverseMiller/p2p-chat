@@ -442,6 +442,8 @@ QVector<Profile::ChatMessage> Profile::loadChat(const QString& peerId, QString* 
     m.incoming = o.value("incoming").toBool(false);
     m.senderId = o.value("senderId").toString();
     m.senderName = o.value("senderName").toString();
+    m.senderUnknown = o.value("senderUnknown").toBool(false);
+    m.verified = o.value("verified").toBool(false);
     m.text = o.value("text").toString();
     // Sanitize timestamps: corrupted chat logs should not crash rendering.
     constexpr qint64 kMin = 946684800000LL;   // 2000-01-01
@@ -468,6 +470,8 @@ bool Profile::saveChat(const QString& peerId, const QVector<ChatMessage>& msgs, 
     o["incoming"] = m.incoming;
     if (!m.senderId.isEmpty()) o["senderId"] = m.senderId;
     if (!m.senderName.isEmpty()) o["senderName"] = m.senderName;
+    if (m.senderUnknown) o["senderUnknown"] = true;
+    if (m.verified) o["verified"] = true;
     o["text"] = m.text;
     arr.push_back(o);
   }

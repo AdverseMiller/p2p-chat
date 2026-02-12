@@ -65,12 +65,16 @@ private:
                                   const QString& senderId,
                                   const QString& senderName,
                                   const QString& text,
-                                  bool incoming);
+                                  bool incoming,
+                                  bool verified);
   void maybeSyncVoiceCallForJoinedChannel();
   QString joinedVoiceServerId() const;
   QString joinedVoiceChannelId() const;
   void sanitizeVoiceOccupantsForServer(const QString& serverId);
+  void syncBackendServerMembers();
+  bool isFriendAccepted(const QString& peerId) const;
   int presenceStateFor(const QString& peerId) const;
+  QString serverPeerDisplayName(const QString& peerId, const QString& hintedName = QString()) const;
   void refreshFriendPresenceRow(const QString& peerId);
   void refreshServerMembersPane();
   void leaveSelectedServer();
@@ -125,6 +129,7 @@ private:
   QMap<QString, QVector<Profile::ChatMessage>> chatCache_;
   QMap<QString, bool> rendezvousOnline_;
   QMap<QString, bool> directOnline_;
+  QSet<QString> pendingJoinOwners_;
 
   QAction* darkModeAction_ = nullptr;
 

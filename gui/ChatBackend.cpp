@@ -212,7 +212,7 @@ public:
               Role role,
               std::string self_id,
               std::shared_ptr<common::Identity> identity,
-              std::function<std::string()> get_self_name,
+              std::function<std::string(const std::string&)> get_self_name,
               std::function<std::vector<uint8_t>()> get_self_avatar_png,
               std::function<bool(const std::string&)> allow_peer,
               std::string expected_peer_id = {})
@@ -528,7 +528,8 @@ private:
   }
 
   void send_name_update() {
-    const auto nm = get_self_name_ ? get_self_name_() : std::string();
+    if (peer_id_.empty()) return;
+    const auto nm = get_self_name_ ? get_self_name_(peer_id_) : std::string();
     if (nm.empty()) return;
     json inner;
     inner["type"] = "name";
@@ -647,7 +648,7 @@ private:
   Role role_;
   std::string self_id_;
   std::shared_ptr<common::Identity> identity_;
-  std::function<std::string()> get_self_name_;
+  std::function<std::string(const std::string&)> get_self_name_;
   std::function<std::vector<uint8_t>()> get_self_avatar_png_;
   std::string peer_id_;
   std::string peer_name_;
@@ -688,7 +689,7 @@ public:
                  Role role,
                  std::string self_id,
                  std::shared_ptr<common::Identity> identity,
-                 std::function<std::string()> get_self_name,
+                 std::function<std::string(const std::string&)> get_self_name,
                  std::function<std::vector<uint8_t>()> get_self_avatar_png,
                  std::function<bool(const std::string&)> allow_peer,
                  std::string expected_peer_id = {},
@@ -1228,7 +1229,8 @@ private:
   }
 
   void send_name_update() {
-    const auto nm = get_self_name_ ? get_self_name_() : std::string();
+    if (peer_id_.empty()) return;
+    const auto nm = get_self_name_ ? get_self_name_(peer_id_) : std::string();
     if (nm.empty()) return;
     send_name(nm);
   }
@@ -1464,7 +1466,7 @@ private:
   Role role_;
   std::string self_id_;
   std::shared_ptr<common::Identity> identity_;
-  std::function<std::string()> get_self_name_;
+  std::function<std::string(const std::string&)> get_self_name_;
   std::function<std::vector<uint8_t>()> get_self_avatar_png_;
   std::string peer_id_;
   std::string peer_name_;
@@ -1874,6 +1876,7 @@ struct ChatBackend::Impl {
 
   std::mutex m;
   std::unordered_set<std::string> accepted_friends;
+  std::unordered_set<std::string> server_members;
   std::unordered_map<std::string, std::deque<std::string>> queued_outgoing;
   std::unordered_map<std::string, std::deque<json>> queued_control;
   std::unordered_map<std::string, std::string> peer_names;
@@ -2434,8 +2437,24 @@ struct ChatBackend::Impl {
     return accepted_friends.find(id) != accepted_friends.end();
   }
 
+  bool isServerMember(const std::string& id) {
+    std::lock_guard lk(m);
+    return server_members.find(id) != server_members.end();
+  }
+
+  bool isRoutablePeer(const std::string& id) {
+    std::lock_guard lk(m);
+    return accepted_friends.find(id) != accepted_friends.end() || server_members.find(id) != server_members.end();
+  }
+
   std::string getSelfName() {
     std::lock_guard lk(m);
+    return self_name;
+  }
+
+  std::string getSelfNameForPeer(const std::string& peer_id) {
+    std::lock_guard lk(m);
+    if (accepted_friends.find(peer_id) == accepted_friends.end()) return {};
     return self_name;
   }
 
@@ -2448,6 +2467,11 @@ struct ChatBackend::Impl {
     std::lock_guard lk(m);
     if (ok) accepted_friends.insert(id);
     else accepted_friends.erase(id);
+  }
+
+  void setServerMembers(const std::unordered_set<std::string>& peers) {
+    std::lock_guard lk(m);
+    server_members = peers;
   }
 
   void queueOutgoing(const std::string& peer, std::string text) {
@@ -2660,12 +2684,13 @@ struct ChatBackend::Impl {
       }
 
       if (type == "secure_hello") {
-        if (!isAccepted(pid)) return;
+        if (!isRoutablePeer(pid)) return;
         const std::string selfId = std::string(identity->public_id());
         auto session = std::make_shared<UdpPeerSession>(
-            udp_socket, from, UdpPeerSession::Role::Acceptor, selfId, identity, [this] { return getSelfName(); },
+            udp_socket, from, UdpPeerSession::Role::Acceptor, selfId, identity,
+            [this](const std::string& pid) { return getSelfNameForPeer(pid); },
             [this] { return getSelfAvatarPng(); },
-            [this](const std::string& x) { return isAccepted(x); },
+            [this](const std::string& x) { return isRoutablePeer(x); },
             std::string{},
             [this](const std::string& s) {
               if (!debug_logs_enabled()) return;
@@ -2873,8 +2898,9 @@ struct ChatBackend::Impl {
     auto selfId = std::string(rendezvous->id());
     auto session = std::make_shared<PeerSession>(
         std::move(socket), PeerSession::Role::Acceptor, std::move(selfId), identity,
-        [this] { return getSelfName(); }, [this] { return getSelfAvatarPng(); },
-        [this](const std::string& pid) { return isAccepted(pid); });
+        [this](const std::string& pid) { return getSelfNameForPeer(pid); },
+        [this] { return getSelfAvatarPng(); },
+        [this](const std::string& pid) { return isRoutablePeer(pid); });
     std::weak_ptr<PeerSession> weak = session;
     session->start_accept_with_first(
         std::move(first),
@@ -2986,9 +3012,9 @@ struct ChatBackend::Impl {
         role,
         selfId,
         identity,
-        [this] { return getSelfName(); },
+        [this](const std::string& pid) { return getSelfNameForPeer(pid); },
         [this] { return getSelfAvatarPng(); },
-        [this](const std::string& pid) { return isAccepted(pid); },
+        [this](const std::string& pid) { return isRoutablePeer(pid); },
         peer_id,
         [this](const std::string& s) {
           if (!debug_logs_enabled()) return;
@@ -3073,8 +3099,9 @@ struct ChatBackend::Impl {
     const std::string peer_key = expected_peer_id;
     auto session = std::make_shared<PeerSession>(
         std::move(socket), PeerSession::Role::Initiator, std::move(selfId), identity,
-        [this] { return getSelfName(); }, [this] { return getSelfAvatarPng(); },
-        [this](const std::string& pid) { return isAccepted(pid); },
+        [this](const std::string& pid) { return getSelfNameForPeer(pid); },
+        [this] { return getSelfAvatarPng(); },
+        [this](const std::string& pid) { return isRoutablePeer(pid); },
         std::move(expected_peer_id));
 
     // Store by expected peer id so we don't attempt another connect while handshaking.
@@ -3134,7 +3161,7 @@ struct ChatBackend::Impl {
 
   void attemptDelivery(const std::string& peer_id, bool silent) {
     if (!rendezvous) return;
-    if (!isAccepted(peer_id)) return;
+    if (!isRoutablePeer(peer_id)) return;
     const auto now = std::chrono::steady_clock::now();
     if (auto it = last_connect_attempt.find(peer_id); it != last_connect_attempt.end()) {
       if (now - it->second < std::chrono::seconds(3)) return;
@@ -3194,12 +3221,16 @@ struct ChatBackend::Impl {
     friend_connect_timer.expires_after(delay);
     friend_connect_timer.async_wait([this](const boost::system::error_code& ec) {
       if (ec) return;
-      std::vector<std::string> friends;
+      std::vector<std::string> peers;
       {
         std::lock_guard lk(m);
-        friends.assign(accepted_friends.begin(), accepted_friends.end());
+        peers.assign(accepted_friends.begin(), accepted_friends.end());
+        for (const auto& id : server_members) {
+          if (accepted_friends.find(id) != accepted_friends.end()) continue;
+          peers.push_back(id);
+        }
       }
-      for (const auto& f : friends) attemptDelivery(f, /*silent*/ true);
+      for (const auto& pid : peers) attemptDelivery(pid, /*silent*/ true);
       scheduleFriendConnect(false);
     });
   }
@@ -3304,11 +3335,11 @@ void ChatBackend::setSelfName(const QString& name) {
 
   // Push updated name immediately to any active session (P2P).
   boost::asio::post(impl_->io, [impl = impl_, nm] {
-    for (auto& [_, s] : impl->tcp_sessions) {
-      if (s) s->send_name(nm);
+    for (auto& [pid, s] : impl->tcp_sessions) {
+      if (s && impl->isAccepted(pid)) s->send_name(nm);
     }
-    for (auto& [_, s] : impl->udp_sessions) {
-      if (s) s->send_name(nm);
+    for (auto& [pid, s] : impl->udp_sessions) {
+      if (s && impl->isAccepted(pid)) s->send_name(nm);
     }
   });
 }
@@ -3349,6 +3380,19 @@ void ChatBackend::setFriendAccepted(const QString& peerId, bool accepted) {
   });
 }
 
+void ChatBackend::setServerMembers(const QStringList& peerIds) {
+  std::unordered_set<std::string> peers;
+  peers.reserve(static_cast<std::size_t>(peerIds.size()));
+  for (const auto& id : peerIds) {
+    if (id.isEmpty()) continue;
+    peers.insert(id.toStdString());
+  }
+  impl_->setServerMembers(peers);
+  boost::asio::post(impl_->io, [impl = impl_] {
+    impl->scheduleFriendConnect(/*immediate*/ true);
+  });
+}
+
 void ChatBackend::sendFriendRequest(const QString& peerId) {
   const auto pid = peerId.toStdString();
   boost::asio::post(impl_->io, [impl = impl_, pid] {
@@ -3371,8 +3415,10 @@ void ChatBackend::sendSignedControl(const QString& peerId, const QString& kind, 
   const auto pid = peerId.toStdString();
   const auto k = kind.toStdString();
   const auto payload = payloadJsonCompact.toStdString();
-  if (!impl_->isAccepted(pid)) {
-    emit deliveryError(peerId, "not friends");
+  const bool isServerKind = (k.rfind("server_", 0) == 0);
+  const bool permitted = impl_->isAccepted(pid) || (isServerKind && impl_->isServerMember(pid));
+  if (!permitted) {
+    emit deliveryError(peerId, "not authorized");
     return;
   }
   boost::asio::post(impl_->io, [impl = impl_, pid, k, payload] {
