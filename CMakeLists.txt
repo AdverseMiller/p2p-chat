@@ -90,8 +90,7 @@ include(CheckIncludeFileCXX)
 
 find_package(PkgConfig)
 
-find_package(Qt6 QUIET COMPONENTS Widgets)
-find_package(Qt6 QUIET COMPONENTS Multimedia)
+find_package(Qt6 QUIET COMPONENTS Core Widgets Multimedia)
 
 option(P2PCHAT_ENABLE_VOICE "Enable voice call support (requires Qt6 Multimedia + Opus)" ON)
 
@@ -114,6 +113,17 @@ if(P2PCHAT_ENABLE_VOICE)
   endif()
 endif()
 
+option(P2PCHAT_ENABLE_VIDEO "Enable webcam video over P2P UDP (Linux + FFmpeg)" ON)
+set(P2PCHAT_HAVE_VIDEO_FFMPEG OFF)
+if(P2PCHAT_ENABLE_VIDEO AND UNIX AND NOT WIN32 AND PKG_CONFIG_FOUND)
+  pkg_check_modules(AVCODEC libavcodec)
+  pkg_check_modules(AVUTIL libavutil)
+  pkg_check_modules(SWSCALE libswscale)
+  if(AVCODEC_FOUND AND AVUTIL_FOUND AND SWSCALE_FOUND)
+    set(P2PCHAT_HAVE_VIDEO_FFMPEG ON)
+  endif()
+endif()
+
 if(NOT WIN32)
   add_executable(rendezvous_server rendezvous_server.cpp)
   target_include_directories(rendezvous_server PRIVATE .)
@@ -133,6 +143,17 @@ if(UNIX)
 endif()
 
 if(Qt6Widgets_FOUND)
+  set(P2PCHAT_VIDEO_SOURCES
+    src/video/v4l2_caps.cpp
+    src/video/v4l2_caps.h
+    src/video/v4l2_capture.cpp
+    src/video/v4l2_capture.h
+    src/video/video_codec.cpp
+    src/video/video_codec.h
+    src/video/video_packetizer.cpp
+    src/video/video_packetizer.h
+  )
+
   add_executable(p2p_chat_gui
     gui/main.cpp
     gui/MainWindow.cpp
@@ -141,11 +162,12 @@ if(Qt6Widgets_FOUND)
     gui/Profile.hpp
     gui/ChatBackend.cpp
     gui/ChatBackend.hpp
-    gui/AudioSettingsDialog.cpp
-    gui/AudioSettingsDialog.hpp
+    gui/SettingsDialog.cpp
+    gui/SettingsDialog.hpp
+    ${P2PCHAT_VIDEO_SOURCES}
   )
   target_include_directories(p2p_chat_gui PRIVATE .)
-  target_link_libraries(p2p_chat_gui PRIVATE Qt6::Widgets Boost::system OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+  target_link_libraries(p2p_chat_gui PRIVATE Qt6::Widgets Qt6::Core Boost::system OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
   p2pchat_max_perf(p2p_chat_gui)
   p2pchat_small_binary(p2p_chat_gui)
   p2pchat_windows_eh(p2p_chat_gui)
@@ -158,6 +180,13 @@ if(Qt6Widgets_FOUND)
     target_link_libraries(p2p_chat_gui PRIVATE Qt6::Multimedia)
     target_include_directories(p2p_chat_gui PRIVATE ${OPUS_INCLUDE_DIRS})
     target_link_libraries(p2p_chat_gui PRIVATE ${OPUS_LIBRARIES})
+    if(P2PCHAT_HAVE_VIDEO_FFMPEG)
+      target_compile_definitions(p2p_chat_gui PRIVATE P2PCHAT_VIDEO)
+      target_include_directories(p2p_chat_gui PRIVATE ${AVCODEC_INCLUDE_DIRS} ${AVUTIL_INCLUDE_DIRS} ${SWSCALE_INCLUDE_DIRS})
+      target_link_libraries(p2p_chat_gui PRIVATE ${AVCODEC_LIBRARIES} ${AVUTIL_LIBRARIES} ${SWSCALE_LIBRARIES})
+    else()
+      message(STATUS "Video disabled for p2p_chat_gui (need FFmpeg libs: libavcodec/libavutil/libswscale)")
+    endif()
   else()
     target_compile_definitions(p2p_chat_gui PRIVATE P2PCHAT_NO_VOICE)
     if(P2PCHAT_ENABLE_VOICE)
@@ -174,9 +203,35 @@ if(Qt6Widgets_FOUND)
       gui/ChatBackend.hpp
       gui/Profile.cpp
       gui/Profile.hpp
+      ${P2PCHAT_VIDEO_SOURCES}
     )
     target_include_directories(udp_smoke PRIVATE .)
     target_link_libraries(udp_smoke PRIVATE Qt6::Core Boost::system OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+    if(P2PCHAT_ENABLE_VOICE AND Qt6Multimedia_FOUND AND P2PCHAT_HAVE_OPUS)
+      target_compile_definitions(udp_smoke PRIVATE P2PCHAT_VOICE)
+      target_link_libraries(udp_smoke PRIVATE Qt6::Multimedia ${OPUS_LIBRARIES})
+      target_include_directories(udp_smoke PRIVATE ${OPUS_INCLUDE_DIRS})
+      if(P2PCHAT_HAVE_VIDEO_FFMPEG)
+        target_compile_definitions(udp_smoke PRIVATE P2PCHAT_VIDEO)
+        target_include_directories(udp_smoke PRIVATE ${AVCODEC_INCLUDE_DIRS} ${AVUTIL_INCLUDE_DIRS} ${SWSCALE_INCLUDE_DIRS})
+        target_link_libraries(udp_smoke PRIVATE ${AVCODEC_LIBRARIES} ${AVUTIL_LIBRARIES} ${SWSCALE_LIBRARIES})
+      endif()
+    endif()
+
+    add_executable(v4l2_dump_modes
+      tools/v4l2_dump_modes.cpp
+      src/video/v4l2_caps.cpp
+      src/video/v4l2_caps.h
+    )
+    target_include_directories(v4l2_dump_modes PRIVATE .)
+    target_link_libraries(v4l2_dump_modes PRIVATE Qt6::Core Threads::Threads)
+
+    add_executable(video_packetizer_smoke
+      tests/video_packetizer_smoke.cpp
+      src/video/video_packetizer.cpp
+      src/video/video_packetizer.h
+    )
+    target_include_directories(video_packetizer_smoke PRIVATE .)
   endif()
 else()
   message(STATUS "Qt6 not found; p2p_chat_gui target will not be built.")

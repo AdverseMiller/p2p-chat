@@ -17,6 +17,9 @@ class QPushButton;
 class QPoint;
 class QAction;
 class QJsonObject;
+class QStackedWidget;
+class QTimer;
+class QWidget;
 
 class MainWindow : public QMainWindow {
   Q_OBJECT
@@ -40,6 +43,7 @@ private:
   void showServerContextMenu(const QPoint& pos);
   void addServerDialog();
   void addChannelToServer(const QString& serverId, bool voice);
+  void renameServerChannel(const QString& serverId, const QString& channelId);
   void inviteFriendToServer(const QString& serverId);
   void removeServer(const QString& serverId);
   void removeServerChannel(const QString& serverId, const QString& channelId);
@@ -49,6 +53,10 @@ private:
                            const QString& payloadJsonCompact,
                            const QString& signature,
                            const QString& fromId);
+  void handleUnsignedControl(const QString& peerId,
+                             const QString& kind,
+                             const QString& payloadJsonCompact,
+                             const QString& fromId);
   void handleServerInvite(const QString& peerId, const QJsonObject& payload, const QString& signature);
   void handleServerJoinRequest(const QString& peerId, const QJsonObject& payload);
   void handleServerMembershipCert(const QString& peerId, const QJsonObject& payload, const QString& signature);
@@ -57,8 +65,10 @@ private:
   void handleServerRevocation(const QString& peerId, const QJsonObject& payload, const QString& signature);
   void handleServerChannelText(const QString& peerId, const QJsonObject& payload, const QString& signature);
   void handleServerVoicePresence(const QString& peerId, const QJsonObject& payload, const QString& signature);
+  void handleServerGlobalSay(const QString& peerId, const QJsonObject& payload);
   void broadcastServerMemberSync(const Profile::ServerEntry& server);
   void broadcastServerText(const QString& serverId, const QString& channelId, const QString& text);
+  void broadcastServerGlobalSay(const QString& serverId, const QString& text);
   void broadcastVoicePresence(const QString& serverId, const QString& channelId, bool joined);
   void appendServerChannelMessage(const QString& serverId,
                                   const QString& channelId,
@@ -68,18 +78,24 @@ private:
                                   bool incoming,
                                   bool verified);
   void maybeSyncVoiceCallForJoinedChannel();
+  void announceJoinedVoicePresence();
   QString joinedVoiceServerId() const;
   QString joinedVoiceChannelId() const;
   void sanitizeVoiceOccupantsForServer(const QString& serverId);
   void syncBackendServerMembers();
   bool isFriendAccepted(const QString& peerId) const;
+  bool canShowNonFriendIdentity(const QString& peerId, const QString& hintedName = QString()) const;
+  bool shouldShowNonFriendAvatar(const QString& peerId, const QString& hintedName = QString()) const;
+  QString serverMemberHintName(const QString& peerId) const;
   int presenceStateFor(const QString& peerId) const;
   QString serverPeerDisplayName(const QString& peerId, const QString& hintedName = QString()) const;
   void refreshFriendPresenceRow(const QString& peerId);
   void refreshServerMembersPane();
+  void refreshVoiceGallery();
   void leaveSelectedServer();
 
   void addFriendDialog();
+  void sendFriendRequestToId(const QString& id);
   void showChatContextMenu(const QPoint& pos);
   void showServerMemberContextMenu(const QPoint& pos);
   void showProfilePopup(const QString& peerId);
@@ -91,6 +107,7 @@ private:
   void refreshHeader();
   void refreshSelfProfileWidget();
   void refreshCallButton();
+  void refreshVideoPanel();
 
   Profile profile_;
   ChatBackend backend_;
@@ -111,7 +128,15 @@ private:
 
   QLabel* headerLabel_ = nullptr;
   QPushButton* callBtn_ = nullptr;
+  QStackedWidget* chatStack_ = nullptr;
   QTextBrowser* chatView_ = nullptr;
+  QListWidget* voiceGallery_ = nullptr;
+  QWidget* videoPanel_ = nullptr;
+  QLabel* remoteVideoLabel_ = nullptr;
+  QLabel* localVideoLabel_ = nullptr;
+  QString remoteVideoPeerId_;
+  bool remoteVideoActive_ = false;
+  bool localVideoActive_ = false;
   QLineEdit* input_ = nullptr;
   QListWidget* serverMembersList_ = nullptr;
 
@@ -132,6 +157,7 @@ private:
   QSet<QString> pendingJoinOwners_;
 
   QAction* darkModeAction_ = nullptr;
+  QTimer* voicePresenceTimer_ = nullptr;
 
   QString activeCallPeer_;
   QString activeCallState_;

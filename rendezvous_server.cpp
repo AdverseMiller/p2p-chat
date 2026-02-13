@@ -487,8 +487,12 @@ class RendezvousServer {
       *out_error = "from_id not registered";
       return;
     }
-    if (!get_registration(to_id)) {
-      *out_error = "to_id not registered";
+    if (!common::is_valid_id(to_id)) {
+      *out_error = "invalid to_id";
+      return;
+    }
+    if (to_id == from_id) {
+      *out_error = "cannot friend yourself";
       return;
     }
     FriendRequest fr;
@@ -503,10 +507,16 @@ class RendezvousServer {
       *out_error = "from_id not registered";
       return;
     }
-    if (!get_registration(to_id)) {
-      *out_error = "to_id not registered";
+    if (!common::is_valid_id(to_id)) {
+      *out_error = "invalid to_id";
       return;
     }
+    if (to_id == from_id) {
+      *out_error = "cannot accept yourself";
+      return;
+    }
+    // Allow accept delivery even when requester is temporarily offline.
+    // It will be emitted on their next poll after they register again.
     pending_friend_accepts_[std::move(to_id)].push_back(std::move(from_id));
   }
 

@@ -80,6 +80,17 @@ public:
     int frameMs = 20;         // 10 or 20
   };
 
+  struct VideoSettings {
+    QString devicePath;
+    QString cameraFourcc; // e.g. "MJPG"
+    int width = 640;
+    int height = 480;
+    int fpsNum = 1;
+    int fpsDen = 30;
+    QString codec = "h264";
+    int bitrateKbps = 1500;
+  };
+
   QString keyPath;          // identity pem path
   QString selfName;         // last used name
   QString selfAvatarPath;   // local avatar path (png)
@@ -89,7 +100,9 @@ public:
   bool noUpnp = false;
   quint16 externalPort = 0;
   bool darkMode = false;
+  bool shareIdentityWithNonFriendsInServers = false;
   AudioSettings audio;
+  VideoSettings video;
 
   QVector<FriendEntry> friends;
   QVector<ServerEntry> servers;

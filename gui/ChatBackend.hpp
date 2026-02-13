@@ -2,6 +2,7 @@
 
 #include <QObject>
 #include <QByteArray>
+#include <QImage>
 #include <QString>
 #include <QStringList>
 
@@ -25,6 +26,15 @@ public:
     int speakerVolume = 100;  // 0..100
     int bitrate = 32000;      // bps
     int frameMs = 20;         // 10 or 20
+    QString videoDevicePath;
+    QString videoFourcc;      // "MJPG"/"YUYV"/...
+    int videoWidth = 640;
+    int videoHeight = 480;
+    int videoFpsNum = 1;
+    int videoFpsDen = 30;
+    QString videoCodec = "h264";
+    int videoBitrateKbps = 1500;
+    bool videoEnabled = true;
   };
 
   explicit ChatBackend(QObject* parent = nullptr);
@@ -41,6 +51,7 @@ public:
   // Send an end-to-end encrypted signed control envelope to an accepted friend.
   // `payloadJsonCompact` must be valid JSON object text.
   void sendSignedControl(const QString& peerId, const QString& kind, const QString& payloadJsonCompact);
+  void sendUnsignedControl(const QString& peerId, const QString& kind, const QString& payloadJsonCompact);
   void sendMessage(const QString& peerId, const QString& text);
   void disconnectPeer(const QString& peerId);
   void warmConnect(const QString& peerId);
@@ -66,11 +77,14 @@ signals:
   void peerNameUpdated(QString peerId, QString name);
   void messageReceived(QString peerId, QString displayName, QString text, bool incoming);
   void signedControlReceived(QString peerId, QString kind, QString payloadJsonCompact, QString signature, QString fromId);
+  void unsignedControlReceived(QString peerId, QString kind, QString payloadJsonCompact, QString fromId);
   void deliveryError(QString peerId, QString message);
 
   void incomingCall(QString peerId);
   void callStateChanged(QString peerId, QString state);
   void callEnded(QString peerId, QString reason);
+  void localVideoFrame(QImage frame);
+  void remoteVideoFrame(QString peerId, QImage frame);
 
 private:
   struct Impl;

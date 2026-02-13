@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -1297,6 +1298,62 @@ class App : public std::enable_shared_from_this<App> {
 
 std::optional<App::Options> parse_args(int argc, char** argv) {
   App::Options opt;
+  auto xdg_config_root = []() -> std::string {
+    const char* xdg = std::getenv("XDG_CONFIG_HOME");
+    const char* home = std::getenv("HOME");
+    if (xdg && *xdg) return std::string(xdg);
+    if (home && *home) return std::string(home) + "/.config";
+    return {};
+  };
+
+  auto load_profile_defaults = [&]() {
+    struct ProfileDefaults {
+      std::string key_path;
+      std::string server_host;
+      uint16_t server_port = 0;
+      uint16_t listen_port = 0;
+      bool no_upnp = false;
+      uint16_t external_port = 0;
+    };
+    ProfileDefaults out;
+    const auto cfgroot = xdg_config_root();
+    if (cfgroot.empty()) return out;
+
+    const auto profile_path = cfgroot + "/p2p-chat/profile.json";
+    std::ifstream in(profile_path);
+    if (!in) return out;
+
+    try {
+      json j = json::parse(in, nullptr, true, true);
+      if (j.contains("keyPath") && j["keyPath"].is_string()) out.key_path = j["keyPath"].get<std::string>();
+      if (j.contains("serverHost") && j["serverHost"].is_string()) out.server_host = j["serverHost"].get<std::string>();
+      if (j.contains("serverPort") && j["serverPort"].is_number_integer()) {
+        const int p = j["serverPort"].get<int>();
+        if (p > 0 && p <= 65535) out.server_port = static_cast<uint16_t>(p);
+      }
+      if (j.contains("listenPort") && j["listenPort"].is_number_integer()) {
+        const int p = j["listenPort"].get<int>();
+        if (p > 0 && p <= 65535) out.listen_port = static_cast<uint16_t>(p);
+      }
+      if (j.contains("noUpnp") && j["noUpnp"].is_boolean()) out.no_upnp = j["noUpnp"].get<bool>();
+      if (j.contains("externalPort") && j["externalPort"].is_number_integer()) {
+        const int p = j["externalPort"].get<int>();
+        if (p > 0 && p <= 65535) out.external_port = static_cast<uint16_t>(p);
+      }
+    } catch (...) {
+      // Ignore malformed profile defaults; CLI flags and fallback defaults still apply.
+    }
+    return out;
+  };
+
+  const auto profile_defaults = load_profile_defaults();
+  if (!profile_defaults.server_host.empty()) opt.server_host = profile_defaults.server_host;
+  if (profile_defaults.server_port != 0) opt.server_port = profile_defaults.server_port;
+  if (profile_defaults.listen_port != 0) opt.listen_port = profile_defaults.listen_port;
+  opt.no_upnp = profile_defaults.no_upnp;
+  if (profile_defaults.external_port != 0) opt.external_port = profile_defaults.external_port;
+  if (!profile_defaults.key_path.empty()) opt.key_path = profile_defaults.key_path;
+
   auto default_key_path = []() -> std::string {
     // Keep CLI state under XDG config dir.
     // Matches the GUI's organization folder name ("p2p-chat").

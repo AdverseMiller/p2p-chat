@@ -12,6 +12,12 @@
 
 namespace {
 QString configRootDir() {
+  const auto overrideDir = qEnvironmentVariable("P2P_CHAT_CONFIG_DIR");
+  if (!overrideDir.trimmed().isEmpty()) {
+    QFileInfo fi(overrideDir);
+    if (fi.isAbsolute()) return fi.absoluteFilePath();
+    return QDir::current().absoluteFilePath(overrideDir);
+  }
   // Prefer the standard XDG config root; keep our state in ~/.config/p2p-chat on Linux.
   const auto root = QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation);
   return QDir(root).filePath("p2p-chat");
@@ -150,6 +156,7 @@ Profile Profile::load(const QString& path, QString* errorOut) {
   p.noUpnp = root.value("noUpnp").toBool(false);
   p.externalPort = static_cast<quint16>(root.value("externalPort").toInt(0));
   p.darkMode = root.value("darkMode").toBool(false);
+  p.shareIdentityWithNonFriendsInServers = root.value("shareIdentityWithNonFriendsInServers").toBool(false);
 
   if (root.value("audio").isObject()) {
     const auto a = root.value("audio").toObject();
@@ -164,6 +171,25 @@ Profile Profile::load(const QString& path, QString* errorOut) {
     p.audio.speakerVolume = std::clamp(p.audio.speakerVolume, 0, 100);
     if (p.audio.bitrate < 8000) p.audio.bitrate = 8000;
     if (p.audio.bitrate > 128000) p.audio.bitrate = 128000;
+  }
+
+  if (root.value("video").isObject()) {
+    const auto v = root.value("video").toObject();
+    p.video.devicePath = v.value("devicePath").toString();
+    p.video.cameraFourcc = v.value("cameraFourcc").toString();
+    p.video.width = v.value("width").toInt(p.video.width);
+    p.video.height = v.value("height").toInt(p.video.height);
+    p.video.fpsNum = v.value("fpsNum").toInt(p.video.fpsNum);
+    p.video.fpsDen = v.value("fpsDen").toInt(p.video.fpsDen);
+    p.video.codec = v.value("codec").toString(p.video.codec);
+    p.video.bitrateKbps = v.value("bitrateKbps").toInt(p.video.bitrateKbps);
+    if (p.video.width < 16) p.video.width = 16;
+    if (p.video.height < 16) p.video.height = 16;
+    if (p.video.fpsNum <= 0) p.video.fpsNum = 1;
+    if (p.video.fpsDen <= 0) p.video.fpsDen = 30;
+    if (p.video.bitrateKbps < 100) p.video.bitrateKbps = 100;
+    if (p.video.bitrateKbps > 20000) p.video.bitrateKbps = 20000;
+    if (p.video.codec.isEmpty()) p.video.codec = "h264";
   }
 
   const auto arr = root.value("friends").toArray();
@@ -286,6 +312,7 @@ bool Profile::save(QString* errorOut) const {
   root["noUpnp"] = noUpnp;
   root["externalPort"] = static_cast<int>(externalPort);
   root["darkMode"] = darkMode;
+  root["shareIdentityWithNonFriendsInServers"] = shareIdentityWithNonFriendsInServers;
 
   {
     QJsonObject a;
@@ -296,6 +323,19 @@ bool Profile::save(QString* errorOut) const {
     a["bitrate"] = audio.bitrate;
     a["frameMs"] = audio.frameMs;
     root["audio"] = a;
+  }
+
+  {
+    QJsonObject v;
+    v["devicePath"] = video.devicePath;
+    v["cameraFourcc"] = video.cameraFourcc;
+    v["width"] = video.width;
+    v["height"] = video.height;
+    v["fpsNum"] = video.fpsNum;
+    v["fpsDen"] = video.fpsDen;
+    v["codec"] = video.codec;
+    v["bitrateKbps"] = video.bitrateKbps;
+    root["video"] = v;
   }
 
   QJsonArray arr;
