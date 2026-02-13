@@ -35,6 +35,9 @@ Codec codecFromString(const QString& s) {
 }
 
 #if !defined(__linux__) || !defined(P2PCHAT_VIDEO)
+struct Encoder::Impl {};
+struct Decoder::Impl {};
+
 bool isInputFourccSupported(uint32_t) { return false; }
 bool convertRawFrameToI420(const RawFrame&, I420Frame*, QString* err) {
   if (err) *err = "video codec unavailable on this build";

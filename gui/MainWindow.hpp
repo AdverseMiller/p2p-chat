@@ -128,6 +128,7 @@ private:
 
   QLabel* headerLabel_ = nullptr;
   QPushButton* callBtn_ = nullptr;
+  QPushButton* webcamBtn_ = nullptr;
   QStackedWidget* chatStack_ = nullptr;
   QTextBrowser* chatView_ = nullptr;
   QListWidget* voiceGallery_ = nullptr;
@@ -161,4 +162,5 @@ private:
 
   QString activeCallPeer_;
   QString activeCallState_;
+  bool webcamEnabled_ = false;
 };

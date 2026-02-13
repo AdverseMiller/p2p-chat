@@ -308,7 +308,9 @@ QString statusTag(Profile::FriendStatus s) {
   }
 }
 
-ChatBackend::VoiceSettings voiceSettingsFromProfile(const Profile::AudioSettings& a, const Profile::VideoSettings& vcfg) {
+ChatBackend::VoiceSettings voiceSettingsFromProfile(const Profile::AudioSettings& a,
+                                                    const Profile::VideoSettings& vcfg,
+                                                    bool webcamEnabled) {
   ChatBackend::VoiceSettings v;
   v.inputDeviceIdHex = a.inputDeviceIdHex;
   v.outputDeviceIdHex = a.outputDeviceIdHex;
@@ -324,7 +326,7 @@ ChatBackend::VoiceSettings voiceSettingsFromProfile(const Profile::AudioSettings
   v.videoFpsDen = vcfg.fpsDen;
   v.videoCodec = vcfg.codec;
   v.videoBitrateKbps = vcfg.bitrateKbps;
-  v.videoEnabled = !vcfg.devicePath.isEmpty();
+  v.videoEnabled = webcamEnabled && !vcfg.devicePath.isEmpty();
   return v;
 }
 
@@ -430,6 +432,7 @@ bool verifyCanonicalJsonSignature(const QString& signerId, const QString& payloa
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   buildUi();
   loadProfile();
+  webcamEnabled_ = false;
   applyTheme(profile_.darkMode);
   refreshSelfProfileWidget();
 
@@ -523,7 +526,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     refreshCallButton();
     const bool inVoiceChannel = !joinedServerVoiceKey_.isEmpty();
     if (inVoiceChannel) {
-      backend_.answerCall(peerId, true, voiceSettingsFromProfile(profile_.audio, profile_.video));
+      backend_.answerCall(peerId, true, voiceSettingsFromProfile(profile_.audio, profile_.video, webcamEnabled_));
       activeCallState_ = "connecting";
       refreshCallButton();
       statusBar()->showMessage("Voice channel call connected", 2500);
@@ -533,7 +536,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     const auto who = f ? friendDisplay(*f) : peerId.left(14) + "...";
     auto ret = QMessageBox::question(this, "Incoming call", QString("%1 is calling you. Accept?").arg(who));
     const bool accept = (ret == QMessageBox::Yes);
-    backend_.answerCall(peerId, accept, voiceSettingsFromProfile(profile_.audio, profile_.video));
+    backend_.answerCall(peerId, accept, voiceSettingsFromProfile(profile_.audio, profile_.video, webcamEnabled_));
     if (!accept) {
       activeCallPeer_.clear();
       activeCallState_.clear();
@@ -671,6 +674,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   rebuildFriendsTab();
   rebuildServerList();
   refreshHeader();
+  refreshCallButton();
 }
 
 MainWindow::~MainWindow() {
@@ -706,10 +710,12 @@ void MainWindow::buildUi() {
   auto* settings = new QAction("Settings...", this);
   connect(settings, &QAction::triggered, this, [this] {
     if (SettingsDialog::edit(&profile_.audio, &profile_.video, &profile_.shareIdentityWithNonFriendsInServers, this)) {
-      backend_.updateVoiceSettings(voiceSettingsFromProfile(profile_.audio, profile_.video));
+      if (profile_.video.devicePath.trimmed().isEmpty()) webcamEnabled_ = false;
+      backend_.updateVoiceSettings(voiceSettingsFromProfile(profile_.audio, profile_.video, webcamEnabled_));
       saveProfile();
       rebuildServerList();
       refreshServerMembersPane();
+      refreshCallButton();
       statusBar()->showMessage("Settings updated", 4000);
     }
   });
@@ -915,6 +921,12 @@ void MainWindow::buildUi() {
   callBtn_->setEnabled(false);
   headerRowLayout->addWidget(callBtn_, 0, Qt::AlignRight);
 
+  webcamBtn_ = new QPushButton("Camera Off", headerRow);
+  webcamBtn_->setCheckable(true);
+  webcamBtn_->setChecked(false);
+  webcamBtn_->setEnabled(false);
+  headerRowLayout->addWidget(webcamBtn_, 0, Qt::AlignRight);
+
   rightLayout->addWidget(headerRow);
 
   auto* contentSplit = new QSplitter(Qt::Horizontal, right);
@@ -1107,7 +1119,15 @@ void MainWindow::buildUi() {
     activeCallPeer_ = pid;
     activeCallState_ = "calling";
     refreshCallButton();
-    backend_.startCall(pid, voiceSettingsFromProfile(profile_.audio, profile_.video));
+    backend_.startCall(pid, voiceSettingsFromProfile(profile_.audio, profile_.video, webcamEnabled_));
+  });
+  connect(webcamBtn_, &QPushButton::toggled, this, [this](bool enabled) {
+    webcamEnabled_ = enabled;
+    refreshCallButton();
+    if (!activeCallPeer_.isEmpty() && !activeCallState_.isEmpty()) {
+      backend_.updateVoiceSettings(voiceSettingsFromProfile(profile_.audio, profile_.video, webcamEnabled_));
+      statusBar()->showMessage(webcamEnabled_ ? "Webcam enabled" : "Webcam disabled", 3000);
+    }
   });
 
   // Dark mode toggle (profile loads after UI is built, so we set checked state later in loadProfile()).
@@ -2490,7 +2510,7 @@ void MainWindow::maybeSyncVoiceCallForJoinedChannel() {
   activeCallPeer_ = target;
   activeCallState_ = "calling";
   refreshCallButton();
-  backend_.startCall(target, voiceSettingsFromProfile(profile_.audio, profile_.video));
+  backend_.startCall(target, voiceSettingsFromProfile(profile_.audio, profile_.video, webcamEnabled_));
 }
 
 void MainWindow::leaveSelectedServer() {
@@ -2852,6 +2872,16 @@ void MainWindow::refreshVideoPanel() {
 
 void MainWindow::refreshCallButton() {
   if (!callBtn_) return;
+  if (webcamBtn_) {
+    const bool hasCamera = !profile_.video.devicePath.trimmed().isEmpty();
+    if (!hasCamera) webcamEnabled_ = false;
+    const bool inVoiceContext =
+        (!selectedServerId_.isEmpty() && !selectedServerChannelId_.isEmpty() && selectedServerChannelVoice_) ||
+        !currentPeerId().isEmpty();
+    webcamBtn_->setEnabled(hasCamera && inVoiceContext);
+    webcamBtn_->setChecked(webcamEnabled_ && hasCamera);
+    webcamBtn_->setText(!hasCamera ? "No Camera" : (webcamEnabled_ ? "Camera On" : "Camera Off"));
+  }
 
   if (!selectedServerId_.isEmpty() && !selectedServerChannelId_.isEmpty()) {
     if (!selectedServerChannelVoice_) {
