@@ -71,6 +71,25 @@ bool is_none_audio_device(const QString& id) {
   return id.compare(QString::fromLatin1(kNoneAudioDeviceId), Qt::CaseInsensitive) == 0;
 }
 
+uint32_t parse_fourcc_text(const QString& s) {
+  const auto b = s.toLatin1();
+  if (b.size() < 4) return 0;
+  return static_cast<uint32_t>(static_cast<uint8_t>(b[0])) |
+         (static_cast<uint32_t>(static_cast<uint8_t>(b[1])) << 8) |
+         (static_cast<uint32_t>(static_cast<uint8_t>(b[2])) << 16) |
+         (static_cast<uint32_t>(static_cast<uint8_t>(b[3])) << 24);
+}
+
+QString resolve_network_video_codec(const ChatBackend::VoiceSettings& settings) {
+  const auto requested = settings.videoCodec.trimmed().toLower();
+  if (requested == "vp8") return "vp8";
+  if (requested == "passthrough") {
+    const auto c = video::codecFromInputFourcc(parse_fourcc_text(settings.videoFourcc));
+    if (c.has_value()) return video::codecToString(c.value());
+  }
+  return "h264";
+}
+
 bool debug_logs_enabled() {
   static const bool enabled = [] {
 #if !defined(NDEBUG)
@@ -2061,6 +2080,8 @@ struct ChatBackend::Impl {
     QString peerId;
     QString callId;
     video::Codec codec = video::Codec::H264;
+    bool passthrough = false;
+    uint32_t captureFourcc = 0;
     int width = 640;
     int height = 480;
     int fpsNum = 1;
@@ -2474,15 +2495,6 @@ struct ChatBackend::Impl {
     if (!callPeerId.isEmpty()) emit q->remoteVideoFrame(callPeerId, QImage());
   }
 
-  static uint32_t fourccFromString(const QString& s) {
-    const auto b = s.toLatin1();
-    if (b.size() < 4) return 0;
-    return static_cast<uint32_t>(static_cast<uint8_t>(b[0])) |
-           (static_cast<uint32_t>(static_cast<uint8_t>(b[1])) << 8) |
-           (static_cast<uint32_t>(static_cast<uint8_t>(b[2])) << 16) |
-           (static_cast<uint32_t>(static_cast<uint8_t>(b[3])) << 24);
-  }
-
   void maybeStartVideoQt() {
     if (callPeerId.isEmpty() || callId.isEmpty()) return;
     if (!(callLocalAccepted && callRemoteAccepted)) return;
@@ -2490,6 +2502,10 @@ struct ChatBackend::Impl {
 
     const bool wantCapture = callSettings.videoEnabled && !callSettings.videoDevicePath.trimmed().isEmpty();
     const auto selectedCodec = callVideoCodec.trimmed().isEmpty() ? QString("h264") : callVideoCodec.trimmed().toLower();
+    const bool wantPassthrough = callSettings.videoCodec.trimmed().compare("passthrough", Qt::CaseInsensitive) == 0;
+    const uint32_t selectedFourcc = parse_fourcc_text(callSettings.videoFourcc);
+    const auto selectedNetworkCodec = video::codecFromString(selectedCodec);
+    const bool canPassthrough = wantPassthrough && video::isPassthroughCompatible(selectedFourcc, selectedNetworkCodec);
     const int selectedWidth = std::max(16, callSettings.videoWidth);
     const int selectedHeight = std::max(16, callSettings.videoHeight);
     const int selectedFpsNum = std::max(1, callSettings.videoFpsNum);
@@ -2505,6 +2521,8 @@ struct ChatBackend::Impl {
         videoRt->fpsNum == selectedFpsNum &&
         videoRt->fpsDen == selectedFpsDen &&
         videoRt->bitrateKbps == selectedBitrate &&
+        videoRt->passthrough == canPassthrough &&
+        videoRt->captureFourcc == selectedFourcc &&
         video::codecToString(videoRt->codec) == video::codecToString(video::codecFromString(selectedCodec)) &&
         videoRt->sharing == wantCapture;
     if (same) return;
@@ -2515,6 +2533,8 @@ struct ChatBackend::Impl {
     vr->peerId = callPeerId;
     vr->callId = callId;
     vr->codec = video::codecFromString(selectedCodec);
+    vr->passthrough = canPassthrough;
+    vr->captureFourcc = selectedFourcc;
     vr->width = selectedWidth;
     vr->height = selectedHeight;
     vr->fpsNum = selectedFpsNum;
@@ -2535,30 +2555,32 @@ struct ChatBackend::Impl {
       return;
     }
 
-    video::EncodeParams ep;
-    ep.codec = vr->codec;
-    ep.width = vr->width;
-    ep.height = vr->height;
-    ep.fpsNum = vr->fpsDen;
-    ep.fpsDen = vr->fpsNum;
-    ep.bitrateKbps = vr->bitrateKbps;
-    if (!vr->encoder.open(ep, &err)) {
-      emit q->logLine("video: encoder unavailable: " + err);
+    if (!vr->passthrough) {
+      video::EncodeParams ep;
+      ep.codec = vr->codec;
+      ep.width = vr->width;
+      ep.height = vr->height;
+      ep.fpsNum = vr->fpsDen;
+      ep.fpsDen = vr->fpsNum;
+      ep.bitrateKbps = vr->bitrateKbps;
+      if (!vr->encoder.open(ep, &err)) {
+        emit q->logLine("video: encoder unavailable: " + err);
+        vr->decoder.close();
+        return;
+      }
+      vr->codec = vr->encoder.codec();
       vr->decoder.close();
-      return;
-    }
-    vr->codec = vr->encoder.codec();
-    vr->decoder.close();
-    if (!vr->decoder.open(vr->codec, &err)) {
-      emit q->logLine("video: decoder unavailable: " + err);
-      vr->encoder.close();
-      return;
+      if (!vr->decoder.open(vr->codec, &err)) {
+        emit q->logLine("video: decoder unavailable: " + err);
+        vr->encoder.close();
+        return;
+      }
     }
 
     vr->capture = std::make_unique<video::V4L2Capture>();
     video::CaptureConfig cfg;
     cfg.devicePath = callSettings.videoDevicePath;
-    cfg.fourcc = fourccFromString(callSettings.videoFourcc);
+    cfg.fourcc = selectedFourcc;
     cfg.width = static_cast<uint32_t>(vr->width);
     cfg.height = static_cast<uint32_t>(vr->height);
     cfg.fpsNum = static_cast<uint32_t>(vr->fpsNum);
@@ -2591,13 +2613,26 @@ struct ChatBackend::Impl {
           emit q->localVideoFrame(video::i420ToQImage(i420));
 
           std::vector<video::EncodedFrame> out;
-          QString encErr;
-          if (!videoRt->encoder.encode(i420, &out, &encErr)) {
-            videoRt->encodeFailures++;
-            if (debug_logs_enabled() && (videoRt->encodeFailures % 30) == 1) {
-              emit q->logLine("[dbg] video encode failed err=" + encErr);
+          if (videoRt->passthrough) {
+            video::EncodedFrame ef;
+            QString passErr;
+            if (!video::passthroughFrame(rf, videoRt->codec, &ef, &passErr)) {
+              videoRt->encodeFailures++;
+              if (debug_logs_enabled() && (videoRt->encodeFailures % 30) == 1) {
+                emit q->logLine("[dbg] video passthrough failed err=" + passErr);
+              }
+              return;
             }
-            return;
+            out.push_back(std::move(ef));
+          } else {
+            QString encErr;
+            if (!videoRt->encoder.encode(i420, &out, &encErr)) {
+              videoRt->encodeFailures++;
+              if (debug_logs_enabled() && (videoRt->encodeFailures % 30) == 1) {
+                emit q->logLine("[dbg] video encode failed err=" + encErr);
+              }
+              return;
+            }
           }
           if (out.empty()) return;
 
@@ -2629,13 +2664,14 @@ struct ChatBackend::Impl {
     vr->sharing = true;
     videoRt = std::move(vr);
     emit q->logLine("video: sharing started (" +
-                    QString("%1 %2x%3 @ %4/%5 bitrate=%6kbps")
+                    QString("%1 %2x%3 @ %4/%5 bitrate=%6kbps mode=%7")
                         .arg(callSettings.videoFourcc)
                         .arg(callSettings.videoWidth)
                         .arg(callSettings.videoHeight)
                         .arg(callSettings.videoFpsNum)
                         .arg(callSettings.videoFpsDen)
-                        .arg(callSettings.videoBitrateKbps) +
+                        .arg(callSettings.videoBitrateKbps)
+                        .arg(videoRt->passthrough ? "passthrough" : "re-encode") +
                     ")");
   }
 
@@ -2765,7 +2801,39 @@ struct ChatBackend::Impl {
     if (type == "video_keyframe_request") {
 #if defined(P2PCHAT_VIDEO)
       if (videoRt && videoRt->peerId == peerId) {
-        videoRt->encoder.requestKeyframe();
+        if (!videoRt->passthrough) {
+          videoRt->encoder.requestKeyframe();
+        } else if (debug_logs_enabled()) {
+          emit q->logLine("[dbg] video keyframe request ignored in passthrough mode");
+        }
+      }
+#endif
+      return;
+    }
+
+    if (type == "video_state") {
+#if defined(P2PCHAT_VIDEO)
+      if (callPeerId != peerId) return;
+      const QString cid = inner.contains("call_id") && inner["call_id"].is_string()
+                              ? QString::fromStdString(inner["call_id"].get<std::string>())
+                              : QString();
+      if (!cid.isEmpty() && cid != callId) return;
+      const bool enabled =
+          inner.contains("enabled") && inner["enabled"].is_boolean() ? inner["enabled"].get<bool>() : false;
+      const QString remoteVideoCodec =
+          inner.contains("video_codec") && inner["video_codec"].is_string()
+              ? QString::fromStdString(inner["video_codec"].get<std::string>()).trimmed().toLower()
+              : QString();
+      callRemoteVideoEnabled = enabled;
+      if (!remoteVideoCodec.isEmpty()) callVideoCodec = remoteVideoCodec;
+      if (!enabled) {
+        emit q->remoteVideoFrame(peerId, QImage());
+      } else {
+        requestVideoKeyframeQt(peerId);
+      }
+      if (debug_logs_enabled()) {
+        emit q->logLine("[dbg] video_state from peer=" + peerId + " enabled=" + QString::number(enabled ? 1 : 0) +
+                        " codec=" + (remoteVideoCodec.isEmpty() ? callVideoCodec : remoteVideoCodec));
       }
 #endif
       return;
@@ -3749,7 +3817,15 @@ void ChatBackend::start(const Options& opt) {
   if (debug_logs_enabled()) {
     emit logLine("[dbg] runtime debug logging enabled");
   }
-  impl_->identity = common::Identity::load_or_create(keyPath.toStdString());
+  try {
+    impl_->identity =
+        common::Identity::load_or_create(keyPath.toStdString(), opt.keyPassword.toStdString());
+  } catch (const std::exception& e) {
+    const QString msg = QString("identity load failed: %1").arg(e.what());
+    common::log(msg.toStdString());
+    emit logLine(msg);
+    return;
+  }
   {
     std::lock_guard lk(impl_->m);
     impl_->self_name = opt.selfName.toStdString();
@@ -4043,11 +4119,8 @@ void ChatBackend::startCall(const QString& peerId, const VoiceSettings& settings
   impl_->callLocalAccepted = true;
   impl_->callRemoteAccepted = false;
   impl_->callRemoteVideoEnabled = false;
-  impl_->callVideoCodec = settings.videoCodec.trimmed().isEmpty() ? "h264" : settings.videoCodec.trimmed().toLower();
+  impl_->callVideoCodec = resolve_network_video_codec(settings);
   impl_->callSettings = settings;
-  if (!settings.videoCodec.trimmed().isEmpty()) {
-    impl_->callVideoCodec = settings.videoCodec.trimmed().toLower();
-  }
   impl_->callFrameMs = (settings.frameMs == 10) ? 10 : 20;
   impl_->callBitrate = std::clamp(settings.bitrate, 8000, 128000);
 
@@ -4335,6 +4408,18 @@ void ChatBackend::updateVoiceSettings(const VoiceSettings& settings) {
       (settings.videoBitrateKbps != prev.videoBitrateKbps);
   if (videoChanged && !impl_->callPeerId.isEmpty() && impl_->callLocalAccepted && impl_->callRemoteAccepted) {
     impl_->maybeStartVideoQt();
+    const auto pid = impl_->callPeerId.toStdString();
+    const auto call_id = impl_->callId.toStdString();
+    const bool enabled = impl_->callSettings.videoEnabled;
+    const std::string codec = impl_->callVideoCodec.toStdString();
+    boost::asio::post(impl_->io, [impl = impl_, pid, call_id, enabled, codec] {
+      json j;
+      j["type"] = "video_state";
+      j["call_id"] = call_id;
+      j["enabled"] = enabled;
+      j["video_codec"] = codec;
+      impl->sendControlToPeer(pid, std::move(j));
+    });
     emit logLine(settings.videoEnabled ? "Video settings applied" : "Video sharing disabled (receive-only)");
   }
 #endif

@@ -1,11 +1,9 @@
 #include "common/framing.hpp"
+#include "common/identity.hpp"
+#include "common/profile_store.hpp"
 #include "common/util.hpp"
 
 #include <boost/asio.hpp>
-
-#include <openssl/evp.h>
-#include <openssl/pem.h>
-#include <openssl/rand.h>
 
 #include <atomic>
 #include <array>
@@ -52,110 +50,7 @@ struct UpnpMapping {
   std::string lan_addr;
 };
 
-class Identity {
- public:
-  static std::shared_ptr<Identity> load_or_create(std::string path) {
-    auto id = std::shared_ptr<Identity>(new Identity());
-    id->key_path_ = std::move(path);
-    if (!id->load_from_disk()) {
-      id->generate_new();
-      id->save_to_disk_best_effort();
-    }
-    id->compute_public_id();
-    return id;
-  }
-
-  std::string_view public_id() const { return public_id_; }
-
-  std::string sign_challenge_b64url(std::string_view challenge_b64url) const {
-    const auto msg = common::base64url_decode(challenge_b64url);
-    if (!msg) return {};
-    std::vector<uint8_t> sig(64);
-    size_t siglen = sig.size();
-
-    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-    if (!ctx) return {};
-    const int ok1 = EVP_DigestSignInit(ctx, nullptr, nullptr, nullptr, pkey_.get());
-    int ok2 = 0;
-    if (ok1 == 1) {
-      ok2 = EVP_DigestSign(ctx, sig.data(), &siglen, msg->data(), msg->size());
-    }
-    EVP_MD_CTX_free(ctx);
-    if (ok2 != 1 || siglen != 64) return {};
-    return common::base64url_encode(std::span<const uint8_t>(sig.data(), siglen));
-  }
-
- private:
-  struct PkeyDeleter {
-    void operator()(EVP_PKEY* p) const { EVP_PKEY_free(p); }
-  };
-  using PkeyPtr = std::unique_ptr<EVP_PKEY, PkeyDeleter>;
-
-  Identity() = default;
-
-  static std::string expand_user_path(const std::string& path) {
-    if (!path.empty() && path[0] == '~') {
-      const char* home = std::getenv("HOME");
-      if (!home) return path;
-      if (path.size() == 1) return std::string(home);
-      if (path[1] == '/') return std::string(home) + path.substr(1);
-    }
-    return path;
-  }
-
-  bool load_from_disk() {
-    const std::string p = expand_user_path(key_path_);
-    FILE* f = std::fopen(p.c_str(), "rb");
-    if (!f) return false;
-    EVP_PKEY* k = PEM_read_PrivateKey(f, nullptr, nullptr, nullptr);
-    std::fclose(f);
-    if (!k) return false;
-    pkey_.reset(k);
-    return true;
-  }
-
-  void generate_new() {
-    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, nullptr);
-    if (!ctx) throw std::runtime_error("EVP_PKEY_CTX_new_id failed");
-    EVP_PKEY* k = nullptr;
-    if (EVP_PKEY_keygen_init(ctx) != 1 || EVP_PKEY_keygen(ctx, &k) != 1 || !k) {
-      EVP_PKEY_CTX_free(ctx);
-      throw std::runtime_error("Ed25519 keygen failed");
-    }
-    EVP_PKEY_CTX_free(ctx);
-    pkey_.reset(k);
-  }
-
-  void save_to_disk_best_effort() {
-    const std::string p = expand_user_path(key_path_);
-    std::filesystem::path fp(p);
-    std::error_code ec;
-    std::filesystem::create_directories(fp.parent_path(), ec);
-
-    FILE* f = std::fopen(p.c_str(), "wb");
-    if (!f) return;
-    // Unencrypted PEM for simplicity.
-    (void)PEM_write_PrivateKey(f, pkey_.get(), nullptr, nullptr, 0, nullptr, nullptr);
-    std::fclose(f);
-    std::filesystem::permissions(fp,
-                                std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-                                std::filesystem::perm_options::replace,
-                                ec);
-  }
-
-  void compute_public_id() {
-    std::array<uint8_t, 32> pub{};
-    size_t publen = pub.size();
-    if (EVP_PKEY_get_raw_public_key(pkey_.get(), pub.data(), &publen) != 1 || publen != pub.size()) {
-      throw std::runtime_error("failed to get public key");
-    }
-    public_id_ = common::base64url_encode(std::span<const uint8_t>(pub.data(), pub.size()));
-  }
-
-  std::string key_path_;
-  PkeyPtr pkey_{nullptr};
-  std::string public_id_;
-};
+using Identity = common::Identity;
 
 class UpnpManager {
  public:
@@ -782,6 +677,7 @@ class App : public std::enable_shared_from_this<App> {
     uint16_t server_port = 0;
     std::string display_name;
     std::string key_path;
+    std::string key_password;
     uint16_t listen_port = 0;
     bool no_upnp = false;
     uint16_t external_port = 0; // optional override when --no-upnp is used
@@ -1298,84 +1194,115 @@ class App : public std::enable_shared_from_this<App> {
 
 std::optional<App::Options> parse_args(int argc, char** argv) {
   App::Options opt;
-  auto xdg_config_root = []() -> std::string {
-    const char* xdg = std::getenv("XDG_CONFIG_HOME");
-    const char* home = std::getenv("HOME");
-    if (xdg && *xdg) return std::string(xdg);
-    if (home && *home) return std::string(home) + "/.config";
-    return {};
-  };
+  std::string config_dir_arg;
+  std::string profile_name_arg;
 
-  auto load_profile_defaults = [&]() {
-    struct ProfileDefaults {
-      std::string key_path;
-      std::string server_host;
-      uint16_t server_port = 0;
-      uint16_t listen_port = 0;
-      bool no_upnp = false;
-      uint16_t external_port = 0;
+  for (int i = 1; i < argc; ++i) {
+    const std::string a = argv[i];
+    auto get_val = [&](std::string_view flag) -> std::optional<std::string> {
+      if (a == flag) {
+        if (i + 1 >= argc) return std::nullopt;
+        return std::string(argv[++i]);
+      }
+      return std::nullopt;
     };
-    ProfileDefaults out;
-    const auto cfgroot = xdg_config_root();
-    if (cfgroot.empty()) return out;
+    if (auto v = get_val("--config-dir")) {
+      config_dir_arg = *v;
+      continue;
+    }
+    if (a.starts_with("--config-dir=")) {
+      config_dir_arg = a.substr(std::string("--config-dir=").size());
+      continue;
+    }
+    if (auto v = get_val("--profile")) {
+      profile_name_arg = *v;
+      continue;
+    }
+    if (a.starts_with("--profile=")) {
+      profile_name_arg = a.substr(std::string("--profile=").size());
+      continue;
+    }
+    if (auto v = get_val("--profile-password")) {
+      opt.key_password = *v;
+      continue;
+    }
+    if (a.starts_with("--profile-password=")) {
+      opt.key_password = a.substr(std::string("--profile-password=").size());
+      continue;
+    }
+  }
 
-    const auto profile_path = cfgroot + "/p2p-chat/profile.json";
+  if (!config_dir_arg.empty()) {
+    setenv("P2P_CHAT_CONFIG_DIR", config_dir_arg.c_str(), 1);
+  }
+
+  const auto cfgroot = common::profile_store::resolve_root();
+  std::string profile_err;
+  (void)common::profile_store::ensure_store(cfgroot, &profile_err);
+
+  common::profile_store::Index idx;
+  (void)common::profile_store::load_index(cfgroot, &idx, nullptr);
+  if (idx.profiles.empty()) {
+    common::profile_store::Entry created;
+    (void)common::profile_store::create_profile(cfgroot, "default", false, &created, nullptr);
+    (void)common::profile_store::load_index(cfgroot, &idx, nullptr);
+  }
+
+  common::profile_store::Entry selected_profile;
+  bool selected_ok = false;
+  if (!profile_name_arg.empty()) {
+    if (auto p = common::profile_store::find_profile(idx, profile_name_arg); p.has_value()) {
+      selected_profile = *p;
+      selected_ok = true;
+    } else {
+      return std::nullopt;
+    }
+  } else if (!idx.current.empty()) {
+    if (auto p = common::profile_store::find_profile(idx, idx.current); p.has_value()) {
+      selected_profile = *p;
+      selected_ok = true;
+    }
+  }
+  if (!selected_ok && !idx.profiles.empty()) {
+    selected_profile = idx.profiles.front();
+    selected_ok = true;
+  }
+  if (!selected_ok) return std::nullopt;
+  if (selected_profile.encrypted && opt.key_password.empty()) return std::nullopt;
+
+  const auto profile_dir = common::profile_store::profile_dir(cfgroot, selected_profile);
+  const auto profile_path = profile_dir / "profile.json";
+  const std::string canonical_key_path = (profile_dir / "identity.pem").string();
+
+  try {
     std::ifstream in(profile_path);
-    if (!in) return out;
-
-    try {
+    if (in) {
       json j = json::parse(in, nullptr, true, true);
-      if (j.contains("keyPath") && j["keyPath"].is_string()) out.key_path = j["keyPath"].get<std::string>();
-      if (j.contains("serverHost") && j["serverHost"].is_string()) out.server_host = j["serverHost"].get<std::string>();
+      if (j.contains("keyPath") && j["keyPath"].is_string()) opt.key_path = j["keyPath"].get<std::string>();
+      if (j.contains("serverHost") && j["serverHost"].is_string())
+        opt.server_host = j["serverHost"].get<std::string>();
       if (j.contains("serverPort") && j["serverPort"].is_number_integer()) {
         const int p = j["serverPort"].get<int>();
-        if (p > 0 && p <= 65535) out.server_port = static_cast<uint16_t>(p);
+        if (p > 0 && p <= 65535) opt.server_port = static_cast<uint16_t>(p);
       }
       if (j.contains("listenPort") && j["listenPort"].is_number_integer()) {
         const int p = j["listenPort"].get<int>();
-        if (p > 0 && p <= 65535) out.listen_port = static_cast<uint16_t>(p);
+        if (p > 0 && p <= 65535) opt.listen_port = static_cast<uint16_t>(p);
       }
-      if (j.contains("noUpnp") && j["noUpnp"].is_boolean()) out.no_upnp = j["noUpnp"].get<bool>();
+      if (j.contains("noUpnp") && j["noUpnp"].is_boolean()) opt.no_upnp = j["noUpnp"].get<bool>();
       if (j.contains("externalPort") && j["externalPort"].is_number_integer()) {
         const int p = j["externalPort"].get<int>();
-        if (p > 0 && p <= 65535) out.external_port = static_cast<uint16_t>(p);
+        if (p > 0 && p <= 65535) opt.external_port = static_cast<uint16_t>(p);
       }
-    } catch (...) {
-      // Ignore malformed profile defaults; CLI flags and fallback defaults still apply.
     }
-    return out;
-  };
+  } catch (...) {
+  }
 
-  const auto profile_defaults = load_profile_defaults();
-  if (!profile_defaults.server_host.empty()) opt.server_host = profile_defaults.server_host;
-  if (profile_defaults.server_port != 0) opt.server_port = profile_defaults.server_port;
-  if (profile_defaults.listen_port != 0) opt.listen_port = profile_defaults.listen_port;
-  opt.no_upnp = profile_defaults.no_upnp;
-  if (profile_defaults.external_port != 0) opt.external_port = profile_defaults.external_port;
-  if (!profile_defaults.key_path.empty()) opt.key_path = profile_defaults.key_path;
+  setenv("P2P_CHAT_CONFIG_DIR", profile_dir.string().c_str(), 1);
+  setenv("P2P_CHAT_PROFILE_NAME", selected_profile.name.c_str(), 1);
+  common::profile_store::set_current(cfgroot, selected_profile.name, nullptr);
 
-  auto default_key_path = []() -> std::string {
-    // Keep CLI state under XDG config dir.
-    // Matches the GUI's organization folder name ("p2p-chat").
-    const char* xdg = std::getenv("XDG_CONFIG_HOME");
-    const char* home = std::getenv("HOME");
-    const std::string cfgroot = (xdg && *xdg) ? std::string(xdg)
-                               : (home && *home) ? (std::string(home) + "/.config")
-                                                 : std::string();
-
-    const std::string canonical = cfgroot.empty() ? "./p2p-chat/identity.pem" : (cfgroot + "/p2p-chat/identity.pem");
-    const std::string legacy = cfgroot.empty() ? "./p2p_chat/identity.pem" : (cfgroot + "/p2p_chat/identity.pem");
-
-    // Best-effort migration from legacy underscore dir to canonical dash dir.
-    try {
-      if (!std::filesystem::exists(canonical) && std::filesystem::exists(legacy)) {
-        std::filesystem::create_directories(std::filesystem::path(canonical).parent_path());
-        std::filesystem::copy_file(legacy, canonical, std::filesystem::copy_options::skip_existing);
-      }
-    } catch (...) {
-    }
-    return canonical;
-  };
+  bool key_overridden = false;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto get_val = [&](std::string_view flag) -> std::optional<std::string> {
@@ -1397,12 +1324,31 @@ std::optional<App::Options> parse_args(int argc, char** argv) {
       opt.no_upnp = true;
       continue;
     }
+    if (auto v = get_val("--config-dir")) {
+      (void)v;
+      continue;
+    }
+    if (a.starts_with("--config-dir=")) continue;
+    if (auto v = get_val("--profile")) {
+      (void)v;
+      continue;
+    }
+    if (a.starts_with("--profile=")) continue;
+    if (auto v = get_val("--profile-password")) {
+      opt.key_password = *v;
+      continue;
+    }
+    if (a.starts_with("--profile-password=")) {
+      opt.key_password = a.substr(std::string("--profile-password=").size());
+      continue;
+    }
     if (auto v = get_val("--name")) {
       opt.display_name = *v;
       continue;
     }
     if (auto v = get_val("--key")) {
       opt.key_path = *v;
+      key_overridden = true;
       continue;
     }
     if (auto v = get_val("--id")) {
@@ -1410,6 +1356,7 @@ std::optional<App::Options> parse_args(int argc, char** argv) {
       // If it looks like a public key, reject; otherwise treat as a key path.
       if (common::is_valid_id(*v) && v->size() >= 40) return std::nullopt;
       opt.key_path = *v;
+      key_overridden = true;
       continue;
     }
     if (auto v = get_val("--listen")) {
@@ -1432,7 +1379,7 @@ std::optional<App::Options> parse_args(int argc, char** argv) {
     opt.server_host = "learn.fairuse.org";
     opt.server_port = 5555;
   }
-  if (opt.key_path.empty()) opt.key_path = default_key_path();
+  if (!key_overridden) opt.key_path = canonical_key_path;
   if (!opt.display_name.empty()) {
     if (opt.display_name.size() > 32) return std::nullopt;
     if (opt.display_name.find('\n') != std::string::npos || opt.display_name.find('\r') != std::string::npos) {
@@ -1445,10 +1392,19 @@ std::optional<App::Options> parse_args(int argc, char** argv) {
 } // namespace
 
 int main(int argc, char** argv) {
+  for (int i = 1; i < argc; ++i) {
+    const std::string a = argv[i];
+    if (a == "--help" || a == "-h") {
+      std::cout << "Usage: " << argv[0]
+                << " [--server <host:port>] [--profile <name>] [--profile-password <password>] [--key <path>] [--name <name>] [--listen <port>] [--no-upnp] [--external-port <port>] [--config-dir <path>]\n"
+                << "Default server: learn.fairuse.org:5555\n";
+      return 0;
+    }
+  }
   const auto opt = parse_args(argc, argv);
   if (!opt) {
     std::cerr << "Usage: " << argv[0]
-              << " [--server <host:port>] [--key <path>] [--name <name>] [--listen <port>] [--no-upnp] [--external-port <port>]\n"
+              << " [--server <host:port>] [--profile <name>] [--profile-password <password>] [--key <path>] [--name <name>] [--listen <port>] [--no-upnp] [--external-port <port>] [--config-dir <path>]\n"
               << "Default server: learn.fairuse.org:5555\n";
     return 2;
   }
@@ -1456,7 +1412,7 @@ int main(int argc, char** argv) {
   try {
     boost::asio::io_context io;
     common::log(std::string("identity key: ") + opt->key_path);
-    auto identity = Identity::load_or_create(opt->key_path);
+    auto identity = Identity::load_or_create(opt->key_path, opt->key_password);
     auto app = std::make_shared<App>(io, *opt, std::move(identity));
     app->run();
     io.run();

@@ -16,6 +16,7 @@
 #include <QTabWidget>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QSignalBlocker>
 
 #include <atomic>
 #include <mutex>
@@ -51,6 +52,34 @@ bool running_as_root() {
 #else
   return ::geteuid() == 0;
 #endif
+}
+
+uint32_t fourccFromText(const QString& s) {
+  const auto b = s.toLatin1();
+  if (b.size() < 4) return 0;
+  return static_cast<uint32_t>(static_cast<uint8_t>(b[0])) |
+         (static_cast<uint32_t>(static_cast<uint8_t>(b[1])) << 8) |
+         (static_cast<uint32_t>(static_cast<uint8_t>(b[2])) << 16) |
+         (static_cast<uint32_t>(static_cast<uint8_t>(b[3])) << 24);
+}
+
+QString codecDescription(const QString& key) {
+  const auto v = key.trimmed().toLower();
+  if (v == "passthrough") {
+    return "Passthrough sends camera-compressed H.264/VP8 frames directly over the network without re-encoding.\n"
+           "Lowest CPU use and latency, but only works when the selected camera pixel format already matches "
+           "the negotiated network codec (H.264 or VP8).";
+  }
+  if (v == "vp8") {
+    return "VP8 re-encodes camera frames to VP8 for network transport.\n"
+           "More CPU use than passthrough, but works with most camera pixel formats.";
+  }
+  return "H.264 re-encodes camera frames to H.264 for network transport.\n"
+         "Best default compatibility and quality/bitrate efficiency across peers.";
+}
+
+bool wantsPassthrough(const QString& codecKey) {
+  return codecKey.trimmed().compare("passthrough", Qt::CaseInsensitive) == 0;
 }
 
 #if defined(P2PCHAT_VOICE) && !defined(_WIN32)
@@ -159,12 +188,7 @@ SettingsDialog::SettingsDialog(const Profile::AudioSettings& initial,
   videoSize_ = new QComboBox(videoTab);
   videoFps_ = new QComboBox(videoTab);
   videoCodec_ = new QComboBox(videoTab);
-  videoCodec_->addItem("H264", "h264");
-  videoCodec_->addItem("VP8", "vp8");
-  {
-    const auto wanted = videoInitial_.codec.trimmed().toLower();
-    if (wanted == "vp8") videoCodec_->setCurrentIndex(1);
-  }
+  videoCodec_->setToolTip(codecDescription("h264"));
   videoBitrate_ = new QSpinBox(videoTab);
   videoBitrate_->setRange(100, 20000);
   videoBitrate_->setSuffix(" kbps");
@@ -196,6 +220,14 @@ SettingsDialog::SettingsDialog(const Profile::AudioSettings& initial,
 
   connect(videoDevice_, &QComboBox::currentIndexChanged, this, [this] {
     stopPreview();
+    rebuildVideoCodecs();
+    rebuildVideoFormats();
+  });
+  connect(videoCodec_, &QComboBox::currentIndexChanged, this, [this] {
+    stopPreview();
+    if (videoCodec_) {
+      videoCodec_->setToolTip(codecDescription(videoCodec_->currentData().toString()));
+    }
     rebuildVideoFormats();
   });
   connect(videoFormat_, &QComboBox::currentIndexChanged, this, [this] {
@@ -208,6 +240,7 @@ SettingsDialog::SettingsDialog(const Profile::AudioSettings& initial,
   });
 
   rebuildVideoDevices();
+  rebuildVideoCodecs();
   tabs->addTab(videoTab, "Video");
 
   auto* privacyTab = new QWidget(tabs);
@@ -340,37 +373,137 @@ void SettingsDialog::rebuildVideoDevices() {
   }
   if (pick < 0 && videoDevice_->count() > 0) pick = 0;
   if (pick >= 0) videoDevice_->setCurrentIndex(pick);
+  rebuildVideoCodecs();
   rebuildVideoFormats();
 }
 
+void SettingsDialog::rebuildVideoCodecs() {
+  if (!videoCodec_ || !videoDevice_) return;
+  const QSignalBlocker block(videoCodec_);
+  const QString current = videoCodec_->currentData().toString().trimmed().toLower();
+  const QString wanted = !current.isEmpty() ? current : videoInitial_.codec.trimmed().toLower();
+  const QString path = videoDevice_->currentData().toString();
+
+  bool hasH264Passthrough = false;
+  bool hasVp8Passthrough = false;
+  if (!path.isEmpty()) {
+    const auto caps = video::queryDeviceCaps(path);
+    for (const auto& fmt : caps.formats) {
+      const auto c = video::codecFromInputFourcc(fmt.fourcc);
+      if (!c.has_value()) continue;
+      if (c.value() == video::Codec::H264) hasH264Passthrough = true;
+      if (c.value() == video::Codec::VP8) hasVp8Passthrough = true;
+    }
+  }
+
+  videoCodec_->clear();
+  videoCodec_->addItem("H264 (re-encode)", "h264");
+  videoCodec_->setItemData(videoCodec_->count() - 1, codecDescription("h264"), Qt::ToolTipRole);
+  videoCodec_->addItem("VP8 (re-encode)", "vp8");
+  videoCodec_->setItemData(videoCodec_->count() - 1, codecDescription("vp8"), Qt::ToolTipRole);
+  const QString passLabel = (hasH264Passthrough || hasVp8Passthrough)
+                                ? QString("Passthrough (camera bitstream)")
+                                : QString("Passthrough (fallback to re-encode)");
+  videoCodec_->addItem(passLabel, "passthrough");
+  QString passTip = codecDescription("passthrough");
+  if (hasH264Passthrough || hasVp8Passthrough) {
+    passTip += "\nDetected passthrough formats: " +
+               QString("%1%2")
+                   .arg(hasH264Passthrough ? "H.264" : "")
+                   .arg(hasVp8Passthrough ? (hasH264Passthrough ? ", VP8" : "VP8") : "");
+  } else {
+    passTip += "\nThis camera did not report H.264/VP8 capture output; the app will fall back to software encode.";
+  }
+  videoCodec_->setItemData(videoCodec_->count() - 1, passTip, Qt::ToolTipRole);
+
+  int pick = 0;
+  for (int i = 0; i < videoCodec_->count(); ++i) {
+    if (videoCodec_->itemData(i).toString().trimmed().toLower() == wanted) {
+      pick = i;
+      break;
+    }
+  }
+  videoCodec_->setCurrentIndex(pick);
+  videoCodec_->setToolTip(videoCodec_->itemData(pick, Qt::ToolTipRole).toString());
+}
+
 void SettingsDialog::rebuildVideoFormats() {
-  if (!videoFormat_ || !videoDevice_) return;
+  if (!videoFormat_ || !videoDevice_ || !videoCodec_) return;
+  const QString previousFourcc = videoFormat_->currentData().toString();
   videoFormat_->clear();
   const auto path = videoDevice_->currentData().toString();
+  const auto selectedCodec = videoCodec_->currentData().toString().trimmed().toLower();
   if (path.isEmpty()) {
     rebuildVideoSizes();
     return;
   }
   const auto caps = video::queryDeviceCaps(path);
   bool addedSupported = false;
+  bool passthroughOnly = wantsPassthrough(selectedCodec);
   for (const auto& fmt : caps.formats) {
     if (!video::isInputFourccSupported(fmt.fourcc)) continue;
-    videoFormat_->addItem(QString("%1 (%2)").arg(fmt.fourccStr, fmt.description), fmt.fourccStr);
+    const auto fmtCodec = video::codecFromInputFourcc(fmt.fourcc);
+    if (passthroughOnly && !fmtCodec.has_value()) continue;
+    QString label = QString("%1 (%2)").arg(fmt.fourccStr, fmt.description);
+    if (fmtCodec.has_value()) {
+      label += QString(" [direct %1]").arg(video::codecToString(fmtCodec.value()).toUpper());
+    } else if (passthroughOnly) {
+      label += " [re-encode fallback]";
+    }
+    videoFormat_->addItem(label, fmt.fourccStr);
+    videoFormat_->setItemData(videoFormat_->count() - 1, static_cast<quint32>(fmt.fourcc), kRoleVideoFourcc);
     addedSupported = true;
   }
   if (!addedSupported) {
     for (const auto& fmt : caps.formats) {
+      if (passthroughOnly && !video::codecFromInputFourcc(fmt.fourcc).has_value()) continue;
       videoFormat_->addItem(QString("%1 (%2, unsupported)").arg(fmt.fourccStr, fmt.description), fmt.fourccStr);
+      videoFormat_->setItemData(videoFormat_->count() - 1, static_cast<quint32>(fmt.fourcc), kRoleVideoFourcc);
+    }
+  }
+  if (!addedSupported && videoFormat_->count() == 0 && passthroughOnly) {
+    // Fall back to all supported formats when passthrough is unavailable on this camera.
+    for (const auto& fmt : caps.formats) {
+      if (!video::isInputFourccSupported(fmt.fourcc)) continue;
+      const auto fmtCodec = video::codecFromInputFourcc(fmt.fourcc);
+      QString label = QString("%1 (%2)").arg(fmt.fourccStr, fmt.description);
+      if (fmtCodec.has_value()) {
+        label += QString(" [direct %1]").arg(video::codecToString(fmtCodec.value()).toUpper());
+      } else {
+        label += " [re-encode fallback]";
+      }
+      videoFormat_->addItem(label, fmt.fourccStr);
+      videoFormat_->setItemData(videoFormat_->count() - 1, static_cast<quint32>(fmt.fourcc), kRoleVideoFourcc);
     }
   }
 
   int pick = -1;
-  if (!videoInitial_.cameraFourcc.isEmpty()) {
+  if (!previousFourcc.isEmpty()) {
+    for (int i = 0; i < videoFormat_->count(); ++i) {
+      if (videoFormat_->itemData(i).toString().compare(previousFourcc, Qt::CaseInsensitive) == 0) {
+        pick = i;
+        break;
+      }
+    }
+  }
+  if (pick < 0 && !videoInitial_.cameraFourcc.isEmpty()) {
     for (int i = 0; i < videoFormat_->count(); ++i) {
       if (videoFormat_->itemData(i).toString().compare(videoInitial_.cameraFourcc, Qt::CaseInsensitive) == 0) {
         pick = i;
         break;
       }
+    }
+  }
+  if (pick < 0 && passthroughOnly) {
+    for (const auto wantedCodec : {video::Codec::H264, video::Codec::VP8}) {
+      for (int i = 0; i < videoFormat_->count(); ++i) {
+        const uint32_t fourcc = static_cast<uint32_t>(videoFormat_->itemData(i, kRoleVideoFourcc).toUInt());
+        if (video::isPassthroughCompatible(fourcc, wantedCodec)) {
+          pick = i;
+          break;
+        }
+      }
+      if (pick >= 0) break;
     }
   }
   if (pick < 0 && videoFormat_->count() > 0) pick = 0;
@@ -476,14 +609,7 @@ void SettingsDialog::startPreview() {
   const int fpsDen = videoFps_->currentData(kRoleVideoFpsDen).toInt();
   if (path.isEmpty() || fourccStr.size() < 4 || w <= 0 || h <= 0) return;
 
-  uint32_t fourcc = 0;
-  const auto bytes = fourccStr.toLatin1();
-  if (bytes.size() >= 4) {
-    fourcc = static_cast<uint32_t>(static_cast<uint8_t>(bytes[0])) |
-             (static_cast<uint32_t>(static_cast<uint8_t>(bytes[1])) << 8) |
-             (static_cast<uint32_t>(static_cast<uint8_t>(bytes[2])) << 16) |
-             (static_cast<uint32_t>(static_cast<uint8_t>(bytes[3])) << 24);
-  }
+  uint32_t fourcc = fourccFromText(fourccStr);
 
   preview_ = std::make_unique<PreviewState>();
   preview_->cap = std::make_unique<video::V4L2Capture>();

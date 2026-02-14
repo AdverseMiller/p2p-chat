@@ -15,6 +15,7 @@ public:
     QString serverHost = "learn.fairuse.org";
     quint16 serverPort = 5555;
     QString keyPath;
+    QString keyPassword;
     QString selfName;
     quint16 listenPort = 0;
   };

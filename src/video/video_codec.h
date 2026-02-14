@@ -17,9 +17,14 @@ enum class Codec {
   VP8,
 };
 
+struct EncodedFrame;
+
 QString codecToString(Codec c);
 Codec codecFromString(const QString& s);
 bool isInputFourccSupported(uint32_t fourcc);
+std::optional<Codec> codecFromInputFourcc(uint32_t fourcc);
+bool isPassthroughCompatible(uint32_t fourcc, Codec networkCodec);
+bool passthroughFrame(const RawFrame& in, Codec networkCodec, EncodedFrame* out, QString* err = nullptr);
 
 struct I420Frame {
   int width = 0;

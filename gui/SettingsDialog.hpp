@@ -35,6 +35,7 @@ public:
 private:
   void rebuildDevices();
   void rebuildVideoDevices();
+  void rebuildVideoCodecs();
   void rebuildVideoFormats();
   void rebuildVideoSizes();
   void rebuildVideoFps();

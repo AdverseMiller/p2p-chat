@@ -75,6 +75,7 @@ QString Profile::chatPathForPeer(const QString& peerId) {
 Profile Profile::load(const QString& path, QString* errorOut) {
   Profile p;
   p.path_ = path;
+  const bool usingProfileStore = !qEnvironmentVariable("P2P_CHAT_PROFILE_NAME").trimmed().isEmpty();
 
   // Identity migration independent of profile existence:
   // if a legacy identity exists but the canonical one doesn't, copy it over before any key creation.
@@ -83,7 +84,7 @@ Profile Profile::load(const QString& path, QString* errorOut) {
   const auto legacy_cli_key =
       QDir(QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation)).filePath("p2p_chat/identity.pem");
 
-  if (!QFile::exists(canonicalKey)) {
+  if (!usingProfileStore && !QFile::exists(canonicalKey)) {
     const QString src = QFile::exists(legacy_cli_key) ? legacy_cli_key
                      : QFile::exists(legacy_gui_key) ? legacy_gui_key
                                                      : QString();
@@ -94,7 +95,7 @@ Profile Profile::load(const QString& path, QString* errorOut) {
   }
 
   // If both exist and differ, surface a warning (helps explain mismatched IDs).
-  if (QFile::exists(canonicalKey) && QFile::exists(legacy_cli_key)) {
+  if (!usingProfileStore && QFile::exists(canonicalKey) && QFile::exists(legacy_cli_key)) {
     QFile a(canonicalKey), b(legacy_cli_key);
     if (a.open(QIODevice::ReadOnly) && b.open(QIODevice::ReadOnly)) {
       const auto ha = QCryptographicHash::hash(a.readAll(), QCryptographicHash::Sha256);
@@ -107,7 +108,7 @@ Profile Profile::load(const QString& path, QString* errorOut) {
   }
 
   // Best-effort migration from legacy Qt AppConfigLocation to ~/.config/p2p-chat.
-  if (!QFile::exists(path)) {
+  if (!usingProfileStore && !QFile::exists(path)) {
     const auto legacyDir = legacyConfigDir();
     const auto legacyProfile = QDir(legacyDir).filePath("profile.json");
     if (QFile::exists(legacyProfile)) {
@@ -277,7 +278,7 @@ Profile Profile::load(const QString& path, QString* errorOut) {
 
   if (p.keyPath.isEmpty()) {
     p.keyPath = canonical;
-  } else if (is_legacy(p.keyPath)) {
+  } else if (!usingProfileStore && is_legacy(p.keyPath)) {
     // Prefer canonical if it exists; otherwise copy legacy into canonical.
     if (QFile::exists(canonical)) {
       p.keyPath = canonical;
@@ -288,6 +289,17 @@ Profile Profile::load(const QString& path, QString* errorOut) {
     } else if (QFile::exists(legacy_gui)) {
       QDir().mkpath(QFileInfo(canonical).absolutePath());
       (void)QFile::copy(legacy_gui, canonical);
+      p.keyPath = canonical;
+    }
+  }
+  if (usingProfileStore) {
+    const auto canonicalAbs = QFileInfo(canonical).absoluteFilePath();
+    const auto currentAbs = QFileInfo(p.keyPath).absoluteFilePath();
+    if (p.keyPath.isEmpty() || currentAbs != canonicalAbs) {
+      if (!QFile::exists(canonical) && QFile::exists(p.keyPath)) {
+        QDir().mkpath(QFileInfo(canonical).absolutePath());
+        (void)QFile::copy(p.keyPath, canonical);
+      }
       p.keyPath = canonical;
     }
   }

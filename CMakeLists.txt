@@ -160,6 +160,8 @@ if(Qt6Widgets_FOUND)
     gui/MainWindow.hpp
     gui/Profile.cpp
     gui/Profile.hpp
+    gui/ProfileLoginDialog.cpp
+    gui/ProfileLoginDialog.hpp
     gui/ChatBackend.cpp
     gui/ChatBackend.hpp
     gui/SettingsDialog.cpp

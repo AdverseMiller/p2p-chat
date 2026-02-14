@@ -429,7 +429,8 @@ bool verifyCanonicalJsonSignature(const QString& signerId, const QString& payloa
 }
 } // namespace
 
-MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
+MainWindow::MainWindow(QString keyPassword, QWidget* parent)
+    : QMainWindow(parent), keyPassword_(std::move(keyPassword)) {
   buildUi();
   loadProfile();
   webcamEnabled_ = false;
@@ -647,6 +648,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   opt.serverHost = profile_.serverHost;
   opt.serverPort = profile_.serverPort;
   opt.keyPath = profile_.keyPath;
+  opt.keyPassword = keyPassword_;
   opt.selfName = profile_.selfName;
   opt.listenPort = profile_.listenPort;
   backend_.start(opt);

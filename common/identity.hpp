@@ -19,12 +19,17 @@ namespace common {
 
 class Identity {
  public:
-  static std::shared_ptr<Identity> load_or_create(std::string path) {
+  static std::shared_ptr<Identity> load_or_create(std::string path, std::string password = {}) {
     auto id = std::shared_ptr<Identity>(new Identity());
     id->key_path_ = std::move(path);
-    if (!id->load_from_disk()) {
+    const std::string expanded = expand_user_path(id->key_path_);
+    const bool already_exists = std::filesystem::exists(std::filesystem::path(expanded));
+    if (!id->load_from_disk(password)) {
+      if (already_exists) {
+        throw std::runtime_error("failed to load identity key (wrong password or invalid key)");
+      }
       id->generate_new();
-      id->save_to_disk_best_effort();
+      id->save_to_disk_best_effort(password);
     }
     id->compute_public_id();
     return id;
@@ -106,11 +111,12 @@ class Identity {
     return path;
   }
 
-  bool load_from_disk() {
+  bool load_from_disk(const std::string& password) {
     const std::string p = expand_user_path(key_path_);
     FILE* f = std::fopen(p.c_str(), "rb");
     if (!f) return false;
-    EVP_PKEY* k = PEM_read_PrivateKey(f, nullptr, nullptr, nullptr);
+    void* pass_arg = password.empty() ? nullptr : const_cast<char*>(password.c_str());
+    EVP_PKEY* k = PEM_read_PrivateKey(f, nullptr, nullptr, pass_arg);
     std::fclose(f);
     if (!k) return false;
     pkey_.reset(k);
@@ -129,7 +135,7 @@ class Identity {
     pkey_.reset(k);
   }
 
-  void save_to_disk_best_effort() {
+  void save_to_disk_best_effort(const std::string& password) {
     const std::string p = expand_user_path(key_path_);
     std::filesystem::path fp(p);
     std::error_code ec;
@@ -137,7 +143,17 @@ class Identity {
 
     FILE* f = std::fopen(p.c_str(), "wb");
     if (!f) return;
-    (void)PEM_write_PrivateKey(f, pkey_.get(), nullptr, nullptr, 0, nullptr, nullptr);
+    if (password.empty()) {
+      (void)PEM_write_PrivateKey(f, pkey_.get(), nullptr, nullptr, 0, nullptr, nullptr);
+    } else {
+      (void)PEM_write_PKCS8PrivateKey(f,
+                                      pkey_.get(),
+                                      EVP_aes_256_cbc(),
+                                      const_cast<char*>(password.c_str()),
+                                      static_cast<int>(password.size()),
+                                      nullptr,
+                                      nullptr);
+    }
     std::fclose(f);
     std::filesystem::permissions(fp,
                                 std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,

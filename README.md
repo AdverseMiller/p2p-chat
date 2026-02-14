@@ -111,7 +111,24 @@ P2PCHAT_DEBUG=1 ./build/p2p_chat_gui
 ./build/p2p_chat_gui --debug
 ```
 
-The GUI defaults to `learn.fairuse.org:5555` as the rendezvous server (editable in the profile JSON for now).
+Profiles:
+- On startup, the GUI shows a profile picker (qTox-style): select existing profile or create a new one.
+- New profiles can be created with optional password protection (encrypts `identity.pem` at rest).
+- Legacy single-profile data in `~/.config/p2p-chat` is auto-migrated to `~/.config/p2p-chat/profiles/<name>/`.
+- Headless migration only:
+
+```bash
+QT_QPA_PLATFORM=offscreen ./build/p2p_chat_gui --migrate-profiles
+```
+
+CLI profile selection:
+
+```bash
+./build/p2p_chat --profile default
+./build/p2p_chat --profile secure --profile-password 'your-password'
+```
+
+Both GUI and CLI read profile data from the same profile directory and therefore share the same ID/key for that profile.
 
 Voice calls:
 - Requires Qt6 Multimedia + Opus.
@@ -119,7 +136,7 @@ Voice calls:
 
 IDs and names:
 - Each user has a cryptographic shareable ID (`Your ID:`) derived from their Ed25519 public key.
-- The GUI stores its identity key in the app config directory (see `profile.json` location), as `identity.pem`.
+- Each profile stores its identity key as `identity.pem` in its own profile directory.
 - Your name is only shared with peers after they accept your friend request and you establish a direct P2P connection.
 
 Encryption:

@@ -24,7 +24,7 @@ class QWidget;
 class MainWindow : public QMainWindow {
   Q_OBJECT
 public:
-  explicit MainWindow(QWidget* parent = nullptr);
+  explicit MainWindow(QString keyPassword = {}, QWidget* parent = nullptr);
   ~MainWindow() override;
 
 private:
@@ -110,6 +110,7 @@ private:
   void refreshVideoPanel();
 
   Profile profile_;
+  QString keyPassword_;
   ChatBackend backend_;
 
   QTabWidget* leftTabs_ = nullptr;

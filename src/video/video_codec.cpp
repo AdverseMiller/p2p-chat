@@ -15,6 +15,8 @@ extern "C" {
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <span>
+#include <string>
 
 namespace video {
 
@@ -39,6 +41,12 @@ struct Encoder::Impl {};
 struct Decoder::Impl {};
 
 bool isInputFourccSupported(uint32_t) { return false; }
+std::optional<Codec> codecFromInputFourcc(uint32_t) { return std::nullopt; }
+bool isPassthroughCompatible(uint32_t, Codec) { return false; }
+bool passthroughFrame(const RawFrame&, Codec, EncodedFrame*, QString* err) {
+  if (err) *err = "video codec unavailable on this build";
+  return false;
+}
 bool convertRawFrameToI420(const RawFrame&, I420Frame*, QString* err) {
   if (err) *err = "video codec unavailable on this build";
   return false;
@@ -281,6 +289,33 @@ const AVCodec* decoder_for_codec(Codec codec) {
   return avcodec_find_decoder(AV_CODEC_ID_VP8);
 }
 
+std::optional<Codec> codec_from_avcodec(AVCodecID codec) {
+  if (codec == AV_CODEC_ID_H264) return Codec::H264;
+  if (codec == AV_CODEC_ID_VP8) return Codec::VP8;
+  return std::nullopt;
+}
+
+bool has_h264_idr(std::span<const uint8_t> data) {
+  const auto n = data.size();
+  for (size_t i = 0; i + 4 < n; ++i) {
+    size_t start = std::string::npos;
+    if (i + 3 < n && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
+      start = i + 3;
+    } else if (i + 4 < n && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1) {
+      start = i + 4;
+    }
+    if (start == std::string::npos || start >= n) continue;
+    const uint8_t nal = data[start] & 0x1Fu;
+    if (nal == 5 || nal == 7 || nal == 8) return true;
+  }
+  return false;
+}
+
+bool is_vp8_keyframe(std::span<const uint8_t> data) {
+  if (data.empty()) return false;
+  return (data[0] & 0x01u) == 0u;
+}
+
 QImage avframe_to_qimage(const AVFrame* frame) {
   if (!frame || frame->width <= 0 || frame->height <= 0) return {};
   SwsContext* sws = sws_getContext(frame->width, frame->height, static_cast<AVPixelFormat>(frame->format),
@@ -316,6 +351,37 @@ struct Decoder::Impl {
 
 bool isInputFourccSupported(uint32_t fourcc) {
   return fourcc_to_compressed_codec(fourcc).has_value() || fourcc_to_pixfmt(fourcc) != AV_PIX_FMT_NONE;
+}
+
+std::optional<Codec> codecFromInputFourcc(uint32_t fourcc) {
+  const auto compressed = fourcc_to_compressed_codec(fourcc);
+  if (!compressed) return std::nullopt;
+  return codec_from_avcodec(*compressed);
+}
+
+bool isPassthroughCompatible(uint32_t fourcc, Codec networkCodec) {
+  const auto c = codecFromInputFourcc(fourcc);
+  return c.has_value() && c.value() == networkCodec;
+}
+
+bool passthroughFrame(const RawFrame& in, Codec networkCodec, EncodedFrame* out, QString* err) {
+  if (!out) {
+    if (err) *err = "null output";
+    return false;
+  }
+  if (!isPassthroughCompatible(in.fourcc, networkCodec)) {
+    if (err) *err = "capture format does not match selected passthrough codec";
+    return false;
+  }
+  out->bytes = in.bytes;
+  out->ptsMs = in.monotonicUs / 1000ull;
+  std::span<const uint8_t> span(out->bytes.data(), out->bytes.size());
+  if (networkCodec == Codec::H264) {
+    out->keyframe = has_h264_idr(span);
+  } else {
+    out->keyframe = is_vp8_keyframe(span);
+  }
+  return true;
 }
 
 bool convertRawFrameToI420(const RawFrame& in, I420Frame* out, QString* err) {
