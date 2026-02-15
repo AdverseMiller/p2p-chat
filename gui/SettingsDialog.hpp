@@ -19,16 +19,19 @@ class SettingsDialog final : public QDialog {
 public:
   explicit SettingsDialog(const Profile::AudioSettings& initial,
                           const Profile::VideoSettings& video_initial,
+                          const Profile::ScreenSettings& screen_initial,
                           bool share_identity_non_friends,
                           QWidget* parent = nullptr);
   ~SettingsDialog() override;
 
   Profile::AudioSettings settings() const;
   Profile::VideoSettings videoSettings() const;
+  Profile::ScreenSettings screenSettings() const;
   bool shareIdentityWithNonFriends() const;
 
   static bool edit(Profile::AudioSettings* inOut,
                    Profile::VideoSettings* video_in_out,
+                   Profile::ScreenSettings* screen_in_out,
                    bool* share_identity_non_friends,
                    QWidget* parent = nullptr);
 
@@ -45,6 +48,7 @@ private:
 
   Profile::AudioSettings initial_;
   Profile::VideoSettings videoInitial_;
+  Profile::ScreenSettings screenInitial_;
 
   QLabel* unavailableLabel_ = nullptr;
   QLabel* deviceWarningLabel_ = nullptr;
@@ -54,6 +58,7 @@ private:
   QSlider* spkVol_ = nullptr;
   QSpinBox* bitrate_ = nullptr;
   QComboBox* frameMs_ = nullptr;
+  QComboBox* channels_ = nullptr;
   QCheckBox* shareIdentityCheck_ = nullptr;
 
   // Video tab
@@ -66,6 +71,11 @@ private:
   QLabel* previewLabel_ = nullptr;
   QPushButton* previewBtn_ = nullptr;
   QTimer* previewUiTimer_ = nullptr;
+
+  // Screen tab
+  QComboBox* screenResolution_ = nullptr;
+  QComboBox* screenFps_ = nullptr;
+  QSpinBox* screenBitrate_ = nullptr;
 
   class PreviewState;
   std::unique_ptr<PreviewState> preview_;

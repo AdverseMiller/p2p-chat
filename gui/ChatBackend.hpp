@@ -27,6 +27,7 @@ public:
     int speakerVolume = 100;  // 0..100
     int bitrate = 32000;      // bps
     int frameMs = 20;         // 10 or 20
+    int channels = 1;         // 1 (mono) or 2 (stereo)
     QString videoDevicePath;
     QString videoFourcc;      // "MJPG"/"YUYV"/...
     int videoWidth = 640;
@@ -59,6 +60,7 @@ public:
 
   void setFriendAccepted(const QString& peerId, bool accepted);
   void setServerMembers(const QStringList& peerIds);
+  void setPeerMuted(const QString& peerId, bool muted);
 
   // Voice calls (Opus over UDP hole-punching). Only one active call at a time.
   void startCall(const QString& peerId, const VoiceSettings& settings);

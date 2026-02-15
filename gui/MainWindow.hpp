@@ -4,6 +4,7 @@
 #include "gui/Profile.hpp"
 
 #include <QMainWindow>
+#include <QImage>
 #include <QMap>
 #include <QPointer>
 #include <QSet>
@@ -20,12 +21,14 @@ class QJsonObject;
 class QStackedWidget;
 class QTimer;
 class QWidget;
+class QResizeEvent;
 
 class MainWindow : public QMainWindow {
   Q_OBJECT
 public:
   explicit MainWindow(QString keyPassword = {}, QWidget* parent = nullptr);
   ~MainWindow() override;
+  void resizeEvent(QResizeEvent* event) override;
 
 private:
   void buildUi();
@@ -98,6 +101,12 @@ private:
   void sendFriendRequestToId(const QString& id);
   void showChatContextMenu(const QPoint& pos);
   void showServerMemberContextMenu(const QPoint& pos);
+  void showServerPeerContextMenu(const QString& peerId,
+                                 const QString& serverId,
+                                 const QPoint& globalPos,
+                                 bool allowProfile = true);
+  bool isVoiceMuted(const QString& peerId) const;
+  void setVoiceMuted(const QString& peerId, bool muted);
   void showProfilePopup(const QString& peerId);
   void clearChatFor(const QString& peerId);
   void removeFriend(const QString& peerId);
@@ -130,15 +139,18 @@ private:
   QLabel* headerLabel_ = nullptr;
   QPushButton* callBtn_ = nullptr;
   QPushButton* webcamBtn_ = nullptr;
+  QPushButton* screenShareBtn_ = nullptr;
+  QPushButton* exitExpandedBtn_ = nullptr;
   QStackedWidget* chatStack_ = nullptr;
   QTextBrowser* chatView_ = nullptr;
   QListWidget* voiceGallery_ = nullptr;
   QWidget* videoPanel_ = nullptr;
-  QLabel* remoteVideoLabel_ = nullptr;
-  QLabel* localVideoLabel_ = nullptr;
+  QListWidget* videoTiles_ = nullptr;
   QString remoteVideoPeerId_;
   bool remoteVideoActive_ = false;
   bool localVideoActive_ = false;
+  QImage localVideoFrame_;
+  QMap<QString, QImage> remoteVideoFrames_;
   QLineEdit* input_ = nullptr;
   QListWidget* serverMembersList_ = nullptr;
 
@@ -157,6 +169,7 @@ private:
   QMap<QString, bool> rendezvousOnline_;
   QMap<QString, bool> directOnline_;
   QSet<QString> pendingJoinOwners_;
+  QSet<QString> mutedVoicePeerIds_;
 
   QAction* darkModeAction_ = nullptr;
   QTimer* voicePresenceTimer_ = nullptr;
@@ -164,4 +177,7 @@ private:
   QString activeCallPeer_;
   QString activeCallState_;
   bool webcamEnabled_ = false;
+  bool screenShareEnabled_ = false;
+  QString screenShareDisplayName_;
+  QString expandedVideoPeerId_;
 };

@@ -78,6 +78,7 @@ public:
     int speakerVolume = 100;  // 0..100
     int bitrate = 32000;      // bps (Opus target)
     int frameMs = 20;         // 10 or 20
+    int channels = 1;         // 1 (mono) or 2 (stereo)
   };
 
   struct VideoSettings {
@@ -91,6 +92,15 @@ public:
     int bitrateKbps = 1500;
   };
 
+  struct ScreenSettings {
+    int width = 0;     // 0 => native display resolution
+    int height = 0;    // 0 => native display resolution
+    int fpsNum = 1;    // denominator-style (fps = den / num)
+    int fpsDen = 15;
+    int bitrateKbps = 2500;
+    QString lastDisplayName;
+  };
+
   QString keyPath;          // identity pem path
   QString selfName;         // last used name
   QString selfAvatarPath;   // local avatar path (png)
@@ -101,8 +111,10 @@ public:
   quint16 externalPort = 0;
   bool darkMode = false;
   bool shareIdentityWithNonFriendsInServers = false;
+  QVector<QString> mutedVoicePeerIds;
   AudioSettings audio;
   VideoSettings video;
+  ScreenSettings screen;
 
   QVector<FriendEntry> friends;
   QVector<ServerEntry> servers;

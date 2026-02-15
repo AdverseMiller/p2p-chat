@@ -14,7 +14,6 @@ namespace video {
 
 enum class Codec {
   H264,
-  VP8,
 };
 
 struct EncodedFrame;
@@ -54,6 +53,7 @@ struct EncodeParams {
 };
 
 bool convertRawFrameToI420(const RawFrame& in, I420Frame* out, QString* err = nullptr);
+bool qimageToI420(const QImage& in, I420Frame* out, QString* err = nullptr);
 QImage i420ToQImage(const I420Frame& in);
 
 class Encoder {

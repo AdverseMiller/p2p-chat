@@ -158,6 +158,15 @@ Profile Profile::load(const QString& path, QString* errorOut) {
   p.externalPort = static_cast<quint16>(root.value("externalPort").toInt(0));
   p.darkMode = root.value("darkMode").toBool(false);
   p.shareIdentityWithNonFriendsInServers = root.value("shareIdentityWithNonFriendsInServers").toBool(false);
+  if (root.value("mutedVoicePeerIds").isArray()) {
+    const auto muted = root.value("mutedVoicePeerIds").toArray();
+    for (const auto& v : muted) {
+      if (!v.isString()) continue;
+      const auto id = v.toString();
+      if (id.isEmpty()) continue;
+      p.mutedVoicePeerIds.push_back(id);
+    }
+  }
 
   if (root.value("audio").isObject()) {
     const auto a = root.value("audio").toObject();
@@ -167,7 +176,9 @@ Profile Profile::load(const QString& path, QString* errorOut) {
     p.audio.speakerVolume = a.value("speakerVolume").toInt(p.audio.speakerVolume);
     p.audio.bitrate = a.value("bitrate").toInt(p.audio.bitrate);
     p.audio.frameMs = a.value("frameMs").toInt(p.audio.frameMs);
+    p.audio.channels = a.value("channels").toInt(p.audio.channels);
     if (p.audio.frameMs != 10 && p.audio.frameMs != 20) p.audio.frameMs = 20;
+    if (p.audio.channels != 1 && p.audio.channels != 2) p.audio.channels = 1;
     p.audio.micVolume = std::clamp(p.audio.micVolume, 0, 100);
     p.audio.speakerVolume = std::clamp(p.audio.speakerVolume, 0, 100);
     if (p.audio.bitrate < 8000) p.audio.bitrate = 8000;
@@ -190,7 +201,27 @@ Profile Profile::load(const QString& path, QString* errorOut) {
     if (p.video.fpsDen <= 0) p.video.fpsDen = 30;
     if (p.video.bitrateKbps < 100) p.video.bitrateKbps = 100;
     if (p.video.bitrateKbps > 20000) p.video.bitrateKbps = 20000;
-    if (p.video.codec.isEmpty()) p.video.codec = "h264";
+    p.video.codec = "h264";
+  }
+
+  if (root.value("screen").isObject()) {
+    const auto s = root.value("screen").toObject();
+    p.screen.width = s.value("width").toInt(p.screen.width);
+    p.screen.height = s.value("height").toInt(p.screen.height);
+    p.screen.fpsNum = s.value("fpsNum").toInt(p.screen.fpsNum);
+    p.screen.fpsDen = s.value("fpsDen").toInt(p.screen.fpsDen);
+    p.screen.bitrateKbps = s.value("bitrateKbps").toInt(p.screen.bitrateKbps);
+    p.screen.lastDisplayName = s.value("lastDisplayName").toString(p.screen.lastDisplayName);
+    if (p.screen.width < 0) p.screen.width = 0;
+    if (p.screen.height < 0) p.screen.height = 0;
+    if (p.screen.width == 0 || p.screen.height == 0) {
+      p.screen.width = 0;
+      p.screen.height = 0;
+    }
+    if (p.screen.fpsNum <= 0) p.screen.fpsNum = 1;
+    if (p.screen.fpsDen <= 0) p.screen.fpsDen = 15;
+    if (p.screen.bitrateKbps < 100) p.screen.bitrateKbps = 100;
+    if (p.screen.bitrateKbps > 20000) p.screen.bitrateKbps = 20000;
   }
 
   const auto arr = root.value("friends").toArray();
@@ -325,6 +356,14 @@ bool Profile::save(QString* errorOut) const {
   root["externalPort"] = static_cast<int>(externalPort);
   root["darkMode"] = darkMode;
   root["shareIdentityWithNonFriendsInServers"] = shareIdentityWithNonFriendsInServers;
+  {
+    QJsonArray muted;
+    for (const auto& id : mutedVoicePeerIds) {
+      if (id.isEmpty()) continue;
+      muted.push_back(id);
+    }
+    root["mutedVoicePeerIds"] = muted;
+  }
 
   {
     QJsonObject a;
@@ -334,6 +373,7 @@ bool Profile::save(QString* errorOut) const {
     a["speakerVolume"] = audio.speakerVolume;
     a["bitrate"] = audio.bitrate;
     a["frameMs"] = audio.frameMs;
+    a["channels"] = (audio.channels == 2) ? 2 : 1;
     root["audio"] = a;
   }
 
@@ -348,6 +388,17 @@ bool Profile::save(QString* errorOut) const {
     v["codec"] = video.codec;
     v["bitrateKbps"] = video.bitrateKbps;
     root["video"] = v;
+  }
+
+  {
+    QJsonObject s;
+    s["width"] = screen.width;
+    s["height"] = screen.height;
+    s["fpsNum"] = screen.fpsNum;
+    s["fpsDen"] = screen.fpsDen;
+    s["bitrateKbps"] = screen.bitrateKbps;
+    s["lastDisplayName"] = screen.lastDisplayName;
+    root["screen"] = s;
   }
 
   QJsonArray arr;

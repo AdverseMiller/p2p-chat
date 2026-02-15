@@ -65,21 +65,10 @@ uint32_t fourccFromText(const QString& s) {
 
 QString codecDescription(const QString& key) {
   const auto v = key.trimmed().toLower();
-  if (v == "passthrough") {
-    return "Passthrough sends camera-compressed H.264/VP8 frames directly over the network without re-encoding.\n"
-           "Lowest CPU use and latency, but only works when the selected camera pixel format already matches "
-           "the negotiated network codec (H.264 or VP8).";
-  }
-  if (v == "vp8") {
-    return "VP8 re-encodes camera frames to VP8 for network transport.\n"
-           "More CPU use than passthrough, but works with most camera pixel formats.";
-  }
+  (void)v;
   return "H.264 re-encodes camera frames to H.264 for network transport.\n"
-         "Best default compatibility and quality/bitrate efficiency across peers.";
-}
-
-bool wantsPassthrough(const QString& codecKey) {
-  return codecKey.trimmed().compare("passthrough", Qt::CaseInsensitive) == 0;
+         "Best default compatibility and quality/bitrate efficiency across peers.\n"
+         "When the selected pixel format already outputs H.264, passthrough is used automatically (preferred).";
 }
 
 #if defined(P2PCHAT_VOICE) && !defined(_WIN32)
@@ -105,9 +94,10 @@ SettingsDialog::~SettingsDialog() = default;
 
 SettingsDialog::SettingsDialog(const Profile::AudioSettings& initial,
                                const Profile::VideoSettings& video_initial,
+                               const Profile::ScreenSettings& screen_initial,
                                bool share_identity_non_friends,
                                QWidget* parent)
-    : QDialog(parent), initial_(initial), videoInitial_(video_initial) {
+    : QDialog(parent), initial_(initial), videoInitial_(video_initial), screenInitial_(screen_initial) {
   setWindowTitle("Settings");
   setMinimumWidth(500);
 
@@ -155,6 +145,9 @@ SettingsDialog::SettingsDialog(const Profile::AudioSettings& initial,
   frameMs_ = new QComboBox(audioTab);
   frameMs_->addItem("10 ms", 10);
   frameMs_->addItem("20 ms", 20);
+  channels_ = new QComboBox(audioTab);
+  channels_->addItem("Mono", 1);
+  channels_->addItem("Stereo", 2);
 
   form->addRow("Input device:", inputDevice_);
   form->addRow("Output device:", outputDevice_);
@@ -162,6 +155,7 @@ SettingsDialog::SettingsDialog(const Profile::AudioSettings& initial,
   form->addRow("Speaker volume:", spkVol_);
   form->addRow("Bitrate:", bitrate_);
   form->addRow("Frame size:", frameMs_);
+  form->addRow("Channels:", channels_);
 
   audioRoot->addLayout(form);
 
@@ -172,6 +166,13 @@ SettingsDialog::SettingsDialog(const Profile::AudioSettings& initial,
   for (int i = 0; i < frameMs_->count(); ++i) {
     if (frameMs_->itemData(i).toInt() == wantFrame) {
       frameMs_->setCurrentIndex(i);
+      break;
+    }
+  }
+  const int wantChannels = (initial_.channels == 2) ? 2 : 1;
+  for (int i = 0; i < channels_->count(); ++i) {
+    if (channels_->itemData(i).toInt() == wantChannels) {
+      channels_->setCurrentIndex(i);
       break;
     }
   }
@@ -241,7 +242,77 @@ SettingsDialog::SettingsDialog(const Profile::AudioSettings& initial,
 
   rebuildVideoDevices();
   rebuildVideoCodecs();
-  tabs->addTab(videoTab, "Video");
+  tabs->addTab(videoTab, "Webcam");
+
+  auto* screenTab = new QWidget(tabs);
+  auto* screenRoot = new QVBoxLayout(screenTab);
+  screenRoot->setContentsMargins(8, 8, 8, 8);
+  auto* sform = new QFormLayout();
+  screenResolution_ = new QComboBox(screenTab);
+  screenFps_ = new QComboBox(screenTab);
+  screenBitrate_ = new QSpinBox(screenTab);
+  screenBitrate_->setRange(100, 20000);
+  screenBitrate_->setSuffix(" kbps");
+  screenBitrate_->setValue(screenInitial_.bitrateKbps);
+
+  auto addRes = [this](const QString& label, int w, int h) {
+    if (!screenResolution_) return;
+    screenResolution_->addItem(label);
+    const int idx = screenResolution_->count() - 1;
+    screenResolution_->setItemData(idx, w, kRoleVideoW);
+    screenResolution_->setItemData(idx, h, kRoleVideoH);
+  };
+  addRes("Native (display resolution)", 0, 0);
+  addRes("3840x2160", 3840, 2160);
+  addRes("2560x1440", 2560, 1440);
+  addRes("1920x1080", 1920, 1080);
+  addRes("1600x900", 1600, 900);
+  addRes("1366x768", 1366, 768);
+  addRes("1280x720", 1280, 720);
+  addRes("1024x576", 1024, 576);
+
+  auto addFps = [this](int fps) {
+    if (!screenFps_ || fps <= 0) return;
+    screenFps_->addItem(QString::number(fps) + " fps");
+    const int idx = screenFps_->count() - 1;
+    screenFps_->setItemData(idx, 1, kRoleVideoFpsNum);
+    screenFps_->setItemData(idx, fps, kRoleVideoFpsDen);
+  };
+  addFps(5);
+  addFps(10);
+  addFps(15);
+  addFps(20);
+  addFps(30);
+  addFps(60);
+
+  int resPick = 0;
+  for (int i = 0; i < screenResolution_->count(); ++i) {
+    const int w = screenResolution_->itemData(i, kRoleVideoW).toInt();
+    const int h = screenResolution_->itemData(i, kRoleVideoH).toInt();
+    if (w == screenInitial_.width && h == screenInitial_.height) {
+      resPick = i;
+      break;
+    }
+  }
+  screenResolution_->setCurrentIndex(resPick);
+
+  int fpsPick = 0;
+  for (int i = 0; i < screenFps_->count(); ++i) {
+    const int num = screenFps_->itemData(i, kRoleVideoFpsNum).toInt();
+    const int den = screenFps_->itemData(i, kRoleVideoFpsDen).toInt();
+    if (num == screenInitial_.fpsNum && den == screenInitial_.fpsDen) {
+      fpsPick = i;
+      break;
+    }
+  }
+  screenFps_->setCurrentIndex(fpsPick);
+
+  sform->addRow("Resolution:", screenResolution_);
+  sform->addRow("FPS:", screenFps_);
+  sform->addRow("Bitrate:", screenBitrate_);
+  screenRoot->addLayout(sform);
+  screenRoot->addStretch(1);
+  tabs->addTab(screenTab, "Screen");
 
   auto* privacyTab = new QWidget(tabs);
   auto* privacyRoot = new QVBoxLayout(privacyTab);
@@ -380,41 +451,11 @@ void SettingsDialog::rebuildVideoDevices() {
 void SettingsDialog::rebuildVideoCodecs() {
   if (!videoCodec_ || !videoDevice_) return;
   const QSignalBlocker block(videoCodec_);
-  const QString current = videoCodec_->currentData().toString().trimmed().toLower();
-  const QString wanted = !current.isEmpty() ? current : videoInitial_.codec.trimmed().toLower();
-  const QString path = videoDevice_->currentData().toString();
-
-  bool hasH264Passthrough = false;
-  bool hasVp8Passthrough = false;
-  if (!path.isEmpty()) {
-    const auto caps = video::queryDeviceCaps(path);
-    for (const auto& fmt : caps.formats) {
-      const auto c = video::codecFromInputFourcc(fmt.fourcc);
-      if (!c.has_value()) continue;
-      if (c.value() == video::Codec::H264) hasH264Passthrough = true;
-      if (c.value() == video::Codec::VP8) hasVp8Passthrough = true;
-    }
-  }
+  const QString wanted = "h264";
 
   videoCodec_->clear();
-  videoCodec_->addItem("H264 (re-encode)", "h264");
+  videoCodec_->addItem("H264", "h264");
   videoCodec_->setItemData(videoCodec_->count() - 1, codecDescription("h264"), Qt::ToolTipRole);
-  videoCodec_->addItem("VP8 (re-encode)", "vp8");
-  videoCodec_->setItemData(videoCodec_->count() - 1, codecDescription("vp8"), Qt::ToolTipRole);
-  const QString passLabel = (hasH264Passthrough || hasVp8Passthrough)
-                                ? QString("Passthrough (camera bitstream)")
-                                : QString("Passthrough (fallback to re-encode)");
-  videoCodec_->addItem(passLabel, "passthrough");
-  QString passTip = codecDescription("passthrough");
-  if (hasH264Passthrough || hasVp8Passthrough) {
-    passTip += "\nDetected passthrough formats: " +
-               QString("%1%2")
-                   .arg(hasH264Passthrough ? "H.264" : "")
-                   .arg(hasVp8Passthrough ? (hasH264Passthrough ? ", VP8" : "VP8") : "");
-  } else {
-    passTip += "\nThis camera did not report H.264/VP8 capture output; the app will fall back to software encode.";
-  }
-  videoCodec_->setItemData(videoCodec_->count() - 1, passTip, Qt::ToolTipRole);
 
   int pick = 0;
   for (int i = 0; i < videoCodec_->count(); ++i) {
@@ -433,22 +474,22 @@ void SettingsDialog::rebuildVideoFormats() {
   videoFormat_->clear();
   const auto path = videoDevice_->currentData().toString();
   const auto selectedCodec = videoCodec_->currentData().toString().trimmed().toLower();
+  const auto selectedNetworkCodec = video::codecFromString(selectedCodec);
   if (path.isEmpty()) {
     rebuildVideoSizes();
     return;
   }
   const auto caps = video::queryDeviceCaps(path);
   bool addedSupported = false;
-  bool passthroughOnly = wantsPassthrough(selectedCodec);
   for (const auto& fmt : caps.formats) {
     if (!video::isInputFourccSupported(fmt.fourcc)) continue;
     const auto fmtCodec = video::codecFromInputFourcc(fmt.fourcc);
-    if (passthroughOnly && !fmtCodec.has_value()) continue;
     QString label = QString("%1 (%2)").arg(fmt.fourccStr, fmt.description);
     if (fmtCodec.has_value()) {
       label += QString(" [direct %1]").arg(video::codecToString(fmtCodec.value()).toUpper());
-    } else if (passthroughOnly) {
-      label += " [re-encode fallback]";
+      if (video::isPassthroughCompatible(fmt.fourcc, selectedNetworkCodec)) {
+        label += " (preferred)";
+      }
     }
     videoFormat_->addItem(label, fmt.fourccStr);
     videoFormat_->setItemData(videoFormat_->count() - 1, static_cast<quint32>(fmt.fourcc), kRoleVideoFourcc);
@@ -456,23 +497,7 @@ void SettingsDialog::rebuildVideoFormats() {
   }
   if (!addedSupported) {
     for (const auto& fmt : caps.formats) {
-      if (passthroughOnly && !video::codecFromInputFourcc(fmt.fourcc).has_value()) continue;
       videoFormat_->addItem(QString("%1 (%2, unsupported)").arg(fmt.fourccStr, fmt.description), fmt.fourccStr);
-      videoFormat_->setItemData(videoFormat_->count() - 1, static_cast<quint32>(fmt.fourcc), kRoleVideoFourcc);
-    }
-  }
-  if (!addedSupported && videoFormat_->count() == 0 && passthroughOnly) {
-    // Fall back to all supported formats when passthrough is unavailable on this camera.
-    for (const auto& fmt : caps.formats) {
-      if (!video::isInputFourccSupported(fmt.fourcc)) continue;
-      const auto fmtCodec = video::codecFromInputFourcc(fmt.fourcc);
-      QString label = QString("%1 (%2)").arg(fmt.fourccStr, fmt.description);
-      if (fmtCodec.has_value()) {
-        label += QString(" [direct %1]").arg(video::codecToString(fmtCodec.value()).toUpper());
-      } else {
-        label += " [re-encode fallback]";
-      }
-      videoFormat_->addItem(label, fmt.fourccStr);
       videoFormat_->setItemData(videoFormat_->count() - 1, static_cast<quint32>(fmt.fourcc), kRoleVideoFourcc);
     }
   }
@@ -494,16 +519,13 @@ void SettingsDialog::rebuildVideoFormats() {
       }
     }
   }
-  if (pick < 0 && passthroughOnly) {
-    for (const auto wantedCodec : {video::Codec::H264, video::Codec::VP8}) {
-      for (int i = 0; i < videoFormat_->count(); ++i) {
-        const uint32_t fourcc = static_cast<uint32_t>(videoFormat_->itemData(i, kRoleVideoFourcc).toUInt());
-        if (video::isPassthroughCompatible(fourcc, wantedCodec)) {
-          pick = i;
-          break;
-        }
+  if (pick < 0) {
+    for (int i = 0; i < videoFormat_->count(); ++i) {
+      const uint32_t fourcc = static_cast<uint32_t>(videoFormat_->itemData(i, kRoleVideoFourcc).toUInt());
+      if (video::isPassthroughCompatible(fourcc, selectedNetworkCodec)) {
+        pick = i;
+        break;
       }
-      if (pick >= 0) break;
     }
   }
   if (pick < 0 && videoFormat_->count() > 0) pick = 0;
@@ -700,7 +722,9 @@ Profile::AudioSettings SettingsDialog::settings() const {
   if (spkVol_) s.speakerVolume = spkVol_->value();
   if (bitrate_) s.bitrate = bitrate_->value();
   if (frameMs_) s.frameMs = frameMs_->currentData().toInt();
+  if (channels_) s.channels = channels_->currentData().toInt();
   if (s.frameMs != 10 && s.frameMs != 20) s.frameMs = 20;
+  if (s.channels != 1 && s.channels != 2) s.channels = 1;
   return s;
 #endif
 }
@@ -731,7 +755,39 @@ Profile::VideoSettings SettingsDialog::videoSettings() const {
   if (s.height < 16) s.height = 16;
   if (s.fpsNum <= 0) s.fpsNum = 1;
   if (s.fpsDen <= 0) s.fpsDen = 30;
-  if (s.codec.isEmpty()) s.codec = "h264";
+  s.codec = "h264";
+  return s;
+}
+
+Profile::ScreenSettings SettingsDialog::screenSettings() const {
+  Profile::ScreenSettings s = screenInitial_;
+  if (screenResolution_) {
+    bool okW = false;
+    const int width = screenResolution_->currentData(kRoleVideoW).toInt(&okW);
+    if (okW) s.width = width;
+    bool okH = false;
+    const int height = screenResolution_->currentData(kRoleVideoH).toInt(&okH);
+    if (okH) s.height = height;
+    if (s.width < 0) s.width = 0;
+    if (s.height < 0) s.height = 0;
+    if (s.width == 0 || s.height == 0) {
+      s.width = 0;
+      s.height = 0;
+    }
+  }
+  if (screenFps_) {
+    bool okNum = false;
+    const int fpsNum = screenFps_->currentData(kRoleVideoFpsNum).toInt(&okNum);
+    if (okNum) s.fpsNum = fpsNum;
+    bool okDen = false;
+    const int fpsDen = screenFps_->currentData(kRoleVideoFpsDen).toInt(&okDen);
+    if (okDen) s.fpsDen = fpsDen;
+  }
+  if (screenBitrate_) s.bitrateKbps = screenBitrate_->value();
+  if (s.fpsNum <= 0) s.fpsNum = 1;
+  if (s.fpsDen <= 0) s.fpsDen = 15;
+  if (s.bitrateKbps < 100) s.bitrateKbps = 100;
+  if (s.bitrateKbps > 20000) s.bitrateKbps = 20000;
   return s;
 }
 
@@ -741,13 +797,15 @@ bool SettingsDialog::shareIdentityWithNonFriends() const {
 
 bool SettingsDialog::edit(Profile::AudioSettings* inOut,
                           Profile::VideoSettings* video_in_out,
+                          Profile::ScreenSettings* screen_in_out,
                           bool* share_identity_non_friends,
                           QWidget* parent) {
-  if (!inOut || !video_in_out || !share_identity_non_friends) return false;
-  SettingsDialog dlg(*inOut, *video_in_out, *share_identity_non_friends, parent);
+  if (!inOut || !video_in_out || !screen_in_out || !share_identity_non_friends) return false;
+  SettingsDialog dlg(*inOut, *video_in_out, *screen_in_out, *share_identity_non_friends, parent);
   if (dlg.exec() != QDialog::Accepted) return false;
   *inOut = dlg.settings();
   *video_in_out = dlg.videoSettings();
+  *screen_in_out = dlg.screenSettings();
   *share_identity_non_friends = dlg.shareIdentityWithNonFriends();
   return true;
 }
