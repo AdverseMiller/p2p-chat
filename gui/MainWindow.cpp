@@ -3103,6 +3103,26 @@ void MainWindow::maybeSyncVoiceCallForJoinedChannel() {
     return;
   }
 
+  // Keep an existing voice-channel peer call stable while that peer is still present.
+  // This avoids dropping an active 1<->1 stream just because another member joins.
+  if (!activeCallPeer_.isEmpty() && peers.contains(activeCallPeer_)) {
+    if (!activeCallState_.isEmpty()) return;
+    if (selfId_ >= activeCallPeer_) {
+      refreshCallButton();
+      return;
+    }
+    activeCallState_ = "calling";
+    refreshCallButton();
+    backend_.startCall(activeCallPeer_,
+                       voiceSettingsFromProfile(profile_.audio,
+                                                profile_.video,
+                                                profile_.screen,
+                                                webcamEnabled_,
+                                                screenShareEnabled_,
+                                                screenShareDisplayName_));
+    return;
+  }
+
   QStringList sortedPeers;
   for (const auto& p : peers) sortedPeers.push_back(p);
   std::sort(sortedPeers.begin(), sortedPeers.end());
