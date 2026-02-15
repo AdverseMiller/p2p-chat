@@ -22,6 +22,7 @@ class QStackedWidget;
 class QTimer;
 class QWidget;
 class QResizeEvent;
+class QNetworkAccessManager;
 
 class MainWindow : public QMainWindow {
   Q_OBJECT
@@ -110,6 +111,7 @@ private:
   void setPeerVideoWatching(const QString& peerId, bool watching);
   void setVoiceMuted(const QString& peerId, bool muted);
   void showProfilePopup(const QString& peerId);
+  void showGifPopup();
   void clearChatFor(const QString& peerId);
   void removeFriend(const QString& peerId);
   void kickServerMember(const QString& serverId, const QString& memberId);
@@ -119,6 +121,8 @@ private:
   void refreshSelfProfileWidget();
   void refreshCallButton();
   void refreshVideoPanel();
+  void maybeFetchGifPreviewsFromText(const QString& text);
+  void ensureGifPreview(const QString& gifUrl);
 
   Profile profile_;
   QString keyPassword_;
@@ -177,6 +181,10 @@ private:
 
   QAction* darkModeAction_ = nullptr;
   QTimer* voicePresenceTimer_ = nullptr;
+  QNetworkAccessManager* gifPreviewNet_ = nullptr;
+  QSet<QString> pendingGifPreviewUrls_;
+  QSet<QString> readyGifPreviewUrls_;
+  QMap<QString, QString> gifLocalUrlByRemote_;
 
   QString activeCallPeer_;
   QString activeCallState_;

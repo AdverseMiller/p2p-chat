@@ -8,6 +8,7 @@
 #include <QBuffer>
 #include <QClipboard>
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QDateTime>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -34,9 +35,14 @@
 #include <QMenuBar>
 #include <QMenu>
 #include <QMessageBox>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QPalette>
 #include <QColor>
 #include <QPushButton>
+#include <QRegularExpression>
+#include <QScrollBar>
 #include <QSizePolicy>
 #include <QStatusBar>
 #include <QStyleFactory>
@@ -48,6 +54,8 @@
 #include <QTextBrowser>
 #include <QTimer>
 #include <QUrl>
+#include <QUrlQuery>
+#include <QStandardPaths>
 #include <QUuid>
 #include <QVBoxLayout>
 
@@ -490,7 +498,46 @@ QString chooseDisplayForShare(QWidget* parent, const QString& currentDisplayName
 }
 
 QString renderLine(const QString& stamp, const QString& who, const QString& text) {
-  return QString("[%1] <b>%2</b>: %3").arg(stamp, who.toHtmlEscaped(), text.toHtmlEscaped());
+  static const QRegularExpression kUrlRe(R"((https?://[^\s<>"']+))", QRegularExpression::CaseInsensitiveOption);
+
+  auto escapePlain = [](const QString& s) -> QString {
+    QString out = s.toHtmlEscaped();
+    out.replace('\n', "<br/>");
+    return out;
+  };
+
+  auto formatMessage = [&](const QString& raw) -> QString {
+    QString html;
+    int pos = 0;
+    auto it = kUrlRe.globalMatch(raw);
+    while (it.hasNext()) {
+      const auto m = it.next();
+      const int start = m.capturedStart(1);
+      const int end = m.capturedEnd(1);
+      if (start < pos) continue;
+      html += escapePlain(raw.mid(pos, start - pos));
+
+      const QString urlText = m.captured(1);
+      const QString safeUrl = urlText.toHtmlEscaped();
+      const QUrl url(urlText);
+      const QString path = url.path().toLower();
+      const bool isHttp = url.isValid() && (url.scheme() == "http" || url.scheme() == "https");
+      const bool isGif = isHttp && path.endsWith(".gif");
+
+      if (isGif) {
+        html += QString("<a href=\"%1\">%1</a><br/>"
+                        "<img src=\"%1\" style=\"max-width:320px; max-height:320px; border-radius:6px;\"/>")
+                    .arg(safeUrl);
+      } else {
+        html += QString("<a href=\"%1\">%1</a>").arg(safeUrl);
+      }
+      pos = end;
+    }
+    html += escapePlain(raw.mid(pos));
+    return html;
+  };
+
+  return QString("[%1] <b>%2</b>: %3").arg(stamp, who.toHtmlEscaped(), formatMessage(text));
 }
 
 QString renderServerLine(const QString& stamp,
@@ -498,12 +545,49 @@ QString renderServerLine(const QString& stamp,
                          const QString& text,
                          bool unknownUser,
                          bool verified) {
+  static const QRegularExpression kUrlRe(R"((https?://[^\s<>"']+))", QRegularExpression::CaseInsensitiveOption);
+  auto escapePlain = [](const QString& s) -> QString {
+    QString out = s.toHtmlEscaped();
+    out.replace('\n', "<br/>");
+    return out;
+  };
+  auto formatMessage = [&](const QString& raw) -> QString {
+    QString html;
+    int pos = 0;
+    auto it = kUrlRe.globalMatch(raw);
+    while (it.hasNext()) {
+      const auto m = it.next();
+      const int start = m.capturedStart(1);
+      const int end = m.capturedEnd(1);
+      if (start < pos) continue;
+      html += escapePlain(raw.mid(pos, start - pos));
+
+      const QString urlText = m.captured(1);
+      const QString safeUrl = urlText.toHtmlEscaped();
+      const QUrl url(urlText);
+      const QString path = url.path().toLower();
+      const bool isHttp = url.isValid() && (url.scheme() == "http" || url.scheme() == "https");
+      const bool isGif = isHttp && path.endsWith(".gif");
+
+      if (isGif) {
+        html += QString("<a href=\"%1\">%1</a><br/>"
+                        "<img src=\"%1\" style=\"max-width:320px; max-height:320px; border-radius:6px;\"/>")
+                    .arg(safeUrl);
+      } else {
+        html += QString("<a href=\"%1\">%1</a>").arg(safeUrl);
+      }
+      pos = end;
+    }
+    html += escapePlain(raw.mid(pos));
+    return html;
+  };
+
   QString whoHtml = unknownUser ? QString("<i>%1</i>").arg(who.toHtmlEscaped())
                                 : QString("<b>%1</b>").arg(who.toHtmlEscaped());
   const QString marker = verified ? "&#10003;" : "&#9888;";
   const QString markerColor = verified ? "#2e7d32" : "#d18a00";
   return QString("[%1] <span style=\"color:%2;\">%3</span> %4: %5")
-      .arg(stamp, markerColor, marker, whoHtml, text.toHtmlEscaped());
+      .arg(stamp, markerColor, marker, whoHtml, formatMessage(text));
 }
 
 QString makeStamp(int hh, int mm) {
@@ -1387,8 +1471,10 @@ void MainWindow::buildUi() {
   bottomLayout->setContentsMargins(0, 0, 0, 0);
   input_ = new QLineEdit(bottom);
   input_->setPlaceholderText("Type a message…");
+  auto* gifBtn = new QPushButton("Gif", bottom);
   auto* sendBtn = new QPushButton("Send", bottom);
   bottomLayout->addWidget(input_, 1);
+  bottomLayout->addWidget(gifBtn);
   bottomLayout->addWidget(sendBtn);
   rightLayout->addWidget(bottom);
 
@@ -1506,6 +1592,7 @@ void MainWindow::buildUi() {
     broadcastServerText(selectedServerId_, selectedServerChannelId_, msg);
   };
   connect(sendBtn, &QPushButton::clicked, this, sendNow);
+  connect(gifBtn, &QPushButton::clicked, this, &MainWindow::showGifPopup);
   connect(input_, &QLineEdit::returnPressed, this, sendNow);
   connect(callBtn_, &QPushButton::clicked, this, [this] {
     if (!selectedServerChannelId_.isEmpty()) {
@@ -1879,6 +1966,7 @@ void MainWindow::selectFriend(const QString& id) {
   for (const auto& m : msgs) {
     const auto who = m.incoming ? peerLabel : "You";
     chatView_->append(renderLine(stampFromUtcMs(m.tsMs), who, m.text));
+    maybeFetchGifPreviewsFromText(m.text);
   }
 }
 
@@ -2035,6 +2123,7 @@ void MainWindow::selectServerChannel(const QString& serverId, const QString& cha
     }
     const bool verified = m.verified && !m.senderId.isEmpty();
     chatView_->append(renderServerLine(stampFromUtcMs(m.tsMs), who, m.text, unknownUser, verified));
+    maybeFetchGifPreviewsFromText(m.text);
   }
   refreshVideoPanel();
 }
@@ -2962,6 +3051,7 @@ void MainWindow::appendServerChannelMessage(const QString& serverId,
   if (key == currentChatKey()) {
     const bool msgVerified = m.verified && !m.senderId.isEmpty();
     chatView_->append(renderServerLine(stampFromUtcMs(m.tsMs), who, text, unknownUser, msgVerified));
+    maybeFetchGifPreviewsFromText(text);
   }
 }
 
@@ -3668,7 +3758,82 @@ void MainWindow::appendMessage(const QString& peerId, const QString& label, cons
     who = f ? friendDisplay(*f) : label;
   }
   const auto line = renderLine(stampFromUtcMs(m.tsMs), who, text);
-  if (peerId == currentChatKey()) chatView_->append(line);
+  if (peerId == currentChatKey()) {
+    chatView_->append(line);
+    maybeFetchGifPreviewsFromText(text);
+  }
+}
+
+void MainWindow::maybeFetchGifPreviewsFromText(const QString& text) {
+  static const QRegularExpression kUrlRe(R"((https?://[^\s<>"']+))", QRegularExpression::CaseInsensitiveOption);
+  auto it = kUrlRe.globalMatch(text);
+  while (it.hasNext()) {
+    const auto m = it.next();
+    const QString urlText = m.captured(1).trimmed();
+    if (urlText.isEmpty()) continue;
+    const QUrl url(urlText);
+    if (!url.isValid()) continue;
+    const QString scheme = url.scheme().toLower();
+    if (scheme != "http" && scheme != "https") continue;
+    if (!url.path().toLower().endsWith(".gif")) continue;
+    ensureGifPreview(url.toString());
+  }
+}
+
+void MainWindow::ensureGifPreview(const QString& gifUrl) {
+  if (!chatView_ || gifUrl.isEmpty()) return;
+  if (readyGifPreviewUrls_.contains(gifUrl)) {
+    const QString localUrl = gifLocalUrlByRemote_.value(gifUrl);
+    if (!localUrl.isEmpty()) {
+      auto* bar = chatView_->verticalScrollBar();
+      const int y = bar ? bar->value() : 0;
+      QString html = chatView_->toHtml();
+      html.replace(QString("src=\"%1\"").arg(gifUrl.toHtmlEscaped()),
+                   QString("src=\"%1\"").arg(localUrl.toHtmlEscaped()));
+      chatView_->setHtml(html);
+      if (bar) bar->setValue(y);
+    }
+    return;
+  }
+  if (pendingGifPreviewUrls_.contains(gifUrl)) return;
+
+  if (!gifPreviewNet_) gifPreviewNet_ = new QNetworkAccessManager(this);
+  pendingGifPreviewUrls_.insert(gifUrl);
+
+  QNetworkRequest req{QUrl(gifUrl)};
+  req.setTransferTimeout(15000);
+  auto* reply = gifPreviewNet_->get(req);
+  connect(reply, &QNetworkReply::finished, this, [this, reply, gifUrl] {
+    pendingGifPreviewUrls_.remove(gifUrl);
+    const auto err = reply->error();
+    const QByteArray payload = reply->readAll();
+    reply->deleteLater();
+    if (err != QNetworkReply::NoError || payload.isEmpty()) return;
+
+    const QByteArray hash = QCryptographicHash::hash(gifUrl.toUtf8(), QCryptographicHash::Sha1).toHex();
+    const QString cacheRoot =
+        QDir(QStandardPaths::writableLocation(QStandardPaths::CacheLocation)).filePath("gif-preview-cache");
+    QDir().mkpath(cacheRoot);
+    const QString gifPath = QDir(cacheRoot).filePath(QString::fromLatin1(hash) + ".gif");
+    QFile out(gifPath);
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) return;
+    if (out.write(payload) != payload.size()) {
+      out.close();
+      return;
+    }
+    out.close();
+
+    const QString localUrl = QUrl::fromLocalFile(gifPath).toString();
+    readyGifPreviewUrls_.insert(gifUrl);
+    gifLocalUrlByRemote_[gifUrl] = localUrl;
+    auto* bar = chatView_->verticalScrollBar();
+    const int y = bar ? bar->value() : 0;
+    QString html = chatView_->toHtml();
+    html.replace(QString("src=\"%1\"").arg(gifUrl.toHtmlEscaped()),
+                 QString("src=\"%1\"").arg(localUrl.toHtmlEscaped()));
+    chatView_->setHtml(html);
+    if (bar) bar->setValue(y);
+  });
 }
 
 void MainWindow::refreshHeader() {
@@ -3724,6 +3889,167 @@ void MainWindow::addFriendDialog() {
   const auto id = idEdit.text().trimmed();
   if (id.isEmpty()) return;
   sendFriendRequestToId(id);
+}
+
+void MainWindow::showGifPopup() {
+  QDialog dlg(this);
+  dlg.setWindowTitle("GIF Search");
+  dlg.resize(700, 520);
+
+  auto* root = new QVBoxLayout(&dlg);
+  auto* top = new QHBoxLayout();
+  auto* queryEdit = new QLineEdit(&dlg);
+  queryEdit->setPlaceholderText("Search GIFs (for example: cat, wow, dancing)");
+  auto* searchBtn = new QPushButton("Search", &dlg);
+  top->addWidget(queryEdit, 1);
+  top->addWidget(searchBtn);
+  root->addLayout(top);
+
+  auto* keyRow = new QHBoxLayout();
+  auto* keyLabel = new QLabel("GIPHY API Key:", &dlg);
+  auto* keyEdit = new QLineEdit(&dlg);
+  keyEdit->setPlaceholderText("Enter your GIPHY API key");
+  keyEdit->setText(qEnvironmentVariable("GIPHY_API_KEY").trimmed());
+  keyRow->addWidget(keyLabel);
+  keyRow->addWidget(keyEdit, 1);
+  root->addLayout(keyRow);
+
+  auto* list = new QListWidget(&dlg);
+  list->setSelectionMode(QAbstractItemView::SingleSelection);
+  root->addWidget(list, 1);
+
+  auto* status = new QLabel("Type a query and click Search.", &dlg);
+  root->addWidget(status);
+
+  auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+  if (auto* ok = buttons->button(QDialogButtonBox::Ok)) ok->setText("Insert");
+  root->addWidget(buttons);
+  connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+  connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+  connect(list, &QListWidget::itemDoubleClicked, &dlg, [&dlg](QListWidgetItem*) { dlg.accept(); });
+
+  struct GifResult {
+    QString title;
+    QString url;
+  };
+  QVector<GifResult> results;
+  auto* net = new QNetworkAccessManager(&dlg);
+
+  auto runSearch = [&] {
+    const QString query = queryEdit->text().trimmed();
+    if (query.isEmpty()) {
+      status->setText("Enter a search term.");
+      return;
+    }
+
+    searchBtn->setEnabled(false);
+    status->setText("Searching...");
+    list->clear();
+    results.clear();
+
+    const QString apiKey = keyEdit->text().trimmed();
+    if (apiKey.isEmpty()) {
+      status->setText("Enter a GIPHY API key to enable GIF search.");
+      searchBtn->setEnabled(true);
+      return;
+    }
+    QUrl url("https://api.giphy.com/v1/gifs/search");
+    QUrlQuery params;
+    params.addQueryItem("api_key", apiKey);
+    params.addQueryItem("q", query);
+    params.addQueryItem("limit", "25");
+    params.addQueryItem("rating", "pg-13");
+    params.addQueryItem("lang", "en");
+    url.setQuery(params);
+
+    QNetworkRequest req(url);
+    req.setTransferTimeout(10000);
+    auto* reply = net->get(req);
+
+    connect(reply, &QNetworkReply::finished, &dlg, [&, reply] {
+      searchBtn->setEnabled(true);
+      const QNetworkReply::NetworkError err = reply->error();
+      const QByteArray payload = reply->readAll();
+      const int httpStatus = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+      reply->deleteLater();
+
+      if (err != QNetworkReply::NoError) {
+        status->setText(QString("Search failed (%1, HTTP %2).")
+                            .arg(reply->errorString())
+                            .arg(httpStatus == 0 ? -1 : httpStatus));
+        return;
+      }
+
+      QJsonParseError parseErr {};
+      const QJsonDocument doc = QJsonDocument::fromJson(payload, &parseErr);
+      if (parseErr.error != QJsonParseError::NoError || !doc.isObject()) {
+        status->setText("Search failed: invalid response.");
+        return;
+      }
+
+      const QJsonObject root = doc.object();
+      const QJsonObject meta = root.value("meta").toObject();
+      const int apiStatus = meta.value("status").toInt(200);
+      if (apiStatus < 200 || apiStatus >= 300) {
+        const QString msg = meta.value("msg").toString().trimmed();
+        status->setText(msg.isEmpty() ? QString("Search failed: GIPHY error %1.").arg(apiStatus)
+                                      : QString("Search failed: %1").arg(msg));
+        return;
+      }
+
+      const QJsonArray arr = root.value("data").toArray();
+      for (const auto& v : arr) {
+        const QJsonObject obj = v.toObject();
+        const QJsonObject images = obj.value("images").toObject();
+        const QJsonObject original = images.value("original").toObject();
+        const QString gifUrl = original.value("url").toString().trimmed();
+        if (gifUrl.isEmpty()) continue;
+
+        QString title = obj.value("title").toString().trimmed();
+        if (title.isEmpty()) title = "GIF";
+
+        results.push_back({title, gifUrl});
+        auto* item = new QListWidgetItem(QString("%1\n%2").arg(title, gifUrl), list);
+        item->setData(Qt::UserRole, results.size() - 1);
+        item->setToolTip(gifUrl);
+        list->addItem(item);
+      }
+
+      if (list->count() == 0) {
+        status->setText("No GIF results found.");
+      } else {
+        list->setCurrentRow(0);
+        status->setText(QString("Found %1 GIFs. Select one and click Insert.").arg(list->count()));
+      }
+    });
+  };
+
+  connect(searchBtn, &QPushButton::clicked, &dlg, runSearch);
+  connect(queryEdit, &QLineEdit::returnPressed, &dlg, runSearch);
+
+  queryEdit->setText("funny");
+  runSearch();
+
+  if (dlg.exec() != QDialog::Accepted) return;
+  auto* current = list->currentItem();
+  if (!current) return;
+
+  const int idx = current->data(Qt::UserRole).toInt();
+  if (idx < 0 || idx >= results.size()) return;
+  const QString selectedUrl = results[idx].url;
+  if (selectedUrl.isEmpty()) return;
+
+  QString nextText = input_ ? input_->text().trimmed() : QString();
+  if (nextText.isEmpty()) {
+    nextText = selectedUrl;
+  } else {
+    nextText += " " + selectedUrl;
+  }
+  if (input_) {
+    input_->setText(nextText);
+    input_->setFocus();
+  }
+  statusBar()->showMessage("GIF URL inserted into message box", 3000);
 }
 
 void MainWindow::sendFriendRequestToId(const QString& id) {

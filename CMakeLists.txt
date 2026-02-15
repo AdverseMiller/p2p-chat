@@ -109,7 +109,7 @@ include(CheckIncludeFileCXX)
 
 find_package(PkgConfig)
 
-find_package(Qt6 QUIET COMPONENTS Core Widgets Multimedia)
+find_package(Qt6 QUIET COMPONENTS Core Widgets Multimedia Network)
 
 option(P2PCHAT_ENABLE_VOICE "Enable voice call support (requires Qt6 Multimedia + Opus)" ON)
 
@@ -216,7 +216,7 @@ if(Qt6Widgets_FOUND)
     set_target_properties(p2p_chat_gui PROPERTIES WIN32_EXECUTABLE ON)
   endif()
   target_include_directories(p2p_chat_gui PRIVATE .)
-  target_link_libraries(p2p_chat_gui PRIVATE Qt6::Widgets Qt6::Core p2pchat_boost OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+  target_link_libraries(p2p_chat_gui PRIVATE Qt6::Widgets Qt6::Core Qt6::Network p2pchat_boost OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
   p2pchat_max_perf(p2p_chat_gui)
   p2pchat_small_binary(p2p_chat_gui)
   p2pchat_windows_eh(p2p_chat_gui)
