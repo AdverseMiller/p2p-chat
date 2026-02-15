@@ -3314,6 +3314,26 @@ struct ChatBackend::Impl {
 
     if (type == "video_state") {
 #if defined(P2PCHAT_VIDEO)
+      if (voice && voice->channelMode) {
+        if (!voice->txPeers.contains(peerId)) return;
+        const QString cid = inner.contains("call_id") && inner["call_id"].is_string()
+                                ? QString::fromStdString(inner["call_id"].get<std::string>())
+                                : QString();
+        if (!cid.isEmpty() && cid != "__voice_channel__") return;
+        const bool enabled =
+            inner.contains("enabled") && inner["enabled"].is_boolean() ? inner["enabled"].get<bool>() : false;
+        if (!enabled) {
+          emit q->remoteVideoFrame(peerId, QImage());
+        } else {
+          requestVideoKeyframeQt(peerId);
+        }
+        emit q->remoteVideoAvailabilityChanged(peerId, enabled);
+        if (debug_logs_enabled()) {
+          emit q->logLine("[dbg] video_state(channel) from peer=" + peerId +
+                          " enabled=" + QString::number(enabled ? 1 : 0));
+        }
+        return;
+      }
       if (callPeerId != peerId) return;
       const QString cid = inner.contains("call_id") && inner["call_id"].is_string()
                               ? QString::fromStdString(inner["call_id"].get<std::string>())
@@ -4558,6 +4578,23 @@ void ChatBackend::setVoiceChannelPeers(const QStringList& peerIds, const VoiceSe
   });
 
   impl_->startVoiceChannelQt();
+
+#if defined(P2PCHAT_VIDEO)
+  const bool enabled = settings.videoEnabled && !settings.videoDevicePath.trimmed().isEmpty();
+  const std::string codec = resolve_network_video_codec(settings).toStdString();
+  boost::asio::post(impl_->io, [impl = impl_, peers, enabled, codec] {
+    for (const auto& peerId : peers) {
+      const auto pid = peerId.toStdString();
+      json j;
+      j["type"] = "video_state";
+      j["call_id"] = "__voice_channel__";
+      j["enabled"] = enabled;
+      j["video_codec"] = codec;
+      impl->sendControlToPeer(pid, std::move(j));
+      impl->attemptDelivery(pid, /*silent*/ true);
+    }
+  });
+#endif
 #endif
 }
 
@@ -5038,6 +5075,22 @@ void ChatBackend::updateVoiceSettings(const VoiceSettings& settings) {
       (settings.videoBitrateKbps != prev.videoBitrateKbps);
   if (videoChanged && impl_->voice && impl_->voice->channelMode) {
     impl_->maybeStartVideoQt();
+#if defined(P2PCHAT_VIDEO)
+    const bool enabled = settings.videoEnabled && !settings.videoDevicePath.trimmed().isEmpty();
+    const std::string codec = resolve_network_video_codec(settings).toStdString();
+    const QStringList peers = impl_->voice->txPeers.values();
+    boost::asio::post(impl_->io, [impl = impl_, peers, enabled, codec] {
+      for (const auto& peerId : peers) {
+        const auto pid = peerId.toStdString();
+        json j;
+        j["type"] = "video_state";
+        j["call_id"] = "__voice_channel__";
+        j["enabled"] = enabled;
+        j["video_codec"] = codec;
+        impl->sendControlToPeer(pid, std::move(j));
+      }
+    });
+#endif
     emit logLine(settings.videoEnabled ? "Video settings applied" : "Video sharing disabled (receive-only)");
   }
   if (videoChanged && !impl_->callPeerId.isEmpty() && impl_->callLocalAccepted && impl_->callRemoteAccepted) {
