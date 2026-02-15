@@ -2,8 +2,10 @@
 
 #include "common/util.hpp"
 
-#if defined(__linux__) && defined(P2PCHAT_VIDEO)
+#if defined(P2PCHAT_VIDEO)
+#if defined(__linux__)
 #include <linux/videodev2.h>
+#endif
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/imgutils.h>
@@ -24,19 +26,16 @@ QString codecToString(Codec c) {
   switch (c) {
     case Codec::H264:
       return "h264";
-    case Codec::VP8:
-      return "vp8";
   }
   return "h264";
 }
 
 Codec codecFromString(const QString& s) {
-  const auto k = s.trimmed().toLower();
-  if (k == "vp8") return Codec::VP8;
+  (void)s;
   return Codec::H264;
 }
 
-#if !defined(__linux__) || !defined(P2PCHAT_VIDEO)
+#if !defined(P2PCHAT_VIDEO)
 struct Encoder::Impl {};
 struct Decoder::Impl {};
 
@@ -48,6 +47,10 @@ bool passthroughFrame(const RawFrame&, Codec, EncodedFrame*, QString* err) {
   return false;
 }
 bool convertRawFrameToI420(const RawFrame&, I420Frame*, QString* err) {
+  if (err) *err = "video codec unavailable on this build";
+  return false;
+}
+bool qimageToI420(const QImage&, I420Frame*, QString* err) {
   if (err) *err = "video codec unavailable on this build";
   return false;
 }
@@ -80,6 +83,13 @@ bool Decoder::isOpen() const { return false; }
 #else
 namespace {
 
+constexpr uint32_t make_fourcc(char a, char b, char c, char d) {
+  return (static_cast<uint32_t>(static_cast<unsigned char>(a)) << 0) |
+         (static_cast<uint32_t>(static_cast<unsigned char>(b)) << 8) |
+         (static_cast<uint32_t>(static_cast<unsigned char>(c)) << 16) |
+         (static_cast<uint32_t>(static_cast<unsigned char>(d)) << 24);
+}
+
 class ScopedPacket {
 public:
   ScopedPacket() : p(av_packet_alloc()) {}
@@ -101,27 +111,26 @@ private:
 };
 
 AVPixelFormat fourcc_to_pixfmt(uint32_t fourcc) {
-  if (fourcc == static_cast<uint32_t>(v4l2_fourcc('Y', 'U', 'Y', 'V'))) return AV_PIX_FMT_YUYV422;
-  if (fourcc == static_cast<uint32_t>(v4l2_fourcc('Y', 'V', 'Y', 'U'))) return AV_PIX_FMT_YVYU422;
-  if (fourcc == static_cast<uint32_t>(v4l2_fourcc('U', 'Y', 'V', 'Y'))) return AV_PIX_FMT_UYVY422;
-  if (fourcc == static_cast<uint32_t>(v4l2_fourcc('N', 'V', '1', '2'))) return AV_PIX_FMT_NV12;
-  if (fourcc == static_cast<uint32_t>(v4l2_fourcc('N', 'V', '2', '1'))) return AV_PIX_FMT_NV21;
-  if (fourcc == static_cast<uint32_t>(v4l2_fourcc('Y', 'U', '1', '2'))) return AV_PIX_FMT_YUV420P;
-  if (fourcc == static_cast<uint32_t>(v4l2_fourcc('Y', 'V', '1', '2'))) return AV_PIX_FMT_YUV420P;
-  if (fourcc == static_cast<uint32_t>(v4l2_fourcc('R', 'G', 'B', '3'))) return AV_PIX_FMT_RGB24;
-  if (fourcc == static_cast<uint32_t>(v4l2_fourcc('B', 'G', 'R', '3'))) return AV_PIX_FMT_BGR24;
-  if (fourcc == static_cast<uint32_t>(v4l2_fourcc('G', 'R', 'E', 'Y'))) return AV_PIX_FMT_GRAY8;
+  if (fourcc == make_fourcc('Y', 'U', 'Y', 'V')) return AV_PIX_FMT_YUYV422;
+  if (fourcc == make_fourcc('Y', 'V', 'Y', 'U')) return AV_PIX_FMT_YVYU422;
+  if (fourcc == make_fourcc('U', 'Y', 'V', 'Y')) return AV_PIX_FMT_UYVY422;
+  if (fourcc == make_fourcc('N', 'V', '1', '2')) return AV_PIX_FMT_NV12;
+  if (fourcc == make_fourcc('N', 'V', '2', '1')) return AV_PIX_FMT_NV21;
+  if (fourcc == make_fourcc('Y', 'U', '1', '2')) return AV_PIX_FMT_YUV420P;
+  if (fourcc == make_fourcc('Y', 'V', '1', '2')) return AV_PIX_FMT_YUV420P;
+  if (fourcc == make_fourcc('R', 'G', 'B', '3')) return AV_PIX_FMT_RGB24;
+  if (fourcc == make_fourcc('B', 'G', 'R', '3')) return AV_PIX_FMT_BGR24;
+  if (fourcc == make_fourcc('G', 'R', 'E', 'Y')) return AV_PIX_FMT_GRAY8;
   return AV_PIX_FMT_NONE;
 }
 
 std::optional<AVCodecID> fourcc_to_compressed_codec(uint32_t fourcc) {
-  if (fourcc == static_cast<uint32_t>(v4l2_fourcc('M', 'J', 'P', 'G')) ||
-      fourcc == static_cast<uint32_t>(v4l2_fourcc('J', 'P', 'E', 'G'))) {
+  if (fourcc == make_fourcc('M', 'J', 'P', 'G') ||
+      fourcc == make_fourcc('J', 'P', 'E', 'G')) {
     return AV_CODEC_ID_MJPEG;
   }
-  if (fourcc == static_cast<uint32_t>(v4l2_fourcc('H', '2', '6', '4'))) return AV_CODEC_ID_H264;
-  if (fourcc == static_cast<uint32_t>(v4l2_fourcc('H', 'E', 'V', 'C'))) return AV_CODEC_ID_HEVC;
-  if (fourcc == static_cast<uint32_t>(v4l2_fourcc('V', 'P', '8', '0'))) return AV_CODEC_ID_VP8;
+  if (fourcc == make_fourcc('H', '2', '6', '4')) return AV_CODEC_ID_H264;
+  if (fourcc == make_fourcc('H', 'E', 'V', 'C')) return AV_CODEC_ID_HEVC;
   return std::nullopt;
 }
 
@@ -194,7 +203,7 @@ bool raw_to_i420_sws(const RawFrame& in, I420Frame* out, QString* err) {
     if (err) *err = "short raw frame";
     return false;
   }
-  if (in.fourcc == static_cast<uint32_t>(v4l2_fourcc('Y', 'V', '1', '2'))) {
+  if (in.fourcc == make_fourcc('Y', 'V', '1', '2')) {
     std::swap(src->data[1], src->data[2]);
     std::swap(src->linesize[1], src->linesize[2]);
   }
@@ -259,39 +268,29 @@ bool compressed_to_i420(const RawFrame& in, AVCodecID codecId, I420Frame* out, Q
 }
 
 const AVCodec* pick_encoder(Codec want, Codec* outCodec) {
-  if (want == Codec::H264) {
-    if (const AVCodec* c = avcodec_find_encoder_by_name("libx264")) {
-      *outCodec = Codec::H264;
-      return c;
-    }
-    if (const AVCodec* c = avcodec_find_encoder_by_name("h264_v4l2m2m")) {
-      *outCodec = Codec::H264;
-      return c;
-    }
-    if (const AVCodec* c = avcodec_find_encoder(AV_CODEC_ID_H264)) {
-      *outCodec = Codec::H264;
-      return c;
-    }
-  }
-  if (const AVCodec* c = avcodec_find_encoder_by_name("libvpx")) {
-    *outCodec = Codec::VP8;
+  if (want != Codec::H264) return nullptr;
+  if (const AVCodec* c = avcodec_find_encoder_by_name("libx264")) {
+    *outCodec = Codec::H264;
     return c;
   }
-  if (const AVCodec* c = avcodec_find_encoder(AV_CODEC_ID_VP8)) {
-    *outCodec = Codec::VP8;
+  if (const AVCodec* c = avcodec_find_encoder_by_name("h264_v4l2m2m")) {
+    *outCodec = Codec::H264;
+    return c;
+  }
+  if (const AVCodec* c = avcodec_find_encoder(AV_CODEC_ID_H264)) {
+    *outCodec = Codec::H264;
     return c;
   }
   return nullptr;
 }
 
 const AVCodec* decoder_for_codec(Codec codec) {
-  if (codec == Codec::H264) return avcodec_find_decoder(AV_CODEC_ID_H264);
-  return avcodec_find_decoder(AV_CODEC_ID_VP8);
+  if (codec != Codec::H264) return nullptr;
+  return avcodec_find_decoder(AV_CODEC_ID_H264);
 }
 
 std::optional<Codec> codec_from_avcodec(AVCodecID codec) {
   if (codec == AV_CODEC_ID_H264) return Codec::H264;
-  if (codec == AV_CODEC_ID_VP8) return Codec::VP8;
   return std::nullopt;
 }
 
@@ -309,11 +308,6 @@ bool has_h264_idr(std::span<const uint8_t> data) {
     if (nal == 5 || nal == 7 || nal == 8) return true;
   }
   return false;
-}
-
-bool is_vp8_keyframe(std::span<const uint8_t> data) {
-  if (data.empty()) return false;
-  return (data[0] & 0x01u) == 0u;
 }
 
 QImage avframe_to_qimage(const AVFrame* frame) {
@@ -376,11 +370,8 @@ bool passthroughFrame(const RawFrame& in, Codec networkCodec, EncodedFrame* out,
   out->bytes = in.bytes;
   out->ptsMs = in.monotonicUs / 1000ull;
   std::span<const uint8_t> span(out->bytes.data(), out->bytes.size());
-  if (networkCodec == Codec::H264) {
-    out->keyframe = has_h264_idr(span);
-  } else {
-    out->keyframe = is_vp8_keyframe(span);
-  }
+  (void)networkCodec;
+  out->keyframe = has_h264_idr(span);
   return true;
 }
 
@@ -392,6 +383,44 @@ bool convertRawFrameToI420(const RawFrame& in, I420Frame* out, QString* err) {
   if (!raw_to_i420_sws(in, out, err)) return false;
   out->ptsMs = in.monotonicUs / 1000ull;
   return true;
+}
+
+bool qimageToI420(const QImage& in, I420Frame* out, QString* err) {
+  if (!out) return false;
+  if (in.isNull()) {
+    if (err) *err = "empty image";
+    return false;
+  }
+  QImage rgb = in.convertToFormat(QImage::Format_RGB888);
+  if (rgb.isNull()) {
+    if (err) *err = "failed to convert image to RGB888";
+    return false;
+  }
+
+  AVFrame* src = av_frame_alloc();
+  if (!src) {
+    if (err) *err = "av_frame_alloc failed";
+    return false;
+  }
+  src->format = AV_PIX_FMT_RGB24;
+  src->width = rgb.width();
+  src->height = rgb.height();
+  const int need = av_image_fill_arrays(src->data,
+                                        src->linesize,
+                                        reinterpret_cast<const uint8_t*>(rgb.constBits()),
+                                        AV_PIX_FMT_RGB24,
+                                        src->width,
+                                        src->height,
+                                        1);
+  if (need < 0) {
+    av_frame_free(&src);
+    if (err) *err = "av_image_fill_arrays failed";
+    return false;
+  }
+
+  const bool ok = scale_to_i420(src, out, err);
+  av_frame_free(&src);
+  return ok;
 }
 
 QImage i420ToQImage(const I420Frame& in) {
@@ -442,10 +471,6 @@ bool Encoder::open(const EncodeParams& p, QString* err) {
     av_opt_set(impl_->ctx->priv_data, "preset", "ultrafast", 0);
     av_opt_set(impl_->ctx->priv_data, "tune", "zerolatency", 0);
     av_opt_set(impl_->ctx->priv_data, "profile", "baseline", 0);
-  }
-  if (impl_->codec->id == AV_CODEC_ID_VP8) {
-    av_opt_set(impl_->ctx->priv_data, "deadline", "realtime", 0);
-    av_opt_set(impl_->ctx->priv_data, "cpu-used", "8", 0);
   }
   if (avcodec_open2(impl_->ctx, impl_->codec, nullptr) < 0) {
     if (err) *err = "avcodec_open2 failed";

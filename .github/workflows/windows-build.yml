@@ -30,15 +30,26 @@ jobs:
             mingw-w64-x86_64-opus
             mingw-w64-x86_64-openssl
             mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-ffmpeg
+            mingw-w64-x86_64-x264
 
       - name: Configure
         run: >
           cmake -S . -B build-win
           -G Ninja
           -DCMAKE_BUILD_TYPE=Release
+          -DP2PCHAT_ENABLE_VIDEO=ON
+          -DP2PCHAT_ENABLE_VOICE=ON
 
       - name: Build
         run: cmake --build build-win -j 2
+
+      - name: Verify video linkage
+        run: |
+          set -euo pipefail
+          objdump -p build-win/p2p_chat_gui.exe | grep -Ei "DLL Name: .*avcodec" >/dev/null
+          objdump -p build-win/p2p_chat_gui.exe | grep -Ei "DLL Name: .*avutil" >/dev/null
+          objdump -p build-win/p2p_chat_gui.exe | grep -Ei "DLL Name: .*swscale" >/dev/null
 
       - name: Bundle
         run: |

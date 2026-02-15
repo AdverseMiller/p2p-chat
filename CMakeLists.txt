@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
 
 include(CheckCXXCompilerFlag)
 
@@ -113,12 +114,36 @@ if(P2PCHAT_ENABLE_VOICE)
   endif()
 endif()
 
-option(P2PCHAT_ENABLE_VIDEO "Enable webcam video over P2P UDP (Linux + FFmpeg)" ON)
+option(P2PCHAT_ENABLE_VIDEO "Enable webcam/screen video over P2P UDP (FFmpeg)" ON)
 set(P2PCHAT_HAVE_VIDEO_FFMPEG OFF)
-if(P2PCHAT_ENABLE_VIDEO AND UNIX AND NOT WIN32 AND PKG_CONFIG_FOUND)
-  pkg_check_modules(AVCODEC libavcodec)
-  pkg_check_modules(AVUTIL libavutil)
-  pkg_check_modules(SWSCALE libswscale)
+if(P2PCHAT_ENABLE_VIDEO)
+  if(PKG_CONFIG_FOUND)
+    pkg_check_modules(AVCODEC libavcodec)
+    pkg_check_modules(AVUTIL libavutil)
+    pkg_check_modules(SWSCALE libswscale)
+  endif()
+
+  if(NOT (AVCODEC_FOUND AND AVUTIL_FOUND AND SWSCALE_FOUND))
+    find_path(AVCODEC_INCLUDE_DIR libavcodec/avcodec.h)
+    find_path(AVUTIL_INCLUDE_DIR libavutil/avutil.h)
+    find_path(SWSCALE_INCLUDE_DIR libswscale/swscale.h)
+    find_library(AVCODEC_LIBRARY NAMES avcodec libavcodec)
+    find_library(AVUTIL_LIBRARY NAMES avutil libavutil)
+    find_library(SWSCALE_LIBRARY NAMES swscale libswscale)
+    if(AVCODEC_INCLUDE_DIR AND AVUTIL_INCLUDE_DIR AND SWSCALE_INCLUDE_DIR AND
+       AVCODEC_LIBRARY AND AVUTIL_LIBRARY AND SWSCALE_LIBRARY)
+      set(AVCODEC_FOUND ON)
+      set(AVUTIL_FOUND ON)
+      set(SWSCALE_FOUND ON)
+      set(AVCODEC_INCLUDE_DIRS ${AVCODEC_INCLUDE_DIR})
+      set(AVUTIL_INCLUDE_DIRS ${AVUTIL_INCLUDE_DIR})
+      set(SWSCALE_INCLUDE_DIRS ${SWSCALE_INCLUDE_DIR})
+      set(AVCODEC_LIBRARIES ${AVCODEC_LIBRARY})
+      set(AVUTIL_LIBRARIES ${AVUTIL_LIBRARY})
+      set(SWSCALE_LIBRARIES ${SWSCALE_LIBRARY})
+    endif()
+  endif()
+
   if(AVCODEC_FOUND AND AVUTIL_FOUND AND SWSCALE_FOUND)
     set(P2PCHAT_HAVE_VIDEO_FFMPEG ON)
   endif()
@@ -158,6 +183,7 @@ if(Qt6Widgets_FOUND)
     gui/main.cpp
     gui/MainWindow.cpp
     gui/MainWindow.hpp
+    gui/resources.qrc
     gui/Profile.cpp
     gui/Profile.hpp
     gui/ProfileLoginDialog.cpp
