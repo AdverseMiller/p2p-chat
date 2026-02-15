@@ -1578,13 +1578,14 @@ void MainWindow::buildUi() {
     if (wasLocalLive != localVideoActive_) rebuildServerList();
     refreshCallButton();
     refreshVideoPanel();
-    if (!activeCallPeer_.isEmpty() && !activeCallState_.isEmpty()) {
+    if ((!activeCallPeer_.isEmpty() && !activeCallState_.isEmpty()) || !joinedServerVoiceKey_.isEmpty()) {
       backend_.updateVoiceSettings(voiceSettingsFromProfile(profile_.audio,
                                                             profile_.video,
                                                             profile_.screen,
                                                             webcamEnabled_,
                                                             screenShareEnabled_,
                                                             screenShareDisplayName_));
+      if (!joinedServerVoiceKey_.isEmpty()) maybeSyncVoiceCallForJoinedChannel();
       statusBar()->showMessage(webcamEnabled_ ? "Webcam enabled" : "Webcam disabled", 3000);
     }
   });
@@ -1621,13 +1622,14 @@ void MainWindow::buildUi() {
     if (wasLocalLive != localVideoActive_) rebuildServerList();
     refreshCallButton();
     refreshVideoPanel();
-    if (!activeCallPeer_.isEmpty() && !activeCallState_.isEmpty()) {
+    if ((!activeCallPeer_.isEmpty() && !activeCallState_.isEmpty()) || !joinedServerVoiceKey_.isEmpty()) {
       backend_.updateVoiceSettings(voiceSettingsFromProfile(profile_.audio,
                                                             profile_.video,
                                                             profile_.screen,
                                                             webcamEnabled_,
                                                             screenShareEnabled_,
                                                             screenShareDisplayName_));
+      if (!joinedServerVoiceKey_.isEmpty()) maybeSyncVoiceCallForJoinedChannel();
       statusBar()->showMessage(screenShareEnabled_ ? "Screen share enabled" : "Screen share disabled", 3000);
     }
   });
