@@ -61,6 +61,7 @@ public:
   void setFriendAccepted(const QString& peerId, bool accepted);
   void setServerMembers(const QStringList& peerIds);
   void setPeerMuted(const QString& peerId, bool muted);
+  void setPeerVideoWatch(const QString& peerId, bool watching);
 
   // Voice calls (Opus over UDP hole-punching). Only one active call at a time.
   void startCall(const QString& peerId, const VoiceSettings& settings);
@@ -88,6 +89,7 @@ signals:
   void callEnded(QString peerId, QString reason);
   void localVideoFrame(QImage frame);
   void remoteVideoFrame(QString peerId, QImage frame);
+  void remoteVideoAvailabilityChanged(QString peerId, bool available);
 
 private:
   struct Impl;

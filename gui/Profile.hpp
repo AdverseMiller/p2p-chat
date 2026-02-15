@@ -111,6 +111,7 @@ public:
   quint16 externalPort = 0;
   bool darkMode = false;
   bool shareIdentityWithNonFriendsInServers = false;
+  bool signedOnlyServerMessages = false;
   QVector<QString> mutedVoicePeerIds;
   AudioSettings audio;
   VideoSettings video;

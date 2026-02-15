@@ -106,6 +106,8 @@ private:
                                  const QPoint& globalPos,
                                  bool allowProfile = true);
   bool isVoiceMuted(const QString& peerId) const;
+  bool isWatchingPeerVideo(const QString& peerId) const;
+  void setPeerVideoWatching(const QString& peerId, bool watching);
   void setVoiceMuted(const QString& peerId, bool muted);
   void showProfilePopup(const QString& peerId);
   void clearChatFor(const QString& peerId);
@@ -151,6 +153,7 @@ private:
   bool localVideoActive_ = false;
   QImage localVideoFrame_;
   QMap<QString, QImage> remoteVideoFrames_;
+  QMap<QString, bool> remoteVideoAvailable_;
   QLineEdit* input_ = nullptr;
   QListWidget* serverMembersList_ = nullptr;
 
@@ -170,6 +173,7 @@ private:
   QMap<QString, bool> directOnline_;
   QSet<QString> pendingJoinOwners_;
   QSet<QString> mutedVoicePeerIds_;
+  QSet<QString> stoppedWatchingVideoPeerIds_;
 
   QAction* darkModeAction_ = nullptr;
   QTimer* voicePresenceTimer_ = nullptr;

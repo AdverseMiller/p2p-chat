@@ -2058,6 +2058,7 @@ struct ChatBackend::Impl {
   int callChannels = 1;
   QString callVideoCodec = "h264";
   bool callRemoteVideoEnabled = false;
+  bool callRemoteWatchingVideo = true;
   ChatBackend::VoiceSettings callSettings;
 
 #if defined(P2PCHAT_VOICE)
@@ -2186,6 +2187,7 @@ struct ChatBackend::Impl {
     callChannels = 1;
     callVideoCodec = "h264";
     callRemoteVideoEnabled = false;
+    callRemoteWatchingVideo = true;
     callSettings = {};
   }
 
@@ -2634,6 +2636,7 @@ struct ChatBackend::Impl {
     const auto peer = vr->peerId;
     auto sendEncodedFrames = [this, peer](const std::vector<video::EncodedFrame>& out) {
       if (out.empty()) return;
+      if (!callRemoteWatchingVideo) return;
       for (const auto& ef : out) {
         const auto pid = peer.toStdString();
         const auto bytes = ef.bytes;
@@ -2854,6 +2857,7 @@ struct ChatBackend::Impl {
     const QString cid = callId;
     stopVoiceQt();
     resetCallStateQt();
+    if (!peer.isEmpty()) emit q->remoteVideoAvailabilityChanged(peer, false);
     if (!peer.isEmpty()) emit q->callEnded(peer, reason);
 
     if (notifyPeer && !peer.isEmpty() && !cid.isEmpty()) {
@@ -2949,9 +2953,30 @@ struct ChatBackend::Impl {
       } else {
         requestVideoKeyframeQt(peerId);
       }
+      emit q->remoteVideoAvailabilityChanged(peerId, enabled);
       if (debug_logs_enabled()) {
         emit q->logLine("[dbg] video_state from peer=" + peerId + " enabled=" + QString::number(enabled ? 1 : 0) +
                         " codec=" + (remoteVideoCodec.isEmpty() ? callVideoCodec : remoteVideoCodec));
+      }
+#endif
+      return;
+    }
+
+    if (type == "video_watch") {
+#if defined(P2PCHAT_VIDEO)
+      if (callPeerId != peerId) return;
+      const QString cid = inner.contains("call_id") && inner["call_id"].is_string()
+                              ? QString::fromStdString(inner["call_id"].get<std::string>())
+                              : QString();
+      if (!cid.isEmpty() && cid != callId) return;
+      const bool watching =
+          inner.contains("watching") && inner["watching"].is_boolean() ? inner["watching"].get<bool>() : true;
+      callRemoteWatchingVideo = watching;
+      if (watching && videoRt && videoRt->peerId == peerId && videoRt->sharing && !videoRt->passthrough) {
+        videoRt->encoder.requestKeyframe();
+      }
+      if (debug_logs_enabled()) {
+        emit q->logLine("[dbg] video_watch from peer=" + peerId + " watching=" + QString::number(watching ? 1 : 0));
       }
 #endif
       return;
@@ -3003,7 +3028,9 @@ struct ChatBackend::Impl {
       callChannels = (channels == 2) ? 2 : 1;
       callBitrate = std::clamp(bitrate, 8000, 128000);
       callRemoteVideoEnabled = remoteVideoEnabled;
+      callRemoteWatchingVideo = true;
       if (!remoteVideoCodec.isEmpty()) callVideoCodec = remoteVideoCodec;
+      emit q->remoteVideoAvailabilityChanged(callPeerId, callRemoteVideoEnabled);
       if (debug_logs_enabled()) {
         emit q->logLine("[dbg] incoming call offer peer=" + callPeerId + " call_id=" + callId +
                         " frameMs=" + QString::number(callFrameMs) + " bitrate=" + QString::number(callBitrate) +
@@ -3045,6 +3072,7 @@ struct ChatBackend::Impl {
       callRemoteAccepted = true;
       callRemoteVideoEnabled = remoteVideoEnabled;
       if (!remoteVideoCodec.isEmpty()) callVideoCodec = remoteVideoCodec;
+      emit q->remoteVideoAvailabilityChanged(callPeerId, callRemoteVideoEnabled);
       if (debug_logs_enabled()) {
         emit q->logLine("[dbg] call_answer accepted by peer=" + peerId + " call_id=" + callId +
                         " negotiatedFrameMs=" + QString::number(callFrameMs) +
@@ -4103,6 +4131,28 @@ void ChatBackend::setPeerMuted(const QString& peerId, bool muted) {
   }
 }
 
+void ChatBackend::setPeerVideoWatch(const QString& peerId, bool watching) {
+  if (peerId.isEmpty()) return;
+  const auto pid = peerId.toStdString();
+  const auto callPeer = impl_->callPeerId;
+  const auto callId = (callPeer == peerId) ? impl_->callId.toStdString() : std::string();
+
+#if defined(P2PCHAT_VIDEO)
+  if (watching && callPeer == peerId) {
+    impl_->requestVideoKeyframeQt(peerId);
+  }
+#endif
+
+  boost::asio::post(impl_->io, [impl = impl_, pid, callId, watching] {
+    json j;
+    j["type"] = "video_watch";
+    if (!callId.empty()) j["call_id"] = callId;
+    j["watching"] = watching;
+    impl->sendControlToPeer(pid, std::move(j));
+    impl->attemptDelivery(pid, /*silent*/ true);
+  });
+}
+
 void ChatBackend::sendFriendRequest(const QString& peerId) {
   const auto pid = peerId.toStdString();
   boost::asio::post(impl_->io, [impl = impl_, pid] {
@@ -4257,6 +4307,7 @@ void ChatBackend::startCall(const QString& peerId, const VoiceSettings& settings
   impl_->callLocalAccepted = true;
   impl_->callRemoteAccepted = false;
   impl_->callRemoteVideoEnabled = false;
+  impl_->callRemoteWatchingVideo = true;
   impl_->callVideoCodec = resolve_network_video_codec(settings);
   impl_->callSettings = settings;
   impl_->callFrameMs = (settings.frameMs == 10) ? 10 : 20;

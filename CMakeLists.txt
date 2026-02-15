@@ -194,6 +194,9 @@ if(Qt6Widgets_FOUND)
     gui/SettingsDialog.hpp
     ${P2PCHAT_VIDEO_SOURCES}
   )
+  if(WIN32)
+    set_target_properties(p2p_chat_gui PROPERTIES WIN32_EXECUTABLE ON)
+  endif()
   target_include_directories(p2p_chat_gui PRIVATE .)
   target_link_libraries(p2p_chat_gui PRIVATE Qt6::Widgets Qt6::Core Boost::system OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
   p2pchat_max_perf(p2p_chat_gui)

@@ -65,6 +65,8 @@ constexpr int kRoleServerId = Qt::UserRole + 11;
 constexpr int kRoleServerChannelId = Qt::UserRole + 12;
 constexpr int kRoleServerChannelVoice = Qt::UserRole + 13;
 constexpr int kRoleIndentPx = Qt::UserRole + 14;
+constexpr int kRoleVoiceLive = Qt::UserRole + 15;
+constexpr int kRoleWatchOverlay = Qt::UserRole + 16;
 
 constexpr int kServerHeaderItem = 1;
 constexpr int kServerChannelItem = 2;
@@ -98,6 +100,7 @@ public:
     const int presence = index.data(kRolePresenceState).toInt();
 
     const bool isVoiceMember = index.data(kRoleServerItemType).toInt() == kServerVoiceMemberItem;
+    const bool isLiveSharing = isVoiceMember && index.data(kRoleVoiceLive).toBool();
     const bool hasPresence = index.data(kRolePresenceState).isValid();
     const int dot = (isVoiceMember || !hasPresence) ? 0 : 10;
     const int margin = 8;
@@ -121,7 +124,24 @@ public:
     dotRect.setBottom(dotRect.top() + dot);
 
     const int textLeft = margin + indentPx + (hasIcon ? (icon + margin) : 0);
-    QRect textRect = opt.rect.adjusted(textLeft, 0, -(margin + (dot > 0 ? dot + margin : 0)), 0);
+    int rightPad = margin + (dot > 0 ? dot + margin : 0);
+    QRect liveRect;
+    QString liveText;
+    QFont liveFont = opt.font;
+    if (isLiveSharing) {
+      liveText = "LIVE";
+      liveFont.setBold(true);
+      liveFont.setPointSize(std::max(8, opt.font.pointSize() - 1));
+      const QFontMetrics lfm(liveFont);
+      const int liveH = std::max(14, std::min(18, opt.rect.height() - 8));
+      const int liveW = std::max(34, lfm.horizontalAdvance(liveText) + 12);
+      liveRect = QRect(opt.rect.right() - margin - liveW + 1,
+                       opt.rect.center().y() - (liveH / 2),
+                       liveW,
+                       liveH);
+      rightPad += liveW + margin;
+    }
+    QRect textRect = opt.rect.adjusted(textLeft, 0, -rightPad, 0);
 
     // Draw background/selection without text.
     QStyleOptionViewItem bg(opt);
@@ -162,6 +182,15 @@ public:
       painter->setBrush(c);
       painter->setPen(Qt::NoPen);
       painter->drawEllipse(dotRect);
+    }
+    if (isLiveSharing && !liveRect.isEmpty()) {
+      painter->setRenderHint(QPainter::Antialiasing, true);
+      painter->setPen(Qt::NoPen);
+      painter->setBrush(QColor(237, 66, 69));
+      painter->drawRoundedRect(liveRect, 7, 7);
+      painter->setFont(liveFont);
+      painter->setPen(Qt::white);
+      painter->drawText(liveRect, Qt::AlignCenter, liveText);
     }
     painter->restore();
   }
@@ -207,6 +236,59 @@ QPixmap loadAvatarOrPlaceholder(const QString& seed, const QString& path, int si
   return placeholderAvatar(seed, size);
 }
 
+QColor dominantColorFromAvatar(const QPixmap& avatar, const QString& fallbackSeed) {
+  if (avatar.isNull()) return colorFromId(fallbackSeed);
+  QImage img = avatar.toImage().convertToFormat(QImage::Format_ARGB32_Premultiplied);
+  if (img.isNull()) return colorFromId(fallbackSeed);
+  img = img.scaled(QSize(40, 40), Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
+  if (img.isNull()) return colorFromId(fallbackSeed);
+
+  quint64 rSum = 0;
+  quint64 gSum = 0;
+  quint64 bSum = 0;
+  quint64 wSum = 0;
+  for (int y = 0; y < img.height(); ++y) {
+    const auto* line = reinterpret_cast<const QRgb*>(img.scanLine(y));
+    for (int x = 0; x < img.width(); ++x) {
+      const QColor c = QColor::fromRgba(line[x]);
+      const int a = c.alpha();
+      if (a < 16) continue;
+      rSum += static_cast<quint64>(c.red()) * static_cast<quint64>(a);
+      gSum += static_cast<quint64>(c.green()) * static_cast<quint64>(a);
+      bSum += static_cast<quint64>(c.blue()) * static_cast<quint64>(a);
+      wSum += static_cast<quint64>(a);
+    }
+  }
+  if (wSum == 0) return colorFromId(fallbackSeed);
+
+  QColor out(static_cast<int>(rSum / wSum), static_cast<int>(gSum / wSum), static_cast<int>(bSum / wSum));
+  int h = 0;
+  int s = 0;
+  int l = 0;
+  int a = 255;
+  out.getHsl(&h, &s, &l, &a);
+  s = std::clamp(s + 18, 50, 220);
+  l = std::clamp(l - 20, 45, 150);
+  return QColor::fromHsl(h < 0 ? 0 : h, s, l, 255);
+}
+
+QPixmap roundAvatarPixmap(const QPixmap& avatar, int size) {
+  if (size < 8) size = 8;
+  QPixmap src = avatar;
+  if (src.isNull()) return {};
+  src = src.scaled(size, size, Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
+  QPixmap out(size, size);
+  out.fill(Qt::transparent);
+
+  QPainter p(&out);
+  p.setRenderHint(QPainter::Antialiasing, true);
+  QPainterPath clip;
+  clip.addEllipse(QRectF(0.5, 0.5, size - 1.0, size - 1.0));
+  p.setClipPath(clip);
+  p.drawPixmap(0, 0, src);
+  return out;
+}
+
 QPixmap videoPlaceholderCard(const QString& seed, const QString& name, const QString& avatarPath, QSize size) {
   if (size.width() < 40) size.setWidth(40);
   if (size.height() < 40) size.setHeight(40);
@@ -216,12 +298,27 @@ QPixmap videoPlaceholderCard(const QString& seed, const QString& name, const QSt
   QPainter p(&pm);
   p.setRenderHint(QPainter::Antialiasing, true);
   const QRect r = pm.rect().adjusted(1, 1, -1, -1);
-  p.setPen(QColor(80, 80, 80, 180));
-  p.setBrush(QColor(35, 35, 35, 230));
+  const QPixmap rawAvatar = loadAvatarOrPlaceholder(seed, avatarPath, 128);
+  const QColor bg = dominantColorFromAvatar(rawAvatar, seed);
+  const QColor bgDark = bg.darker(145);
+  const QColor bgLight = bg.lighter(118);
+  QLinearGradient grad(r.topLeft(), r.bottomRight());
+  grad.setColorAt(0.0, bgLight);
+  grad.setColorAt(1.0, bgDark);
+  p.setPen(QColor(255, 255, 255, 24));
+  p.setBrush(grad);
+  p.drawRoundedRect(r, 8, 8);
+
+  QLinearGradient dimGrad(QPointF(0, r.top()), QPointF(0, r.bottom()));
+  dimGrad.setColorAt(0.0, QColor(0, 0, 0, 28));
+  dimGrad.setColorAt(1.0, QColor(0, 0, 0, 92));
+  p.setPen(Qt::NoPen);
+  p.setBrush(dimGrad);
   p.drawRoundedRect(r, 8, 8);
 
   const int avatarSize = std::min(size.width(), size.height()) / 3;
-  const QPixmap avatar = loadAvatarOrPlaceholder(seed, avatarPath, std::max(48, avatarSize));
+  const int finalAvatarSize = std::max(48, avatarSize);
+  const QPixmap avatar = roundAvatarPixmap(rawAvatar, finalAvatarSize);
   const QRect avatarRect((size.width() - avatar.width()) / 2,
                          std::max(10, size.height() / 2 - avatar.height() / 2 - 10),
                          avatar.width(),
@@ -232,10 +329,10 @@ QPixmap videoPlaceholderCard(const QString& seed, const QString& name, const QSt
   f.setBold(true);
   f.setPointSize(std::max(9, std::min(14, size.width() / 28)));
   p.setFont(f);
-  p.setPen(QColor(235, 235, 235));
+  p.setPen(QColor(245, 245, 245));
   const QString text = name.isEmpty() ? "No video" : name;
   const QRect textRect(10, avatarRect.bottom() + 8, size.width() - 20, size.height() - avatarRect.bottom() - 14);
-  p.drawText(textRect, Qt::AlignHCenter | Qt::AlignTop | Qt::TextWordWrap, text);
+  p.drawText(textRect, Qt::AlignHCenter | Qt::AlignTop, text);
   return pm;
 }
 
@@ -287,6 +384,38 @@ QPixmap roundedContain(const QImage& img, QSize target, int radius = 8) {
   p.setPen(QColor(90, 90, 90, 180));
   p.setBrush(Qt::NoBrush);
   p.drawRoundedRect(QRectF(0.5, 0.5, target.width() - 1.0, target.height() - 1.0), radius, radius);
+  return out;
+}
+
+QPixmap withWatchStreamOverlay(const QPixmap& base) {
+  if (base.isNull()) return {};
+  QPixmap out = base.copy();
+  QPainter p(&out);
+  p.setRenderHint(QPainter::Antialiasing, true);
+
+  const QRectF card(1.0, 1.0, out.width() - 2.0, out.height() - 2.0);
+  QPainterPath clip;
+  clip.addRoundedRect(card, 8, 8);
+  p.setClipPath(clip);
+  p.fillRect(out.rect(), QColor(0, 0, 0, 95));
+  p.setClipping(false);
+
+  const QString label = "Watch Stream";
+  QFont font = p.font();
+  font.setBold(true);
+  font.setPointSize(std::max(9, std::min(13, out.width() / 24)));
+  p.setFont(font);
+  QFontMetrics fm(font);
+
+  const int btnH = std::max(32, std::min(42, out.height() / 5));
+  const int btnW = std::max(138, std::min(out.width() - 24, fm.horizontalAdvance(label) + 44));
+  const QRect btnRect((out.width() - btnW) / 2, (out.height() - btnH) / 2, btnW, btnH);
+
+  p.setPen(QColor(220, 220, 220, 70));
+  p.setBrush(QColor(44, 47, 51, 235));
+  p.drawRoundedRect(btnRect, 10, 10);
+  p.setPen(QColor(245, 245, 245));
+  p.drawText(btnRect, Qt::AlignCenter, label);
   return out;
 }
 
@@ -747,14 +876,20 @@ MainWindow::MainWindow(QString keyPassword, QWidget* parent)
   connect(&backend_, &ChatBackend::callStateChanged, this, [this](QString peerId, QString state) {
     activeCallPeer_ = peerId;
     activeCallState_ = state;
+    if (!peerId.isEmpty()) {
+      backend_.setPeerVideoWatch(peerId, isWatchingPeerVideo(peerId));
+    }
     refreshCallButton();
     refreshVideoPanel();
   });
 
   connect(&backend_, &ChatBackend::callEnded, this, [this](QString peerId, QString reason) {
+    const bool hadRemoteLive = remoteVideoFrames_.contains(peerId);
+    remoteVideoAvailable_[peerId] = false;
     remoteVideoFrames_.remove(peerId);
     if (remoteVideoPeerId_ == peerId) remoteVideoPeerId_.clear();
     remoteVideoActive_ = !remoteVideoFrames_.isEmpty();
+    if (hadRemoteLive) rebuildServerList();
     if (activeCallPeer_ == peerId) {
       activeCallPeer_.clear();
       activeCallState_.clear();
@@ -766,27 +901,46 @@ MainWindow::MainWindow(QString keyPassword, QWidget* parent)
   });
 
   connect(&backend_, &ChatBackend::localVideoFrame, this, [this](QImage frame) {
+    const bool wasLocalLive = localVideoActive_;
     if (frame.isNull()) {
       localVideoActive_ = false;
       localVideoFrame_ = QImage();
+      if (wasLocalLive != localVideoActive_) rebuildServerList();
       refreshVideoPanel();
       return;
     }
     localVideoActive_ = true;
     localVideoFrame_ = frame;
+    if (wasLocalLive != localVideoActive_) rebuildServerList();
     refreshVideoPanel();
   });
   connect(&backend_, &ChatBackend::remoteVideoFrame, this, [this](QString peerId, QImage frame) {
     if (!activeCallPeer_.isEmpty() && peerId != activeCallPeer_) return;
+    if (!isWatchingPeerVideo(peerId)) return;
+    const bool wasRemoteLive = remoteVideoFrames_.contains(peerId) && !remoteVideoFrames_.value(peerId).isNull();
     remoteVideoPeerId_ = peerId;
     if (frame.isNull()) {
       remoteVideoFrames_.remove(peerId);
       remoteVideoActive_ = !remoteVideoFrames_.isEmpty();
+      if (wasRemoteLive) rebuildServerList();
       refreshVideoPanel();
       return;
     }
     remoteVideoActive_ = true;
     remoteVideoFrames_[peerId] = frame;
+    if (!wasRemoteLive) rebuildServerList();
+    refreshVideoPanel();
+  });
+  connect(&backend_, &ChatBackend::remoteVideoAvailabilityChanged, this, [this](QString peerId, bool available) {
+    if (peerId.isEmpty()) return;
+    remoteVideoAvailable_[peerId] = available;
+    if (!available) {
+      remoteVideoFrames_.remove(peerId);
+      if (remoteVideoPeerId_ == peerId) remoteVideoPeerId_.clear();
+      remoteVideoActive_ = !remoteVideoFrames_.isEmpty();
+      if (expandedVideoPeerId_ == peerId) expandedVideoPeerId_.clear();
+    }
+    rebuildServerList();
     refreshVideoPanel();
   });
 
@@ -812,6 +966,10 @@ MainWindow::MainWindow(QString keyPassword, QWidget* parent)
     rendezvousOnline_[peerId] = online;
     if (!online) {
       directOnline_[peerId] = false;
+      remoteVideoAvailable_[peerId] = false;
+      remoteVideoFrames_.remove(peerId);
+      if (remoteVideoPeerId_ == peerId) remoteVideoPeerId_.clear();
+      remoteVideoActive_ = !remoteVideoFrames_.isEmpty();
       for (auto it = voiceOccupantsByChannel_.begin(); it != voiceOccupantsByChannel_.end(); ++it) {
         it.value().remove(peerId);
       }
@@ -921,6 +1079,7 @@ void MainWindow::buildUi() {
                              &profile_.video,
                              &profile_.screen,
                              &profile_.shareIdentityWithNonFriendsInServers,
+                             &profile_.signedOnlyServerMessages,
                              this)) {
       if (profile_.video.devicePath.trimmed().isEmpty()) webcamEnabled_ = false;
       backend_.updateVoiceSettings(voiceSettingsFromProfile(profile_.audio,
@@ -1250,7 +1409,7 @@ void MainWindow::buildUi() {
     showChatContextMenu(pos);
   });
 
-  connect(serverList_, &QListWidget::itemClicked, this, [this](QListWidgetItem* item) {
+  connect(serverList_, &QListWidget::itemPressed, this, [this](QListWidgetItem* item) {
     if (!item) return;
     const int type = item->data(kRoleServerItemType).toInt();
     if (type == kServerHeaderItem) {
@@ -1270,10 +1429,19 @@ void MainWindow::buildUi() {
       return;
     }
     if (type == kServerVoiceMemberItem) {
-      const auto peerId = item->data(kRolePeerId).toString();
-      if (!peerId.isEmpty()) showProfilePopup(peerId);
+      const auto serverId = item->data(kRoleServerId).toString();
+      const auto channelId = item->data(kRoleServerChannelId).toString();
+      if (!serverId.isEmpty() && !channelId.isEmpty()) {
+        selectServerChannel(serverId, channelId, /*voice=*/true);
+      }
       return;
     }
+  });
+  connect(serverList_, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem* item) {
+    if (!item) return;
+    if (item->data(kRoleServerItemType).toInt() != kServerVoiceMemberItem) return;
+    const auto peerId = item->data(kRolePeerId).toString();
+    if (!peerId.isEmpty()) showProfilePopup(peerId);
   });
 
   connect(serverList_, &QListWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
@@ -1298,10 +1466,15 @@ void MainWindow::buildUi() {
         (selectedServerChannelVoice_ && !selectedServerId_.isEmpty()) ? selectedServerId_ : QString();
     showServerPeerContextMenu(peerId, serverId, videoTiles_->viewport()->mapToGlobal(pos), /*allowProfile*/ true);
   });
-  connect(videoTiles_, &QListWidget::itemClicked, this, [this](QListWidgetItem* item) {
+  connect(videoTiles_, &QListWidget::itemPressed, this, [this](QListWidgetItem* item) {
     if (!item) return;
+    if (!(QApplication::mouseButtons() & Qt::LeftButton)) return;
     const auto peerId = item->data(kRolePeerId).toString();
     if (peerId.isEmpty()) return;
+    if (item->data(kRoleWatchOverlay).toBool()) {
+      setPeerVideoWatching(peerId, true);
+      return;
+    }
     if (expandedVideoPeerId_ == peerId) {
       expandedVideoPeerId_.clear();
     } else {
@@ -1397,10 +1570,12 @@ void MainWindow::buildUi() {
       }
     }
     webcamEnabled_ = enabled;
+    const bool wasLocalLive = localVideoActive_;
     if (!webcamEnabled_) {
       localVideoActive_ = false;
       localVideoFrame_ = QImage();
     }
+    if (wasLocalLive != localVideoActive_) rebuildServerList();
     refreshCallButton();
     refreshVideoPanel();
     if (!activeCallPeer_.isEmpty() && !activeCallState_.isEmpty()) {
@@ -1414,6 +1589,7 @@ void MainWindow::buildUi() {
     }
   });
   connect(screenShareBtn_, &QPushButton::toggled, this, [this](bool enabled) {
+    const bool wasLocalLive = localVideoActive_;
     if (enabled) {
       const QString displayName = chooseDisplayForShare(this, profile_.screen.lastDisplayName);
       if (displayName.trimmed().isEmpty()) {
@@ -1442,6 +1618,7 @@ void MainWindow::buildUi() {
       }
     }
     screenShareEnabled_ = enabled && !screenShareDisplayName_.trimmed().isEmpty();
+    if (wasLocalLive != localVideoActive_) rebuildServerList();
     refreshCallButton();
     refreshVideoPanel();
     if (!activeCallPeer_.isEmpty() && !activeCallState_.isEmpty()) {
@@ -1764,6 +1941,11 @@ void MainWindow::rebuildServerList() {
         memberItem->setData(kRolePeerId, id);
         memberItem->setData(kRoleIndentPx, 24);
         memberItem->setData(kRolePresenceState, presenceStateFor(id));
+        const bool liveSharing = (id == selfId_)
+                                     ? ((webcamEnabled_ || screenShareEnabled_) && localVideoActive_)
+                                     : remoteVideoAvailable_.value(
+                                           id, remoteVideoFrames_.contains(id) && !remoteVideoFrames_.value(id).isNull());
+        memberItem->setData(kRoleVoiceLive, liveSharing);
         QString avatarPath = (id == selfId_) ? profile_.selfAvatarPath : (f ? f->avatarPath : QString());
         if (avatarPath.isEmpty() && shouldShowNonFriendAvatar(id, hinted)) {
           const auto candidate = Profile::peerAvatarFile(id);
@@ -1998,18 +2180,25 @@ void MainWindow::showServerPeerContextMenu(const QString& peerId,
   const auto* server = serverId.isEmpty() ? nullptr : profile_.findServer(serverId);
   const bool canKick = (server && !selfId_.isEmpty() && server->ownerId == selfId_ && peerId != selfId_);
   const bool canMute = (peerId != selfId_);
+  const bool canWatchControl =
+      (peerId != selfId_) && (peerId == activeCallPeer_ || remoteVideoAvailable_.value(peerId, false) ||
+                              remoteVideoFrames_.contains(peerId));
   QMenu menu(this);
   QAction* profileAct = nullptr;
   QAction* muteAct = nullptr;
+  QAction* watchAct = nullptr;
   QAction* kickAct = nullptr;
   if (allowProfile) profileAct = menu.addAction("View profile...");
   if (canMute) muteAct = menu.addAction(isVoiceMuted(peerId) ? "Unmute in voice channels" : "Mute in voice channels");
+  if (canWatchControl) {
+    watchAct = menu.addAction(isWatchingPeerVideo(peerId) ? "Stop watching stream" : "Watch stream");
+  }
   if (canKick) {
-    if (profileAct || muteAct) menu.addSeparator();
+    if (profileAct || muteAct || watchAct) menu.addSeparator();
     kickAct = menu.addAction("Kick user");
   }
 
-  if (!profileAct && !muteAct && !kickAct) return;
+  if (!profileAct && !muteAct && !watchAct && !kickAct) return;
   auto* chosen = menu.exec(globalPos);
   if (!chosen) return;
   if (chosen == profileAct) {
@@ -2018,6 +2207,10 @@ void MainWindow::showServerPeerContextMenu(const QString& peerId,
   }
   if (chosen == muteAct) {
     setVoiceMuted(peerId, !isVoiceMuted(peerId));
+    return;
+  }
+  if (chosen == watchAct) {
+    setPeerVideoWatching(peerId, !isWatchingPeerVideo(peerId));
     return;
   }
   if (chosen == kickAct && server) {
@@ -2035,6 +2228,35 @@ bool MainWindow::isVoiceMuted(const QString& peerId) const {
   return mutedVoicePeerIds_.contains(peerId);
 }
 
+bool MainWindow::isWatchingPeerVideo(const QString& peerId) const {
+  if (peerId.isEmpty()) return false;
+  return !stoppedWatchingVideoPeerIds_.contains(peerId);
+}
+
+void MainWindow::setPeerVideoWatching(const QString& peerId, bool watching) {
+  if (peerId.isEmpty() || peerId == selfId_) return;
+  const bool current = isWatchingPeerVideo(peerId);
+  if (current == watching) return;
+
+  if (watching) {
+    stoppedWatchingVideoPeerIds_.remove(peerId);
+  } else {
+    stoppedWatchingVideoPeerIds_.insert(peerId);
+    remoteVideoFrames_.remove(peerId);
+    if (remoteVideoPeerId_ == peerId) remoteVideoPeerId_.clear();
+    remoteVideoActive_ = !remoteVideoFrames_.isEmpty();
+    if (expandedVideoPeerId_ == peerId) expandedVideoPeerId_.clear();
+  }
+
+  backend_.setPeerVideoWatch(peerId, watching);
+  rebuildServerList();
+  refreshVideoPanel();
+  statusBar()->showMessage(
+      watching ? QString("Watching %1's stream").arg(serverPeerDisplayName(peerId))
+               : QString("Stopped watching %1's stream").arg(serverPeerDisplayName(peerId)),
+      3500);
+}
+
 void MainWindow::setVoiceMuted(const QString& peerId, bool muted) {
   if (peerId.isEmpty() || peerId == selfId_) return;
   const bool had = mutedVoicePeerIds_.contains(peerId);
@@ -2049,7 +2271,6 @@ void MainWindow::setVoiceMuted(const QString& peerId, bool muted) {
   saveProfile();
   rebuildServerList();
   refreshServerMembersPane();
-  maybeSyncVoiceCallForJoinedChannel();
   statusBar()->showMessage(
       muted ? QString("Muted %1 in voice channels").arg(serverPeerDisplayName(peerId))
             : QString("Unmuted %1 in voice channels").arg(serverPeerDisplayName(peerId)),
@@ -2299,6 +2520,7 @@ void MainWindow::handleUnsignedControl(const QString& peerId,
                                        const QString& kind,
                                        const QString& payloadJsonCompact,
                                        const QString& fromId) {
+  if (profile_.signedOnlyServerMessages) return;
   if (peerId != fromId) return;
   QJsonParseError pe;
   const auto doc = QJsonDocument::fromJson(payloadJsonCompact.toUtf8(), &pe);
@@ -2634,6 +2856,10 @@ void MainWindow::broadcastServerText(const QString& serverId, const QString& cha
 
 void MainWindow::broadcastServerGlobalSay(const QString& serverId, const QString& text) {
   if (text.isEmpty()) return;
+  if (profile_.signedOnlyServerMessages) {
+    statusBar()->showMessage("Signed-only mode is enabled; /say is disabled", 5000);
+    return;
+  }
   auto* s = profile_.findServer(serverId);
   if (!s) return;
   if (s->ownerId != selfId_) {
@@ -2865,7 +3091,7 @@ void MainWindow::maybeSyncVoiceCallForJoinedChannel() {
   auto peers = voiceOccupantsByChannel_.value(joinedServerVoiceKey_);
   peers.remove(selfId_);
   for (auto it = peers.begin(); it != peers.end();) {
-    if (presenceStateFor(*it) == kPresenceOffline || isVoiceMuted(*it)) {
+    if (presenceStateFor(*it) == kPresenceOffline) {
       it = peers.erase(it);
     } else {
       ++it;
@@ -3311,6 +3537,7 @@ void MainWindow::refreshVideoPanel() {
   for (const auto& peerId : peerIds) {
     auto* item = new QListWidgetItem();
     item->setData(kRolePeerId, peerId);
+    item->setData(kRoleWatchOverlay, false);
 
     QString display;
     if (peerId == selfId_) {
@@ -3334,13 +3561,23 @@ void MainWindow::refreshVideoPanel() {
 
     QPixmap tile;
     const bool expanded = !expandedVideoPeerId_.isEmpty();
-    if (peerId == selfId_ && (webcamEnabled_ || screenShareEnabled_) && localVideoActive_ && !localVideoFrame_.isNull()) {
+    const bool selfTile = (peerId == selfId_);
+    const bool watchingRemote = selfTile ? true : isWatchingPeerVideo(peerId);
+    const bool remoteAvailable =
+        !selfTile && remoteVideoAvailable_.value(peerId, remoteVideoFrames_.contains(peerId) && !remoteVideoFrames_[peerId].isNull());
+    const bool showWatchOverlay = remoteAvailable && !watchingRemote;
+    if (selfTile && (webcamEnabled_ || screenShareEnabled_) && localVideoActive_ && !localVideoFrame_.isNull()) {
       tile = expanded ? roundedContain(localVideoFrame_, QSize(tileW, tileH)) : roundedCover(localVideoFrame_, QSize(tileW, tileH));
     } else if (remoteVideoFrames_.contains(peerId) && !remoteVideoFrames_[peerId].isNull()) {
       tile = expanded ? roundedContain(remoteVideoFrames_[peerId], QSize(tileW, tileH))
                       : roundedCover(remoteVideoFrames_[peerId], QSize(tileW, tileH));
     } else {
       tile = videoPlaceholderCard(peerId, display, avatarPath, QSize(tileW, tileH));
+    }
+    if (showWatchOverlay) {
+      tile = withWatchStreamOverlay(tile);
+      item->setData(kRoleWatchOverlay, true);
+      item->setToolTip(display + " — Watch Stream");
     }
     item->setIcon(QIcon(tile));
     item->setSizeHint(QSize(tileW, tileH));

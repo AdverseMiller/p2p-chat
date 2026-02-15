@@ -96,6 +96,7 @@ SettingsDialog::SettingsDialog(const Profile::AudioSettings& initial,
                                const Profile::VideoSettings& video_initial,
                                const Profile::ScreenSettings& screen_initial,
                                bool share_identity_non_friends,
+                               bool signed_only_server_messages,
                                QWidget* parent)
     : QDialog(parent), initial_(initial), videoInitial_(video_initial), screenInitial_(screen_initial) {
   setWindowTitle("Settings");
@@ -320,6 +321,12 @@ SettingsDialog::SettingsDialog(const Profile::AudioSettings& initial,
   shareIdentityCheck_ = new QCheckBox("Allow non-friends in servers to see my username and profile picture", privacyTab);
   shareIdentityCheck_->setChecked(share_identity_non_friends);
   privacyRoot->addWidget(shareIdentityCheck_);
+  signedOnlyServerMessagesCheck_ = new QCheckBox("Signed-only server messages (ignore unsigned /say)", privacyTab);
+  signedOnlyServerMessagesCheck_->setChecked(signed_only_server_messages);
+  signedOnlyServerMessagesCheck_->setToolTip(
+      "When enabled, unsigned server messages are ignored.\n"
+      "This disables receiving owner /say broadcast messages.");
+  privacyRoot->addWidget(signedOnlyServerMessagesCheck_);
   privacyRoot->addStretch(1);
   tabs->addTab(privacyTab, "Privacy");
 
@@ -795,17 +802,30 @@ bool SettingsDialog::shareIdentityWithNonFriends() const {
   return shareIdentityCheck_ ? shareIdentityCheck_->isChecked() : false;
 }
 
+bool SettingsDialog::signedOnlyServerMessages() const {
+  return signedOnlyServerMessagesCheck_ ? signedOnlyServerMessagesCheck_->isChecked() : false;
+}
+
 bool SettingsDialog::edit(Profile::AudioSettings* inOut,
                           Profile::VideoSettings* video_in_out,
                           Profile::ScreenSettings* screen_in_out,
                           bool* share_identity_non_friends,
+                          bool* signed_only_server_messages,
                           QWidget* parent) {
-  if (!inOut || !video_in_out || !screen_in_out || !share_identity_non_friends) return false;
-  SettingsDialog dlg(*inOut, *video_in_out, *screen_in_out, *share_identity_non_friends, parent);
+  if (!inOut || !video_in_out || !screen_in_out || !share_identity_non_friends || !signed_only_server_messages) {
+    return false;
+  }
+  SettingsDialog dlg(*inOut,
+                     *video_in_out,
+                     *screen_in_out,
+                     *share_identity_non_friends,
+                     *signed_only_server_messages,
+                     parent);
   if (dlg.exec() != QDialog::Accepted) return false;
   *inOut = dlg.settings();
   *video_in_out = dlg.videoSettings();
   *screen_in_out = dlg.screenSettings();
   *share_identity_non_friends = dlg.shareIdentityWithNonFriends();
+  *signed_only_server_messages = dlg.signedOnlyServerMessages();
   return true;
 }
