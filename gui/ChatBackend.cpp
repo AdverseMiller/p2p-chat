@@ -46,8 +46,10 @@
 #include <QAudioSink>
 #include <QAudioSource>
 #include <QElapsedTimer>
+#include <QHash>
 #include <QIODevice>
 #include <QMap>
+#include <QSet>
 #include <QMediaDevices>
 
 #include <opus/opus.h>
@@ -2063,8 +2065,18 @@ struct ChatBackend::Impl {
 
 #if defined(P2PCHAT_VOICE)
   struct VoiceRuntime {
+    struct RxPeerState {
+      OpusDecoder* dec = nullptr;
+      QMap<quint64, QByteArray> jitter; // seq -> opus frame
+      quint64 expectedSeq = 0;
+      bool playoutStarted = false;
+      uint64_t rxFrames = 0;
+      uint64_t decFrames = 0;
+    };
+
     QString peerId;
     QString callId;
+    bool channelMode = false;
     int frameMs = 20;
     int bitrate = 32000;
     int sampleRate = 48000;
@@ -2081,6 +2093,8 @@ struct ChatBackend::Impl {
     QPointer<PcmRingBufferIODevice> sinkDev;
 
     QPointer<QTimer> playoutTimer;
+    QSet<QString> txPeers;
+    QHash<QString, RxPeerState> rxPeers;
     QMap<quint64, QByteArray> jitter; // seq -> opus frame
     quint64 expectedSeq = 0;
     bool playoutStarted = false;
@@ -2093,6 +2107,9 @@ struct ChatBackend::Impl {
     uint64_t decFrames = 0;
   };
   std::unique_ptr<VoiceRuntime> voice;
+  bool voiceChannelActive = false;
+  ChatBackend::VoiceSettings voiceChannelSettings;
+  QSet<QString> voiceChannelPeers;
 #endif
 
 #if defined(P2PCHAT_VIDEO)
@@ -2196,7 +2213,8 @@ struct ChatBackend::Impl {
     stopVideoQt();
     if (!voice) return;
     if (debug_logs_enabled()) {
-      emit q->logLine("[dbg] voice stop peer=" + voice->peerId + " capBytes=" + QString::number(voice->capBytes) +
+      const QString mode = voice->channelMode ? "channel" : "direct";
+      emit q->logLine("[dbg] voice stop mode=" + mode + " peer=" + voice->peerId + " capBytes=" + QString::number(voice->capBytes) +
                       " encFrames=" + QString::number(voice->encFrames) + " rxFrames=" + QString::number(voice->rxFrames) +
                       " decFrames=" + QString::number(voice->decFrames));
     }
@@ -2233,6 +2251,14 @@ struct ChatBackend::Impl {
       opus_decoder_destroy(voice->dec);
       voice->dec = nullptr;
     }
+    for (auto it = voice->rxPeers.begin(); it != voice->rxPeers.end(); ++it) {
+      if (it->dec) {
+        opus_decoder_destroy(it->dec);
+        it->dec = nullptr;
+      }
+    }
+    voice->rxPeers.clear();
+    voice->txPeers.clear();
     voice.reset();
   }
 
@@ -2245,9 +2271,227 @@ struct ChatBackend::Impl {
     return QAudioDevice();
   }
 
+  void syncVoiceChannelPeersQt() {
+    if (!voice || !voice->channelMode) return;
+
+    // Keep TX peers in sync.
+    voice->txPeers = voiceChannelPeers;
+
+    // Drop decoder/jitter state for peers no longer in channel.
+    for (auto it = voice->rxPeers.begin(); it != voice->rxPeers.end();) {
+      if (!voice->txPeers.contains(it.key())) {
+        if (it->dec) opus_decoder_destroy(it->dec);
+        it = voice->rxPeers.erase(it);
+      } else {
+        ++it;
+      }
+    }
+
+    const int frameMs = voice->frameMs;
+    const QStringList peers = voice->txPeers.values();
+    boost::asio::post(io, [this, peers, frameMs] {
+      for (const auto& peerId : peers) {
+        auto it = udp_sessions.find(peerId.toStdString());
+        if (it != udp_sessions.end() && it->second) it->second->set_voice_frame_ms(frameMs);
+      }
+    });
+  }
+
+  void startVoiceChannelQt() {
+    if (!voiceChannelActive || voiceChannelPeers.isEmpty()) {
+      if (voice && voice->channelMode) stopVoiceQt();
+      return;
+    }
+    if (voice) {
+      if (voice->channelMode) {
+        syncVoiceChannelPeersQt();
+      }
+      return;
+    }
+
+    const int frameMs = (voiceChannelSettings.frameMs == 10) ? 10 : 20;
+    const int sampleRate = 48000;
+    const int channels = (voiceChannelSettings.channels == 2) ? 2 : 1;
+    const int frameSamples = sampleRate * frameMs / 1000;
+    const int bitrate = std::clamp(voiceChannelSettings.bitrate, 8000, 128000);
+
+    int err = 0;
+    OpusEncoder* enc = opus_encoder_create(sampleRate, channels, OPUS_APPLICATION_VOIP, &err);
+    if (!enc || err != OPUS_OK) {
+      if (enc) opus_encoder_destroy(enc);
+      emit q->logLine("voice: failed to create Opus encoder for voice channel");
+      return;
+    }
+    opus_encoder_ctl(enc, OPUS_SET_BITRATE(bitrate));
+
+    QAudioFormat fmt;
+    fmt.setSampleRate(sampleRate);
+    fmt.setChannelCount(channels);
+    fmt.setSampleFormat(QAudioFormat::Int16);
+
+    const bool disableInput = is_none_audio_device(voiceChannelSettings.inputDeviceIdHex);
+    const bool disableOutput = is_none_audio_device(voiceChannelSettings.outputDeviceIdHex);
+    auto inDev = findAudioDeviceByHexId(QMediaDevices::audioInputs(), voiceChannelSettings.inputDeviceIdHex);
+    if (!disableInput && inDev.isNull()) inDev = QMediaDevices::defaultAudioInput();
+    auto outDev = findAudioDeviceByHexId(QMediaDevices::audioOutputs(), voiceChannelSettings.outputDeviceIdHex);
+    if (!disableOutput && outDev.isNull()) outDev = QMediaDevices::defaultAudioOutput();
+
+    auto vr = std::make_unique<VoiceRuntime>();
+    vr->channelMode = true;
+    vr->peerId = "__voice_channel__";
+    vr->frameMs = frameMs;
+    vr->bitrate = bitrate;
+    vr->sampleRate = sampleRate;
+    vr->channels = channels;
+    vr->enc = enc;
+    vr->txPeers = voiceChannelPeers;
+    vr->logTimer.start();
+
+    if (!disableOutput && !outDev.isNull()) {
+      vr->sinkDev = new PcmRingBufferIODevice(q);
+      vr->sinkDev->start();
+      vr->sink = new QAudioSink(outDev, fmt, q);
+      vr->sink->setBufferSize(frameSamples * channels * static_cast<int>(sizeof(opus_int16)) * 6);
+      vr->sink->setVolume(std::clamp(voiceChannelSettings.speakerVolume, 0, 100) / 100.0);
+      vr->sink->start(vr->sinkDev.data());
+    }
+
+    if (!disableInput && !inDev.isNull()) {
+      vr->source = new QAudioSource(inDev, fmt, q);
+      vr->source->setBufferSize(frameSamples * channels * static_cast<int>(sizeof(opus_int16)) * 6);
+      vr->source->setVolume(std::clamp(voiceChannelSettings.micVolume, 0, 100) / 100.0);
+      vr->sourceDev = vr->source->start();
+    }
+
+    vr->playoutTimer = new QTimer(q);
+    vr->playoutTimer->setInterval(frameMs);
+    QObject::connect(vr->playoutTimer, &QTimer::timeout, q, [this, frameSamples] {
+      if (!voice || !voice->channelMode) return;
+      if (!voice->sinkDev) return;
+
+      std::vector<int32_t> mixed(static_cast<std::size_t>(frameSamples * voice->channels), 0);
+      int activeStreams = 0;
+
+      for (auto it = voice->rxPeers.begin(); it != voice->rxPeers.end(); ++it) {
+        const auto peerId = it.key();
+        auto& st = it.value();
+        if (!st.dec) continue;
+
+        {
+          std::lock_guard lk(m);
+          if (muted_voice_peers.find(peerId.toStdString()) != muted_voice_peers.end()) continue;
+        }
+
+        if (!st.playoutStarted && st.jitter.size() >= kVoiceJitterStartFrames) {
+          const quint64 newest = st.jitter.lastKey();
+          const quint64 startAt = (newest >= static_cast<quint64>(kVoiceJitterTargetFrames - 1))
+                                      ? (newest - static_cast<quint64>(kVoiceJitterTargetFrames - 1))
+                                      : newest;
+          st.expectedSeq = startAt;
+          while (!st.jitter.isEmpty() && st.jitter.firstKey() < st.expectedSeq) {
+            st.jitter.erase(st.jitter.begin());
+          }
+          st.playoutStarted = true;
+        }
+        if (!st.playoutStarted) continue;
+
+        if (st.jitter.size() > kVoiceJitterMaxFrames) {
+          const quint64 newest = st.jitter.lastKey();
+          const quint64 want = (newest >= static_cast<quint64>(kVoiceJitterTargetFrames - 1))
+                                   ? (newest - static_cast<quint64>(kVoiceJitterTargetFrames - 1))
+                                   : newest;
+          if (want > st.expectedSeq) st.expectedSeq = want;
+        }
+        while (!st.jitter.isEmpty() && st.jitter.firstKey() < st.expectedSeq) {
+          st.jitter.erase(st.jitter.begin());
+        }
+
+        QByteArray frame;
+        if (st.jitter.contains(st.expectedSeq)) {
+          frame = st.jitter.take(st.expectedSeq);
+        }
+        st.expectedSeq++;
+
+        std::vector<opus_int16> pcm(static_cast<std::size_t>(frameSamples * voice->channels));
+        int outSamples = 0;
+        if (!frame.isEmpty()) {
+          outSamples = opus_decode(st.dec,
+                                   reinterpret_cast<const unsigned char*>(frame.constData()),
+                                   frame.size(),
+                                   pcm.data(),
+                                   frameSamples,
+                                   0);
+        } else {
+          outSamples = opus_decode(st.dec, nullptr, 0, pcm.data(), frameSamples, 0);
+        }
+        if (outSamples <= 0) continue;
+
+        const int sampleCount = std::min(outSamples, frameSamples) * voice->channels;
+        for (int i = 0; i < sampleCount; ++i) {
+          mixed[static_cast<std::size_t>(i)] += static_cast<int32_t>(pcm[static_cast<std::size_t>(i)]);
+        }
+        ++activeStreams;
+      }
+
+      if (activeStreams <= 0) return;
+
+      std::vector<opus_int16> out(static_cast<std::size_t>(frameSamples * voice->channels));
+      for (std::size_t i = 0; i < out.size(); ++i) {
+        int32_t v = mixed[i] / activeStreams;
+        if (v > 32767) v = 32767;
+        if (v < -32768) v = -32768;
+        out[i] = static_cast<opus_int16>(v);
+      }
+      voice->sinkDev->push(QByteArray(reinterpret_cast<const char*>(out.data()),
+                                      static_cast<int>(out.size() * sizeof(opus_int16))));
+    });
+    vr->playoutTimer->start();
+
+    if (vr->sourceDev) {
+      QObject::connect(vr->sourceDev.data(), &QIODevice::readyRead, q, [this, frameSamples, channels] {
+        if (!voice || !voice->channelMode) return;
+        if (!voice->sourceDev) return;
+        const QByteArray got = voice->sourceDev->readAll();
+        voice->capBytes += static_cast<uint64_t>(got.size());
+        voice->captureBuf.append(got);
+        const int frameBytes = frameSamples * channels * static_cast<int>(sizeof(opus_int16));
+        while (voice && voice->captureBuf.size() >= frameBytes) {
+          const QByteArray pcm = voice->captureBuf.left(frameBytes);
+          voice->captureBuf.remove(0, frameBytes);
+
+          std::array<unsigned char, 1500> out{};
+          const int n = opus_encode(voice->enc,
+                                    reinterpret_cast<const opus_int16*>(pcm.constData()),
+                                    frameSamples,
+                                    out.data(),
+                                    static_cast<opus_int32>(out.size()));
+          if (n <= 0) continue;
+          std::vector<uint8_t> pkt(out.data(), out.data() + n);
+          const QStringList peers = voice->txPeers.values();
+          boost::asio::post(io, [this, peers, pkt = std::move(pkt)]() mutable {
+            for (const auto& peerId : peers) {
+              auto it = udp_sessions.find(peerId.toStdString());
+              if (it == udp_sessions.end() || !it->second) continue;
+              it->second->send_voice_frame(std::vector<uint8_t>(pkt.begin(), pkt.end()));
+            }
+          });
+        }
+      });
+    }
+
+    voice = std::move(vr);
+    syncVoiceChannelPeersQt();
+    emit q->logLine("voice channel: active (" + QString::number(voice->txPeers.size()) + " peers)");
+  }
+
   void maybeStartVoiceQt() {
+    if (voiceChannelActive) {
+      startVoiceChannelQt();
+      return;
+    }
     if (callPeerId.isEmpty() || callId.isEmpty()) return;
     if (!(callLocalAccepted && callRemoteAccepted)) return;
+    if (voice && voice->channelMode) return;
     if (voice) {
       maybeStartVideoQt();
       return;
@@ -2480,6 +2724,41 @@ struct ChatBackend::Impl {
 
   void handleVoiceFrameQt(const QString& peerId, quint64 seq, const QByteArray& opusFrame) {
     if (!voice) return;
+    if (voice->channelMode) {
+      if (!voice->txPeers.contains(peerId)) return;
+      if (opusFrame.isEmpty()) return;
+      {
+        std::lock_guard lk(m);
+        if (muted_voice_peers.find(peerId.toStdString()) != muted_voice_peers.end()) return;
+      }
+
+      auto it = voice->rxPeers.find(peerId);
+      if (it == voice->rxPeers.end()) {
+        int err = 0;
+        OpusDecoder* dec = opus_decoder_create(voice->sampleRate, voice->channels, &err);
+        if (!dec || err != OPUS_OK) {
+          if (dec) opus_decoder_destroy(dec);
+          return;
+        }
+        VoiceRuntime::RxPeerState st;
+        st.dec = dec;
+        it = voice->rxPeers.insert(peerId, std::move(st));
+      }
+
+      if (!it->jitter.contains(seq)) it->jitter.insert(seq, opusFrame);
+      if (!it->playoutStarted && it->jitter.size() >= kVoiceJitterStartFrames) {
+        const quint64 newest = it->jitter.lastKey();
+        const quint64 startAt = (newest >= static_cast<quint64>(kVoiceJitterTargetFrames - 1))
+                                    ? (newest - static_cast<quint64>(kVoiceJitterTargetFrames - 1))
+                                    : newest;
+        it->expectedSeq = startAt;
+        while (!it->jitter.isEmpty() && it->jitter.firstKey() < it->expectedSeq) {
+          it->jitter.erase(it->jitter.begin());
+        }
+        it->playoutStarted = true;
+      }
+      return;
+    }
     if (voice->peerId != peerId) return;
     if (opusFrame.isEmpty()) return;
     {
@@ -4151,6 +4430,46 @@ void ChatBackend::setPeerVideoWatch(const QString& peerId, bool watching) {
     impl->sendControlToPeer(pid, std::move(j));
     impl->attemptDelivery(pid, /*silent*/ true);
   });
+}
+
+void ChatBackend::setVoiceChannelPeers(const QStringList& peerIds, const VoiceSettings& settings) {
+#if !defined(P2PCHAT_VOICE)
+  (void)peerIds;
+  (void)settings;
+  return;
+#else
+  QSet<QString> peers;
+  for (const auto& id : peerIds) {
+    const auto trimmed = id.trimmed();
+    if (!trimmed.isEmpty()) peers.insert(trimmed);
+  }
+
+  impl_->voiceChannelSettings = settings;
+  impl_->voiceChannelPeers = peers;
+  impl_->voiceChannelActive = !peers.isEmpty();
+
+  boost::asio::post(impl_->io, [impl = impl_, peers] {
+    for (const auto& peerId : peers) {
+      const auto pid = peerId.toStdString();
+      if (!impl->isRoutablePeer(pid)) continue;
+      impl->attemptDelivery(pid, /*silent*/ true);
+    }
+  });
+
+  impl_->startVoiceChannelQt();
+#endif
+}
+
+void ChatBackend::stopVoiceChannel() {
+#if !defined(P2PCHAT_VOICE)
+  return;
+#else
+  impl_->voiceChannelActive = false;
+  impl_->voiceChannelPeers.clear();
+  if (impl_->voice && impl_->voice->channelMode) {
+    impl_->stopVoiceQt();
+  }
+#endif
 }
 
 void ChatBackend::sendFriendRequest(const QString& peerId) {

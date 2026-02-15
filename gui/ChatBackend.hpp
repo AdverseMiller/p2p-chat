@@ -62,6 +62,8 @@ public:
   void setServerMembers(const QStringList& peerIds);
   void setPeerMuted(const QString& peerId, bool muted);
   void setPeerVideoWatch(const QString& peerId, bool watching);
+  void setVoiceChannelPeers(const QStringList& peerIds, const VoiceSettings& settings);
+  void stopVoiceChannel();
 
   // Voice calls (Opus over UDP hole-punching). Only one active call at a time.
   void startCall(const QString& peerId, const VoiceSettings& settings);

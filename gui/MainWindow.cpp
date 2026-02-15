@@ -1515,7 +1515,7 @@ void MainWindow::buildUi() {
         broadcastVoicePresence(selectedServerId_, selectedServerChannelId_, false);
         voiceOccupantsByChannel_[key].remove(selfId_);
         joinedServerVoiceKey_.clear();
-        if (!activeCallPeer_.isEmpty()) backend_.endCall(activeCallPeer_);
+        backend_.stopVoiceChannel();
         statusBar()->showMessage("Left voice channel", 3000);
       } else {
         if (!joinedServerVoiceKey_.isEmpty()) {
@@ -3084,7 +3084,7 @@ void MainWindow::sanitizeVoiceOccupantsForServer(const QString& serverId) {
 
 void MainWindow::maybeSyncVoiceCallForJoinedChannel() {
   if (joinedServerVoiceKey_.isEmpty()) {
-    if (!activeCallPeer_.isEmpty()) backend_.endCall(activeCallPeer_);
+    backend_.stopVoiceChannel();
     return;
   }
 
@@ -3099,61 +3099,20 @@ void MainWindow::maybeSyncVoiceCallForJoinedChannel() {
   }
 
   if (peers.isEmpty()) {
-    if (!activeCallPeer_.isEmpty()) backend_.endCall(activeCallPeer_);
-    return;
-  }
-
-  // Keep an existing voice-channel peer call stable while that peer is still present.
-  // This avoids dropping an active 1<->1 stream just because another member joins.
-  if (!activeCallPeer_.isEmpty() && peers.contains(activeCallPeer_)) {
-    if (!activeCallState_.isEmpty()) return;
-    if (selfId_ >= activeCallPeer_) {
-      refreshCallButton();
-      return;
-    }
-    activeCallState_ = "calling";
-    refreshCallButton();
-    backend_.startCall(activeCallPeer_,
-                       voiceSettingsFromProfile(profile_.audio,
-                                                profile_.video,
-                                                profile_.screen,
-                                                webcamEnabled_,
-                                                screenShareEnabled_,
-                                                screenShareDisplayName_));
+    backend_.stopVoiceChannel();
     return;
   }
 
   QStringList sortedPeers;
   for (const auto& p : peers) sortedPeers.push_back(p);
   std::sort(sortedPeers.begin(), sortedPeers.end());
-  const auto target = sortedPeers.front();
-
-  if (!activeCallPeer_.isEmpty() && activeCallPeer_ != target) {
-    backend_.endCall(activeCallPeer_);
-    return;
-  }
-  if (!activeCallPeer_.isEmpty() && activeCallPeer_ == target && !activeCallState_.isEmpty()) {
-    return;
-  }
-
-  // Deterministic initiator avoids simultaneous call_offer collisions.
-  if (selfId_ >= target) {
-    activeCallPeer_ = target;
-    activeCallState_.clear();
-    refreshCallButton();
-    return;
-  }
-
-  activeCallPeer_ = target;
-  activeCallState_ = "calling";
-  refreshCallButton();
-  backend_.startCall(target,
-                     voiceSettingsFromProfile(profile_.audio,
-                                              profile_.video,
-                                              profile_.screen,
-                                              webcamEnabled_,
-                                              screenShareEnabled_,
-                                              screenShareDisplayName_));
+  backend_.setVoiceChannelPeers(sortedPeers,
+                                voiceSettingsFromProfile(profile_.audio,
+                                                         profile_.video,
+                                                         profile_.screen,
+                                                         webcamEnabled_,
+                                                         screenShareEnabled_,
+                                                         screenShareDisplayName_));
 }
 
 void MainWindow::leaveSelectedServer() {
@@ -3193,7 +3152,7 @@ void MainWindow::removeServer(const QString& serverId) {
   if (selectedServerId_ == serverId) {
     if (!joinedServerVoiceKey_.isEmpty() && joinedVoiceServerId() == serverId) {
       joinedServerVoiceKey_.clear();
-      if (!activeCallPeer_.isEmpty()) backend_.endCall(activeCallPeer_);
+      backend_.stopVoiceChannel();
     }
     selectedServerId_.clear();
     selectedServerChannelId_.clear();
@@ -3223,7 +3182,7 @@ void MainWindow::removeServerChannel(const QString& serverId, const QString& cha
   if (selectedServerId_ == serverId && selectedServerChannelId_ == channelId) {
     if (joinedServerVoiceKey_ == key) {
       joinedServerVoiceKey_.clear();
-      if (!activeCallPeer_.isEmpty()) backend_.endCall(activeCallPeer_);
+      backend_.stopVoiceChannel();
     }
     selectedServerChannelId_.clear();
     selectedServerChannelVoice_ = false;
