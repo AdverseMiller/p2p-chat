@@ -66,9 +66,11 @@ constexpr auto kConnectTimeout = std::chrono::seconds(10);
 constexpr auto kUdpPunchInterval = std::chrono::milliseconds(250);
 constexpr auto kUdpHandshakeResend = std::chrono::milliseconds(400);
 constexpr auto kUdpDataResend = std::chrono::milliseconds(500);
-constexpr int kVoiceJitterStartFrames = 3;
-constexpr int kVoiceJitterTargetFrames = 2;
-constexpr int kVoiceJitterMaxFrames = 8;
+constexpr int kVoiceJitterStartFrames = 5;
+constexpr int kVoiceJitterTargetFrames = 4;
+constexpr int kVoiceJitterMaxFrames = 30;
+constexpr quint64 kVoiceSeqResetGap = 2000;
+constexpr int kVoiceMaxDecodeSamplesPerChannel = 2880; // 60 ms @ 48 kHz
 constexpr uint64_t kVideoFrameExpireMs = 250;
 constexpr uint64_t kVideoJitterWaitMs = 120;
 constexpr auto kNoneAudioDeviceId = "none";
@@ -76,6 +78,16 @@ constexpr auto kNoneAudioDeviceId = "none";
 bool is_none_audio_device(const QString& id) {
   return id.compare(QString::fromLatin1(kNoneAudioDeviceId), Qt::CaseInsensitive) == 0;
 }
+
+#if defined(P2PCHAT_VOICE)
+void configure_opus_encoder(OpusEncoder* encoder, int bitrate) {
+  if (!encoder) return;
+  opus_encoder_ctl(encoder, OPUS_SET_BITRATE(std::clamp(bitrate, 8000, 128000)));
+  opus_encoder_ctl(encoder, OPUS_SET_INBAND_FEC(1));
+  opus_encoder_ctl(encoder, OPUS_SET_PACKET_LOSS_PERC(8));
+  opus_encoder_ctl(encoder, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
+}
+#endif
 
 uint32_t parse_fourcc_text(const QString& s) {
   const auto b = s.toLatin1();
@@ -2328,7 +2340,7 @@ struct ChatBackend::Impl {
       emit q->logLine("voice: failed to create Opus encoder for voice channel");
       return;
     }
-    opus_encoder_ctl(enc, OPUS_SET_BITRATE(bitrate));
+    configure_opus_encoder(enc, bitrate);
 
     QAudioFormat fmt;
     fmt.setSampleRate(sampleRate);
@@ -2412,23 +2424,41 @@ struct ChatBackend::Impl {
           st.jitter.erase(st.jitter.begin());
         }
 
+        const quint64 playSeq = st.expectedSeq;
         QByteArray frame;
-        if (st.jitter.contains(st.expectedSeq)) {
-          frame = st.jitter.take(st.expectedSeq);
+        if (st.jitter.contains(playSeq)) {
+          frame = st.jitter.take(playSeq);
         }
         st.expectedSeq++;
 
-        std::vector<opus_int16> pcm(static_cast<std::size_t>(frameSamples * voice->channels));
+        QByteArray fecFrame;
+        bool useFec = false;
+        if (frame.isEmpty()) {
+          auto next = st.jitter.find(playSeq + 1);
+          if (next != st.jitter.end()) {
+            fecFrame = next.value();
+            useFec = true;
+          }
+        }
+
+        std::vector<opus_int16> pcm(static_cast<std::size_t>(kVoiceMaxDecodeSamplesPerChannel * voice->channels));
         int outSamples = 0;
         if (!frame.isEmpty()) {
           outSamples = opus_decode(st.dec,
                                    reinterpret_cast<const unsigned char*>(frame.constData()),
                                    frame.size(),
                                    pcm.data(),
-                                   frameSamples,
+                                   kVoiceMaxDecodeSamplesPerChannel,
                                    0);
+        } else if (useFec) {
+          outSamples = opus_decode(st.dec,
+                                   reinterpret_cast<const unsigned char*>(fecFrame.constData()),
+                                   fecFrame.size(),
+                                   pcm.data(),
+                                   kVoiceMaxDecodeSamplesPerChannel,
+                                   1);
         } else {
-          outSamples = opus_decode(st.dec, nullptr, 0, pcm.data(), frameSamples, 0);
+          outSamples = opus_decode(st.dec, nullptr, 0, pcm.data(), kVoiceMaxDecodeSamplesPerChannel, 0);
         }
         if (outSamples <= 0) continue;
 
@@ -2526,8 +2556,7 @@ struct ChatBackend::Impl {
       return;
     }
 
-    // Configure bitrate (best-effort).
-    opus_encoder_ctl(enc, OPUS_SET_BITRATE(callBitrate));
+    configure_opus_encoder(enc, callBitrate);
 
     QAudioFormat fmt;
     fmt.setSampleRate(sampleRate);
@@ -2640,17 +2669,25 @@ struct ChatBackend::Impl {
         voice->jitter.erase(voice->jitter.begin());
       }
 
+      const quint64 playSeq = voice->expectedSeq;
       QByteArray frame;
-      if (voice->jitter.contains(voice->expectedSeq)) {
-        frame = voice->jitter.take(voice->expectedSeq);
+      if (voice->jitter.contains(playSeq)) {
+        frame = voice->jitter.take(playSeq);
       }
       voice->expectedSeq++;
 
+      QByteArray fecFrame;
+      bool useFec = false;
+      if (frame.isEmpty()) {
+        auto next = voice->jitter.find(playSeq + 1);
+        if (next != voice->jitter.end()) {
+          fecFrame = next.value();
+          useFec = true;
+        }
+      }
+
       std::vector<opus_int16> pcm;
-      // Keep decode buffer at Opus max frame size (60 ms @ 48 kHz) so a temporary peer-side
-      // frame-size mismatch does not cause OPUS_BUFFER_TOO_SMALL.
-      constexpr int kMaxDecodeSamplesPerChannel = 2880; // 60 ms @ 48 kHz
-      pcm.resize(kMaxDecodeSamplesPerChannel * voice->channels);
+      pcm.resize(kVoiceMaxDecodeSamplesPerChannel * voice->channels);
       int outSamples = 0;
       if (!frame.isEmpty()) {
         if (debug_logs_enabled()) voice->rxFrames++;
@@ -2658,11 +2695,18 @@ struct ChatBackend::Impl {
                                  reinterpret_cast<const unsigned char*>(frame.constData()),
                                  frame.size(),
                                  pcm.data(),
-                                 kMaxDecodeSamplesPerChannel,
+                                 kVoiceMaxDecodeSamplesPerChannel,
                                  0);
+      } else if (useFec) {
+        outSamples = opus_decode(voice->dec,
+                                 reinterpret_cast<const unsigned char*>(fecFrame.constData()),
+                                 fecFrame.size(),
+                                 pcm.data(),
+                                 kVoiceMaxDecodeSamplesPerChannel,
+                                 1);
       } else {
         // PLC.
-        outSamples = opus_decode(voice->dec, nullptr, 0, pcm.data(), kMaxDecodeSamplesPerChannel, 0);
+        outSamples = opus_decode(voice->dec, nullptr, 0, pcm.data(), kVoiceMaxDecodeSamplesPerChannel, 0);
       }
       if (outSamples <= 0) return;
       if (debug_logs_enabled()) {
@@ -2752,6 +2796,19 @@ struct ChatBackend::Impl {
         it = voice->rxPeers.insert(peerId, std::move(st));
       }
 
+      if (it->playoutStarted && it->expectedSeq > seq &&
+          (it->expectedSeq - seq) > kVoiceSeqResetGap) {
+        const quint64 oldExpected = it->expectedSeq;
+        if (it->dec) opus_decoder_ctl(it->dec, OPUS_RESET_STATE);
+        it->jitter.clear();
+        it->expectedSeq = 0;
+        it->playoutStarted = false;
+        if (debug_logs_enabled()) {
+          emit q->logLine("[dbg] voice rx reset(channel) peer=" + peerId + " old_expected=" +
+                          QString::number(oldExpected) + " new_seq=" + QString::number(seq));
+        }
+      }
+
       if (!it->jitter.contains(seq)) it->jitter.insert(seq, opusFrame);
       if (!it->playoutStarted && it->jitter.size() >= kVoiceJitterStartFrames) {
         const quint64 newest = it->jitter.lastKey();
@@ -2779,6 +2836,20 @@ struct ChatBackend::Impl {
         emit q->logLine("[dbg] voice rx frame seq=" + QString::number(seq) + " len=" + QString::number(opusFrame.size()) +
                         " jitter=" + QString::number(voice->jitter.size()) + " expected=" +
                         QString::number(voice->expectedSeq));
+      }
+    }
+
+    if (voice->playoutStarted && voice->expectedSeq > seq &&
+        (voice->expectedSeq - seq) > kVoiceSeqResetGap) {
+      const quint64 oldExpected = voice->expectedSeq;
+      if (voice->dec) opus_decoder_ctl(voice->dec, OPUS_RESET_STATE);
+      voice->jitter.clear();
+      voice->expectedSeq = 0;
+      voice->playoutStarted = false;
+      if (voice->playoutTimer) voice->playoutTimer->stop();
+      if (debug_logs_enabled()) {
+        emit q->logLine("[dbg] voice rx reset(dm) peer=" + peerId + " old_expected=" +
+                        QString::number(oldExpected) + " new_seq=" + QString::number(seq));
       }
     }
     if (!voice->jitter.contains(seq)) voice->jitter.insert(seq, opusFrame);
@@ -3498,6 +3569,23 @@ struct ChatBackend::Impl {
 
   void onPeerReadyQt(const QString& peerId) {
     emit q->directPeerConnectionChanged(peerId, true);
+    if (voice) {
+      if (voice->channelMode) {
+        auto it = voice->rxPeers.find(peerId);
+        if (it != voice->rxPeers.end()) {
+          if (it->dec) opus_decoder_ctl(it->dec, OPUS_RESET_STATE);
+          it->jitter.clear();
+          it->expectedSeq = 0;
+          it->playoutStarted = false;
+        }
+      } else if (voice->peerId == peerId) {
+        if (voice->dec) opus_decoder_ctl(voice->dec, OPUS_RESET_STATE);
+        voice->jitter.clear();
+        voice->expectedSeq = 0;
+        voice->playoutStarted = false;
+        if (voice->playoutTimer) voice->playoutTimer->stop();
+      }
+    }
     if (peerId != callPeerId) return;
     if (callPeerId.isEmpty()) return;
     if (callLocalAccepted && callRemoteAccepted) maybeStartVoiceQt();

@@ -53,6 +53,7 @@
 #include <QTabWidget>
 #include <QTextBrowser>
 #include <QTimer>
+#include <QToolButton>
 #include <QUrl>
 #include <QUrlQuery>
 #include <QStandardPaths>
@@ -75,6 +76,7 @@ constexpr int kRoleServerChannelVoice = Qt::UserRole + 13;
 constexpr int kRoleIndentPx = Qt::UserRole + 14;
 constexpr int kRoleVoiceLive = Qt::UserRole + 15;
 constexpr int kRoleWatchOverlay = Qt::UserRole + 16;
+constexpr int kRoleDmCallAvatar = Qt::UserRole + 17;
 
 constexpr int kServerHeaderItem = 1;
 constexpr int kServerChannelItem = 2;
@@ -295,6 +297,153 @@ QPixmap roundAvatarPixmap(const QPixmap& avatar, int size) {
   p.setClipPath(clip);
   p.drawPixmap(0, 0, src);
   return out;
+}
+
+QPixmap dmCallAvatarTile(const QString& seed, const QString& avatarPath, QSize size, bool self) {
+  if (size.width() < 40) size.setWidth(40);
+  if (size.height() < 40) size.setHeight(40);
+  QPixmap pm(size);
+  pm.fill(Qt::transparent);
+
+  const int avatarSize = std::max(48, std::min(size.width(), size.height()) - 16);
+  const QPixmap rawAvatar = loadAvatarOrPlaceholder(seed, avatarPath, avatarSize);
+  const QPixmap avatar = roundAvatarPixmap(rawAvatar, avatarSize);
+  const QRect avatarRect((size.width() - avatar.width()) / 2,
+                         (size.height() - avatar.height()) / 2,
+                         avatar.width(),
+                         avatar.height());
+
+  QPainter p(&pm);
+  p.setRenderHint(QPainter::Antialiasing, true);
+  p.drawPixmap(avatarRect, avatar);
+  p.setBrush(Qt::NoBrush);
+  p.setPen(self ? QColor(62, 130, 247, 220) : QColor(255, 255, 255, 70));
+  p.drawEllipse(avatarRect.adjusted(0, 0, -1, -1));
+  return pm;
+}
+
+QIcon iconFromSvg(const char* svgText, const QString& colorHex = {}) {
+  if (!svgText) return {};
+  QByteArray data(svgText);
+  if (!colorHex.trimmed().isEmpty()) {
+    data.replace("currentColor", colorHex.trimmed().toUtf8());
+  }
+  QPixmap pm;
+  if (!pm.loadFromData(data, "SVG")) return {};
+  return QIcon(pm);
+}
+
+QIcon discordMicIcon(bool muted, bool dark) {
+  static const char* kMicOnSvg = R"SVG(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <g transform="translate(12 8.5)"><path fill="currentColor" d="M-4,-1.4600000381469727 C-4,-3.6689999103546143 -2.2090001106262207,-5.460000038146973 0,-5.460000038146973 C2.2090001106262207,-5.460000038146973 4,-3.6689999103546143 4,-1.4600000381469727 C4,-1.4600000381469727 4,2.5 4,2.5 C4,4.709000110626221 2.2090001106262207,6.5 0,6.5 C-2.2090001106262207,6.5 -4,4.709000110626221 -4,2.5 C-4,2.5 -4,-1.4600000381469727 -4,-1.4600000381469727z"/></g>
+  <g transform="translate(12 14)"><path d="M-7,-3 C-7,0.8659999966621399 -3.865999937057495,4 0,4 C3.865999937057495,4 7,0.8659999966621399 7,-3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></g>
+  <g transform="translate(12 20)"><path fill="currentColor" d="M-1,-2 C-1,-2.2760000228881836 -0.7760000228881836,-2.5 -0.5,-2.5 C-0.5,-2.5 0.5,-2.5 0.5,-2.5 C0.7760000228881836,-2.5 1,-2.2760000228881836 1,-2 C1,-2 1,2 1,2 C1,2.2760000228881836 0.7760000228881836,2.5 0.5,2.5 C0.5,2.5 -0.5,2.5 -0.5,2.5 C-0.7760000228881836,2.5 -1,2.2760000228881836 -1,2 C-1,2 -1,-2 -1,-2z"/></g>
+  <g transform="translate(12 22)"><path fill="currentColor" d="M3,-1 C3.552000045776367,-1 4,-0.5519999861717224 4,0 C4,0.5519999861717224 3.552000045776367,1 3,1 C3,1 -3,1 -3,1 C-3.552000045776367,1 -4,0.5519999861717224 -4,0 C-4,-0.5519999861717224 -3.552000045776367,-1 -3,-1 C-3,-1 3,-1 3,-1z"/></g>
+  </svg>)SVG";
+  static const char* kMicOffSvg = R"SVG(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <g transform="translate(12 8.5)"><path fill="currentColor" d="M-4,-1.4600000381469727 C-4,-3.6689999103546143 -2.2090001106262207,-5.460000038146973 0,-5.460000038146973 C2.2090001106262207,-5.460000038146973 4,-3.6689999103546143 4,-1.4600000381469727 C4,-1.4600000381469727 4,2.5 4,2.5 C4,4.709000110626221 2.2090001106262207,6.5 0,6.5 C-2.2090001106262207,6.5 -4,4.709000110626221 -4,2.5 C-4,2.5 -4,-1.4600000381469727 -4,-1.4600000381469727z"/></g>
+  <g transform="translate(12 14)"><path d="M-7,-3 C-7,0.8659999966621399 -3.865999937057495,4 0,4 C3.865999937057495,4 7,0.8659999966621399 7,-3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></g>
+  <g transform="translate(12 20)"><path fill="currentColor" d="M-1,-2 C-1,-2.2760000228881836 -0.7760000228881836,-2.5 -0.5,-2.5 C-0.5,-2.5 0.5,-2.5 0.5,-2.5 C0.7760000228881836,-2.5 1,-2.2760000228881836 1,-2 C1,-2 1,2 1,2 C1,2.2760000228881836 0.7760000228881836,2.5 0.5,2.5 C0.5,2.5 -0.5,2.5 -0.5,2.5 C-0.7760000228881836,2.5 -1,2.2760000228881836 -1,2 C-1,2 -1,-2 -1,-2z"/></g>
+  <g transform="translate(12 22)"><path fill="currentColor" d="M3,-1 C3.552000045776367,-1 4,-0.5519999861717224 4,0 C4,0.5519999861717224 3.552000045776367,1 3,1 C3,1 -3,1 -3,1 C-3.552000045776367,1 -4,0.5519999861717224 -4,0 C-4,-0.5519999861717224 -3.552000045776367,-1 -3,-1 C-3,-1 3,-1 3,-1z"/></g>
+  <g transform="translate(12 12)"><path d="M-10,10 L10,-10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></g>
+  </svg>)SVG";
+  static const QIcon onDark = iconFromSvg(kMicOnSvg, "#f2f3f5");
+  static const QIcon onLight = iconFromSvg(kMicOnSvg, "#1d232f");
+  static const QIcon offDark = iconFromSvg(kMicOffSvg, "#f2f3f5");
+  static const QIcon offLight = iconFromSvg(kMicOffSvg, "#1d232f");
+  const QIcon& on = dark ? onDark : onLight;
+  const QIcon& off = dark ? offDark : offLight;
+  return muted ? off : on;
+}
+
+QIcon discordCameraIcon(bool offState, bool dark, bool activeOverlay = false) {
+  static const char* kCamOnSvg = R"SVG(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <g transform="translate(9.5 12)"><path fill="currentColor" d="M-5.5,-8 C-5.5,-8 -1.253999948501587,-8 -1.253999948501587,-8 C-1.253999948501587,-8 5.5,-8 5.5,-8 C7.1570000648498535,-8 8.5,-6.6570000648498535 8.5,-5 C8.5,-5 8.5,5 8.5,5 C8.5,6.6570000648498535 7.1570000648498535,8 5.5,8 C5.5,8 0.13199999928474426,8 0.13199999928474426,8 C0.13199999928474426,8 -5.5,8 -5.5,8 C-7.1570000648498535,8 -8.5,6.6570000648498535 -8.5,5 C-8.5,5 -8.5,-5 -8.5,-5 C-8.5,-6.6570000648498535 -7.1570000648498535,-8 -5.5,-8z"/></g>
+  <g transform="translate(20.5 12)"><path fill="currentColor" d="M-2.5,-2.881999969482422 C-2.5,-3.260999917984009 -2.2860000133514404,-3.6070001125335693 -1.9470000267028809,-3.7760000228881836 C-1.9470000267028809,-3.7760000228881836 1.0529999732971191,-5.276000022888184 1.0529999732971191,-5.276000022888184 C1.718000054359436,-5.609000205993652 2.5,-5.125 2.5,-4.381999969482422 C2.5,-4.381999969482422 2.5,4.381999969482422 2.5,4.381999969482422 C2.5,5.125 1.718000054359436,5.609000205993652 1.0529999732971191,5.276000022888184 C1.0529999732971191,5.276000022888184 -1.9470000267028809,3.7760000228881836 -1.9470000267028809,3.7760000228881836 C-2.2860000133514404,3.6070001125335693 -2.5,3.260999917984009 -2.5,2.881999969482422 C-2.5,2.881999969482422 -3.1675777435302734,-0.012422150000929832 -3.1675777435302734,-0.012422150000929832 C-3.1675777435302734,-0.012422150000929832 -2.5,-2.881999969482422 -2.5,-2.881999969482422z"/></g>
+  </svg>)SVG";
+  static const char* kCamOffSvg = R"SVG(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <g transform="translate(9.5 12)"><path fill="currentColor" d="M-5.5,-8 C-5.5,-8 -1.253999948501587,-8 -1.253999948501587,-8 C-1.253999948501587,-8 5.5,-8 5.5,-8 C7.1570000648498535,-8 8.5,-6.6570000648498535 8.5,-5 C8.5,-5 8.5,5 8.5,5 C8.5,6.6570000648498535 7.1570000648498535,8 5.5,8 C5.5,8 0.13199999928474426,8 0.13199999928474426,8 C0.13199999928474426,8 -5.5,8 -5.5,8 C-7.1570000648498535,8 -8.5,6.6570000648498535 -8.5,5 C-8.5,5 -8.5,-5 -8.5,-5 C-8.5,-6.6570000648498535 -7.1570000648498535,-8 -5.5,-8z"/></g>
+  <g transform="translate(20.5 12)"><path fill="currentColor" d="M-2.5,-2.881999969482422 C-2.5,-3.260999917984009 -2.2860000133514404,-3.6070001125335693 -1.9470000267028809,-3.7760000228881836 C-1.9470000267028809,-3.7760000228881836 1.0529999732971191,-5.276000022888184 1.0529999732971191,-5.276000022888184 C1.718000054359436,-5.609000205993652 2.5,-5.125 2.5,-4.381999969482422 C2.5,-4.381999969482422 2.5,4.381999969482422 2.5,4.381999969482422 C2.5,5.125 1.718000054359436,5.609000205993652 1.0529999732971191,5.276000022888184 C1.0529999732971191,5.276000022888184 -1.9470000267028809,3.7760000228881836 -1.9470000267028809,3.7760000228881836 C-2.2860000133514404,3.6070001125335693 -2.5,3.260999917984009 -2.5,2.881999969482422 C-2.5,2.881999969482422 -3.1675777435302734,-0.012422150000929832 -3.1675777435302734,-0.012422150000929832 C-3.1675777435302734,-0.012422150000929832 -2.5,-2.881999969482422 -2.5,-2.881999969482422z"/></g>
+  <g transform="translate(12 12)"><path d="M-10,10 L10,-10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></g>
+  </svg>)SVG";
+  static const QIcon onDark = iconFromSvg(kCamOnSvg, "#f2f3f5");
+  static const QIcon onLight = iconFromSvg(kCamOnSvg, "#1d232f");
+  static const QIcon offDark = iconFromSvg(kCamOffSvg, "#f2f3f5");
+  static const QIcon offLight = iconFromSvg(kCamOffSvg, "#1d232f");
+  static const QIcon onAccent = iconFromSvg(kCamOnSvg, "#57f287");
+  const QIcon& on = activeOverlay ? onAccent : (dark ? onDark : onLight);
+  const QIcon& off = dark ? offDark : offLight;
+  return offState ? off : on;
+}
+
+QIcon discordScreenIcon(bool dark, bool activeOverlay = false) {
+  static const char* kScreenSvg = R"SVG(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <g transform="translate(12 12)"><path fill="currentColor" d="M-10,-7 C-10,-8.656999588012695 -8.656999588012695,-10 -7,-10 C-7,-10 7,-10 7,-10 C8.656999588012695,-10 10,-8.656999588012695 10,-7 C10,-7 10,1 10,1 C10,2.6570000648498535 8.656999588012695,4 7,4 C7,4 -7,4 -7,4 C-8.656999588012695,4 -10,2.6570000648498535 -10,1 C-10,1 -10,-7 -10,-7z"/></g>
+  <g transform="translate(12 12)"><path fill="currentColor" d="M1,7.5 C1,7.776000022888184 1.2239999771118164,8 1.5,8 C1.5,8 3,8 3,8 C3.552000045776367,8 4,8.447999954223633 4,9 C4,9.552000045776367 3.552000045776367,10 3,10 C3,10 -3,10 -3,10 C-3.552000045776367,10 -4,9.552000045776367 -4,9 C-4,8.447999954223633 -3.552000045776367,8 -3,8 C-3,8 -1.5,8 -1.5,8 C-1.2239999771118164,8 -1,7.776000022888184 -1,7.5 C-1,7.5 -1,5.5 -1,5.5 C-1,5.223999977111816 -0.7760000228881836,5 -0.5,5 C-0.5,5 0.5,5 0.5,5 C0.7760000228881836,5 1,5.223999977111816 1,5.5 C1,5.5 1,7.5 1,7.5z"/></g>
+  <g transform="translate(12 12)"><path fill="currentColor" d="M6,-4 C6,-4.264999866485596 5.894999980926514,-4.519000053405762 5.706999778747559,-4.706999778747559 C5.706999778747559,-4.706999778747559 2.7070000171661377,-7.706999778747559 2.7070000171661377,-7.706999778747559 C2.315999984741211,-8.097999572753906 1.684000015258789,-8.097999572753906 1.2929999828338623,-7.706999778747559 C0.9020000100135803,-7.315999984741211 0.9020000100135803,-6.684000015258789 1.2929999828338623,-6.293000221252441 C1.2929999828338623,-6.293000221252441 2.5859999656677246,-5 2.5859999656677246,-5 C2.5859999656677246,-5 1,-5 1,-5 C-2.313999891281128,-5 -5,-2.313999891281128 -5,1 C-5,1.5520000457763672 -4.552000045776367,2 -4,2 C-3.447999954223633,2 -3,1.5520000457763672 -3,1 C-3,-1.2089999914169312 -1.2089999914169312,-3 1,-3 C1,-3 2.5859999656677246,-3 2.5859999656677246,-3 C2.5859999656677246,-3 1.2929999828338623,-1.7070000171661377 1.2929999828338623,-1.7070000171661377 C0.9020000100135803,-1.315999984741211 0.9020000100135803,-0.6840000152587891 1.2929999828338623,-0.2930000126361847 C1.684000015258789,0.09799999743700027 2.315999984741211,0.09799999743700027 2.7070000171661377,-0.2930000126361847 C2.7070000171661377,-0.2930000126361847 5.706999778747559,-3.2929999828338623 5.706999778747559,-3.2929999828338623 C5.894999980926514,-3.4809999465942383 6,-3.734999895095825 6,-4z"/></g>
+  </svg>)SVG";
+  static const QIcon darkIcon = iconFromSvg(kScreenSvg, "#f2f3f5");
+  static const QIcon lightIcon = iconFromSvg(kScreenSvg, "#1d232f");
+  static const QIcon accentIcon = iconFromSvg(kScreenSvg, "#57f287");
+  const QIcon& icon = activeOverlay ? accentIcon : (dark ? darkIcon : lightIcon);
+  return icon;
+}
+
+QIcon discordHangupIcon(bool dark) {
+  static const char* kHangupSvg = R"SVG(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <g transform="translate(12 12.61)"><path fill="currentColor" d="M9.335000038146973,-1.8179999589920044 C4.184999942779541,-6.9670000076293945 -4.164000034332275,-6.9670000076293945 -9.312999725341797,-1.8179999589920044 C-11.690999984741211,0.5609999895095825 -11.35099983215332,3.6040000915527344 -9.555999755859375,5.39900016784668 C-9.300999641418457,5.6539998054504395 -8.909000396728516,5.7129998207092285 -8.59000015258789,5.544000148773193 C-8.59000015258789,5.544000148773193 -4.269999980926514,3.256999969482422 -4.269999980926514,3.256999969482422 C-3.871000051498413,3.0460000038146973 -3.683000087738037,2.5769999027252197 -3.8259999752044678,2.1489999294281006 C-3.8259999752044678,2.1489999294281006 -4.558000087738037,-0.04600000008940697 -4.558000087738037,-0.04600000008940697 C-1.8250000476837158,-1.9980000257492065 1.8459999561309814,-1.9980000257492065 4.578999996185303,-0.04600000008940697 C4.578999996185303,-0.04600000008940697 3.815000057220459,2.757999897003174 3.815000057220459,2.757999897003174 C3.693000078201294,3.2070000171661377 3.9240000247955322,3.677000045776367 4.354000091552734,3.8540000915527344 C4.354000091552734,3.8540000915527344 8.63599967956543,5.617000102996826 8.63599967956543,5.617000102996826 C8.946000099182129,5.744999885559082 9.303000450134277,5.672999858856201 9.539999961853027,5.435999870300293 C11.331999778747559,3.6440000534057617 11.708999633789062,0.5559999942779541 9.335000038146973,-1.8179999589920044z"/></g>
+  </svg>)SVG";
+  static const QIcon darkIcon = iconFromSvg(kHangupSvg, "#f2f3f5");
+  static const QIcon lightIcon = iconFromSvg(kHangupSvg, "#1d232f");
+  const QIcon& icon = dark ? darkIcon : lightIcon;
+  return icon;
+}
+
+QString callControlsStyleSheet(bool dark) {
+  if (dark) {
+    return QStringLiteral(
+        "QWidget#callControlsBar { background: transparent; border: none; }"
+        "QPushButton#callMicButton, QPushButton#callCamButton, QPushButton#callShareButton {"
+        "  border-radius: 9px; padding: 0; background: #2f3136; color: #f2f3f5; border: 1px solid #3e4147;"
+        "}"
+        "QPushButton#callMicButton:checked {"
+        "  background: #da4e5a; border-color: #ef6a73; color: #ffffff;"
+        "}"
+        "QPushButton#callCamButton:checked, QPushButton#callShareButton:checked {"
+        "  background: #3ba55d; border-color: #43b86a; color: #ffffff;"
+        "}"
+        "QToolButton#callMicCaretButton, QToolButton#callCamCaretButton {"
+        "  border-radius: 9px; padding: 0; background: #2f3136; color: #f2f3f5; border: 1px solid #3e4147;"
+        "}"
+        "QToolButton#callMicCaretButton[danger=\"true\"] {"
+        "  background: #da4e5a; border-color: #ef6a73; color: #ffffff;"
+        "}"
+        "QPushButton#callHangupButton {"
+        "  border-radius: 9px; padding: 0; background: #d84f5a; color: #ffffff; border: 1px solid #e0616d;"
+        "}"
+        "QPushButton#callHangupButton:hover { background: #e0616d; }");
+  }
+  return QStringLiteral(
+      "QWidget#callControlsBar { background: transparent; border: none; }"
+      "QPushButton#callMicButton, QPushButton#callCamButton, QPushButton#callShareButton {"
+      "  border-radius: 9px; padding: 0; background: #eef1f7; color: #1d232f; border: 1px solid #c8d1e1;"
+      "}"
+      "QPushButton#callMicButton:checked {"
+      "  background: #da4e5a; color: #ffffff; border-color: #c94550;"
+      "}"
+      "QPushButton#callCamButton:checked, QPushButton#callShareButton:checked {"
+      "  background: #3ba55d; color: #ffffff; border-color: #43b86a;"
+      "}"
+      "QToolButton#callMicCaretButton, QToolButton#callCamCaretButton {"
+      "  border-radius: 9px; padding: 0; background: #eef1f7; color: #1d232f; border: 1px solid #c8d1e1;"
+      "}"
+      "QToolButton#callMicCaretButton[danger=\"true\"] {"
+      "  background: #da4e5a; color: #ffffff; border-color: #c94550;"
+      "}"
+      "QPushButton#callHangupButton {"
+      "  border-radius: 9px; padding: 0; background: #df4f56; color: #ffffff; border: 1px solid #c74248;"
+      "}"
+      "QPushButton#callHangupButton:hover { background: #cb4048; }");
 }
 
 QPixmap videoPlaceholderCard(const QString& seed, const QString& name, const QString& avatarPath, QSize size) {
@@ -654,13 +803,14 @@ QString statusTag(Profile::FriendStatus s) {
 ChatBackend::VoiceSettings voiceSettingsFromProfile(const Profile::AudioSettings& a,
                                                     const Profile::VideoSettings& vcfg,
                                                     const Profile::ScreenSettings& scfg,
+                                                    bool micMuted,
                                                     bool webcamEnabled,
                                                     bool screenShareEnabled,
                                                     const QString& screenDisplayName) {
   ChatBackend::VoiceSettings v;
   v.inputDeviceIdHex = a.inputDeviceIdHex;
   v.outputDeviceIdHex = a.outputDeviceIdHex;
-  v.micVolume = a.micVolume;
+  v.micVolume = micMuted ? 0 : a.micVolume;
   v.speakerVolume = a.speakerVolume;
   v.bitrate = a.bitrate;
   v.frameMs = a.frameMs;
@@ -930,6 +1080,7 @@ MainWindow::MainWindow(QString keyPassword, QWidget* parent)
                           voiceSettingsFromProfile(profile_.audio,
                                                    profile_.video,
                                                    profile_.screen,
+                                                   localMicMuted_,
                                                    webcamEnabled_,
                                                    screenShareEnabled_,
                                                    screenShareDisplayName_));
@@ -947,6 +1098,7 @@ MainWindow::MainWindow(QString keyPassword, QWidget* parent)
                         voiceSettingsFromProfile(profile_.audio,
                                                  profile_.video,
                                                  profile_.screen,
+                                                 localMicMuted_,
                                                  webcamEnabled_,
                                                  screenShareEnabled_,
                                                  screenShareDisplayName_));
@@ -1169,6 +1321,7 @@ void MainWindow::buildUi() {
       backend_.updateVoiceSettings(voiceSettingsFromProfile(profile_.audio,
                                                             profile_.video,
                                                             profile_.screen,
+                                                            localMicMuted_,
                                                             webcamEnabled_,
                                                             screenShareEnabled_,
                                                             screenShareDisplayName_));
@@ -1364,6 +1517,24 @@ void MainWindow::buildUi() {
   serversLayout->addWidget(clearInvitesBtn, 0);
 
   leftTabs_->addTab(serversTab, "Servers");
+  connect(leftTabs_, &QTabWidget::currentChanged, this, [this, chatsTab](int idx) {
+    if (!leftTabs_ || !chatsTab) return;
+    if (leftTabs_->widget(idx) != chatsTab) return;
+    if (!joinedServerVoiceKey_.isEmpty()) return;
+    if (activeCallPeer_.isEmpty() || activeCallState_.isEmpty()) return;
+    if (selectedPeerId_ == activeCallPeer_ && selectedServerId_.isEmpty()) return;
+
+    selectFriend(activeCallPeer_);
+    if (friendList_) {
+      for (int i = 0; i < friendList_->count(); ++i) {
+        if (!friendList_->item(i)) continue;
+        if (friendList_->item(i)->data(kRolePeerId).toString() == activeCallPeer_) {
+          friendList_->setCurrentRow(i);
+          break;
+        }
+      }
+    }
+  });
 
   auto* right = new QWidget(splitter);
   auto* rightLayout = new QVBoxLayout(right);
@@ -1382,23 +1553,98 @@ void MainWindow::buildUi() {
   callBtn_->setEnabled(false);
   headerRowLayout->addWidget(callBtn_, 0, Qt::AlignRight);
 
-  webcamBtn_ = new QPushButton("Camera Off", headerRow);
-  webcamBtn_->setCheckable(true);
-  webcamBtn_->setChecked(false);
-  webcamBtn_->setEnabled(false);
-  headerRowLayout->addWidget(webcamBtn_, 0, Qt::AlignRight);
-
-  screenShareBtn_ = new QPushButton("Screen Off", headerRow);
-  screenShareBtn_->setCheckable(true);
-  screenShareBtn_->setChecked(false);
-  screenShareBtn_->setEnabled(false);
-  headerRowLayout->addWidget(screenShareBtn_, 0, Qt::AlignRight);
-
   exitExpandedBtn_ = new QPushButton("Back to Grid", headerRow);
   exitExpandedBtn_->setVisible(false);
   headerRowLayout->addWidget(exitExpandedBtn_, 0, Qt::AlignRight);
 
   rightLayout->addWidget(headerRow);
+
+  callControlsBar_ = new QWidget(right);
+  callControlsBar_->setObjectName("callControlsBar");
+  auto* callControlsLayout = new QHBoxLayout(callControlsBar_);
+  callControlsLayout->setContentsMargins(0, 0, 0, 0);
+  callControlsLayout->setSpacing(0);
+  callControlsLayout->addStretch(1);
+
+  micBtn_ = new QPushButton(callControlsBar_);
+  micBtn_->setCheckable(true);
+  micBtn_->setChecked(false);
+  micBtn_->setToolTip("Mute microphone");
+  micBtn_->setObjectName("callMicButton");
+  micBtn_->setIcon(discordMicIcon(false, profile_.darkMode));
+  micBtn_->setIconSize(QSize(18, 18));
+  micBtn_->setText({});
+  micBtn_->setFixedSize(42, 32);
+  callControlsLayout->addWidget(micBtn_);
+
+  micMoreBtn_ = new QToolButton(callControlsBar_);
+  micMoreBtn_->setText("▾");
+  micMoreBtn_->setToolTip("Microphone options");
+  micMoreBtn_->setPopupMode(QToolButton::InstantPopup);
+  auto* micMenu = new QMenu(micMoreBtn_);
+  micMenu->addAction("Audio Settings…", this, [settings] { settings->trigger(); });
+  micMoreBtn_->setMenu(micMenu);
+  micMoreBtn_->setObjectName("callMicCaretButton");
+  micMoreBtn_->setProperty("danger", false);
+  micMoreBtn_->setFixedSize(20, 32);
+  callControlsLayout->addWidget(micMoreBtn_);
+
+  webcamBtn_ = new QPushButton(callControlsBar_);
+  webcamBtn_->setCheckable(true);
+  webcamBtn_->setChecked(false);
+  webcamBtn_->setEnabled(false);
+  webcamBtn_->setToolTip("Toggle webcam");
+  webcamBtn_->setObjectName("callCamButton");
+  webcamBtn_->setIcon(discordCameraIcon(true, profile_.darkMode, false));
+  webcamBtn_->setIconSize(QSize(18, 18));
+  webcamBtn_->setText({});
+  webcamBtn_->setFixedSize(42, 32);
+  callControlsLayout->addSpacing(8);
+  callControlsLayout->addWidget(webcamBtn_);
+
+  camMoreBtn_ = new QToolButton(callControlsBar_);
+  camMoreBtn_->setText("▾");
+  camMoreBtn_->setToolTip("Camera options");
+  camMoreBtn_->setPopupMode(QToolButton::InstantPopup);
+  auto* camMenu = new QMenu(camMoreBtn_);
+  camMenu->addAction("Video Settings…", this, [settings] { settings->trigger(); });
+  camMenu->addAction("Toggle Screen Share", this, [this] {
+    if (!screenShareBtn_ || !screenShareBtn_->isEnabled()) return;
+    screenShareBtn_->toggle();
+  });
+  camMoreBtn_->setMenu(camMenu);
+  camMoreBtn_->setObjectName("callCamCaretButton");
+  camMoreBtn_->setFixedSize(20, 32);
+  callControlsLayout->addWidget(camMoreBtn_);
+
+  // Hidden backing toggle used by call controls/context menus for screen sharing.
+  screenShareBtn_ = new QPushButton(callControlsBar_);
+  screenShareBtn_->setCheckable(true);
+  screenShareBtn_->setChecked(false);
+  screenShareBtn_->setEnabled(false);
+  screenShareBtn_->setToolTip("Toggle screen share");
+  screenShareBtn_->setObjectName("callShareButton");
+  screenShareBtn_->setIcon(discordScreenIcon(profile_.darkMode, false));
+  screenShareBtn_->setIconSize(QSize(18, 18));
+  screenShareBtn_->setText({});
+  screenShareBtn_->setFixedSize(42, 32);
+  callControlsLayout->addSpacing(8);
+  callControlsLayout->addWidget(screenShareBtn_);
+
+  disconnectBtn_ = new QPushButton(callControlsBar_);
+  disconnectBtn_->setObjectName("callHangupButton");
+  disconnectBtn_->setToolTip("Leave call");
+  disconnectBtn_->setIcon(discordHangupIcon(profile_.darkMode));
+  disconnectBtn_->setIconSize(QSize(18, 18));
+  disconnectBtn_->setText({});
+  disconnectBtn_->setFixedSize(46, 32);
+  callControlsLayout->addSpacing(8);
+  callControlsLayout->addWidget(disconnectBtn_);
+
+  callControlsLayout->addStretch(1);
+  callControlsBar_->setFixedHeight(36);
+  callControlsBar_->setStyleSheet(callControlsStyleSheet(profile_.darkMode));
+  callControlsBar_->setVisible(false);
 
   auto* contentSplit = new QSplitter(Qt::Horizontal, right);
   auto* chatPane = new QWidget(contentSplit);
@@ -1407,10 +1653,11 @@ void MainWindow::buildUi() {
   chatPaneLayout->setSpacing(0);
 
   videoPanel_ = new QWidget(chatPane);
-  auto* videoLayout = new QHBoxLayout(videoPanel_);
-  videoLayout->setContentsMargins(0, 0, 0, 6);
+  auto* videoLayout = new QVBoxLayout(videoPanel_);
+  videoLayout->setContentsMargins(0, 0, 0, 0);
   videoLayout->setSpacing(0);
   videoTiles_ = new QListWidget(videoPanel_);
+  videoTiles_->setObjectName("videoTiles");
   videoTiles_->setViewMode(QListView::IconMode);
   videoTiles_->setFlow(QListView::LeftToRight);
   videoTiles_->setResizeMode(QListView::Adjust);
@@ -1418,6 +1665,7 @@ void MainWindow::buildUi() {
   videoTiles_->setWrapping(true);
   videoTiles_->setWordWrap(true);
   videoTiles_->setSelectionMode(QAbstractItemView::NoSelection);
+  videoTiles_->setSelectionRectVisible(false);
   videoTiles_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
   videoTiles_->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
   videoTiles_->setSpacing(10);
@@ -1425,9 +1673,26 @@ void MainWindow::buildUi() {
   videoTiles_->setGridSize(QSize(340, 212));
   videoTiles_->setUniformItemSizes(true);
   videoTiles_->setContextMenuPolicy(Qt::CustomContextMenu);
+  videoTiles_->setFrameShape(QFrame::NoFrame);
+  videoTiles_->setFrameStyle(QFrame::NoFrame);
+  videoTiles_->setLineWidth(0);
+  videoTiles_->setMidLineWidth(0);
+  videoTiles_->setFocusPolicy(Qt::NoFocus);
+  videoTiles_->viewport()->setAutoFillBackground(false);
   videoTiles_->setMinimumHeight(220);
   videoTiles_->setStyleSheet({});
   videoLayout->addWidget(videoTiles_, 1);
+
+  dmAvatarRow_ = new QWidget(videoPanel_);
+  dmAvatarRow_->setVisible(false);
+  dmAvatarRow_->setStyleSheet("background: transparent; border: none;");
+  dmAvatarLayout_ = new QHBoxLayout(dmAvatarRow_);
+  dmAvatarLayout_->setContentsMargins(0, 0, 0, 0);
+  dmAvatarLayout_->setSpacing(16);
+  videoLayout->addWidget(dmAvatarRow_, 0, Qt::AlignHCenter);
+
+  callControlsBar_->setParent(videoPanel_);
+  videoLayout->addWidget(callControlsBar_, 0, Qt::AlignHCenter);
   videoPanel_->setVisible(false);
   chatPaneLayout->addWidget(videoPanel_, 0);
 
@@ -1557,6 +1822,7 @@ void MainWindow::buildUi() {
     if (!(QApplication::mouseButtons() & Qt::LeftButton)) return;
     const auto peerId = item->data(kRolePeerId).toString();
     if (peerId.isEmpty()) return;
+    if (item->data(kRoleDmCallAvatar).toBool()) return;
     if (item->data(kRoleWatchOverlay).toBool()) {
       setPeerVideoWatching(peerId, true);
       return;
@@ -1642,9 +1908,47 @@ void MainWindow::buildUi() {
                        voiceSettingsFromProfile(profile_.audio,
                                                 profile_.video,
                                                 profile_.screen,
+                                                localMicMuted_,
                                                 webcamEnabled_,
                                                 screenShareEnabled_,
                                                 screenShareDisplayName_));
+  });
+  connect(disconnectBtn_, &QPushButton::clicked, this, [this] {
+    if (!joinedServerVoiceKey_.isEmpty()) {
+      const auto serverId = joinedVoiceServerId();
+      const auto channelId = joinedVoiceChannelId();
+      if (!serverId.isEmpty() && !channelId.isEmpty()) {
+        broadcastVoicePresence(serverId, channelId, false);
+        voiceOccupantsByChannel_[joinedServerVoiceKey_].remove(selfId_);
+      }
+      joinedServerVoiceKey_.clear();
+      backend_.stopVoiceChannel();
+      rebuildServerList();
+      refreshHeader();
+      refreshCallButton();
+      statusBar()->showMessage("Left voice channel", 3000);
+      return;
+    }
+    if (!activeCallPeer_.isEmpty() && !activeCallState_.isEmpty()) {
+      backend_.endCall(activeCallPeer_);
+    }
+  });
+  connect(micBtn_, &QPushButton::toggled, this, [this](bool muted) {
+    localMicMuted_ = muted;
+    if (micBtn_) {
+      micBtn_->setToolTip(muted ? "Unmute microphone" : "Mute microphone");
+    }
+    if (micMoreBtn_) micMoreBtn_->setProperty("danger", muted);
+    if (callControlsBar_) callControlsBar_->setStyleSheet(callControlsStyleSheet(profile_.darkMode));
+    if ((!activeCallPeer_.isEmpty() && !activeCallState_.isEmpty()) || !joinedServerVoiceKey_.isEmpty()) {
+      backend_.updateVoiceSettings(voiceSettingsFromProfile(profile_.audio,
+                                                            profile_.video,
+                                                            profile_.screen,
+                                                            localMicMuted_,
+                                                            webcamEnabled_,
+                                                            screenShareEnabled_,
+                                                            screenShareDisplayName_));
+    }
   });
   connect(webcamBtn_, &QPushButton::toggled, this, [this](bool enabled) {
     if (enabled && screenShareBtn_ && screenShareBtn_->isChecked()) {
@@ -1669,6 +1973,7 @@ void MainWindow::buildUi() {
       backend_.updateVoiceSettings(voiceSettingsFromProfile(profile_.audio,
                                                             profile_.video,
                                                             profile_.screen,
+                                                            localMicMuted_,
                                                             webcamEnabled_,
                                                             screenShareEnabled_,
                                                             screenShareDisplayName_));
@@ -1713,6 +2018,7 @@ void MainWindow::buildUi() {
       backend_.updateVoiceSettings(voiceSettingsFromProfile(profile_.audio,
                                                             profile_.video,
                                                             profile_.screen,
+                                                            localMicMuted_,
                                                             webcamEnabled_,
                                                             screenShareEnabled_,
                                                             screenShareDisplayName_));
@@ -1726,6 +2032,7 @@ void MainWindow::buildUi() {
     profile_.darkMode = on;
     saveProfile();
     applyTheme(on);
+    refreshCallButton();
   });
   darkModeAction_ = darkMode;
 
@@ -1856,6 +2163,7 @@ QString MainWindow::serverPeerDisplayName(const QString& peerId, const QString& 
 }
 
 void MainWindow::applyTheme(bool dark) {
+  if (callControlsBar_) callControlsBar_->setStyleSheet(callControlsStyleSheet(dark));
   if (!dark) {
     qApp->setStyleSheet({});
     if (videoTiles_) videoTiles_->setStyleSheet("QListWidget { padding: 3px; }");
@@ -1867,6 +2175,7 @@ void MainWindow::applyTheme(bool dark) {
   qApp->setStyleSheet(
       "QWidget { background-color: #1e1e1e; color: #dcdcdc; }"
       "QLineEdit, QTextEdit, QTextBrowser, QListWidget { background-color: #141414; color: #dcdcdc; border: 1px solid #3a3a3a; }"
+      "QListWidget#videoTiles, QListWidget#videoTiles::item { background: transparent; border: none; }"
       "QPushButton { background-color: #2d2d2d; color: #dcdcdc; border: 1px solid #555; padding: 4px 8px; }"
       "QPushButton:hover { background-color: #3a3a3a; }"
       "QMenuBar, QMenu { background-color: #252525; color: #dcdcdc; }"
@@ -3202,6 +3511,7 @@ void MainWindow::maybeSyncVoiceCallForJoinedChannel() {
                                 voiceSettingsFromProfile(profile_.audio,
                                                          profile_.video,
                                                          profile_.screen,
+                                                         localMicMuted_,
                                                          webcamEnabled_,
                                                          screenShareEnabled_,
                                                          screenShareDisplayName_));
@@ -3539,18 +3849,117 @@ void MainWindow::refreshVideoPanel() {
   const bool inSelectedVoiceChannel = (selectedServerChannelVoice_ && !selectedServerId_.isEmpty() &&
                                        !selectedServerChannelId_.isEmpty());
   const bool inSelectedDirectCallView = (!selectedPeerId_.isEmpty() && selectedPeerId_ == activeCallPeer_);
-  const bool show = inSelectedVoiceChannel || (callActive && inSelectedDirectCallView);
+  const bool inSelectedDirectCall = callActive && inSelectedDirectCallView;
+  const QString directPeerId = !activeCallPeer_.isEmpty() ? activeCallPeer_ : selectedPeerId_;
+  const bool directLocalLive = (webcamEnabled_ || screenShareEnabled_) && localVideoActive_ && !localVideoFrame_.isNull();
+  const bool directRemoteLive = !directPeerId.isEmpty() && remoteVideoFrames_.contains(directPeerId) &&
+                                !remoteVideoFrames_.value(directPeerId).isNull();
+  const bool directRemoteAvailable = !directPeerId.isEmpty() && remoteVideoAvailable_.value(directPeerId, directRemoteLive);
+  const bool directShowVisuals =
+      directLocalLive || directRemoteLive || (directRemoteAvailable && !isWatchingPeerVideo(directPeerId));
+  const bool directAvatarMode = inSelectedDirectCall && !directShowVisuals;
+  const bool show = inSelectedVoiceChannel || inSelectedDirectCall;
+  const bool hardHide = !(inSelectedVoiceChannel || inSelectedDirectCall);
   videoPanel_->setVisible(show);
-  if (exitExpandedBtn_) exitExpandedBtn_->setVisible(show && !expandedVideoPeerId_.isEmpty());
+  if (dmAvatarRow_) dmAvatarRow_->setVisible(false);
+  if (videoTiles_) videoTiles_->setVisible(true);
+  if (exitExpandedBtn_) exitExpandedBtn_->setVisible(show && !expandedVideoPeerId_.isEmpty() && !directAvatarMode);
   if (!show) {
-    remoteVideoPeerId_.clear();
-    remoteVideoActive_ = false;
-    localVideoActive_ = false;
-    localVideoFrame_ = QImage();
-    remoteVideoFrames_.clear();
+    if (hardHide) {
+      remoteVideoPeerId_.clear();
+      remoteVideoActive_ = false;
+      localVideoActive_ = false;
+      localVideoFrame_ = QImage();
+      remoteVideoFrames_.clear();
+    }
     expandedVideoPeerId_.clear();
     videoTiles_->clear();
+    if (dmAvatarLayout_) {
+      while (auto* item = dmAvatarLayout_->takeAt(0)) {
+        if (item->widget()) item->widget()->deleteLater();
+        delete item;
+      }
+    }
     return;
+  }
+
+  if (directAvatarMode) {
+    expandedVideoPeerId_.clear();
+    if (exitExpandedBtn_) exitExpandedBtn_->setVisible(false);
+    if (videoTiles_) videoTiles_->setVisible(false);
+    if (dmAvatarRow_) dmAvatarRow_->setVisible(true);
+
+    QStringList peerIds;
+    if (!selfId_.isEmpty()) peerIds.push_back(selfId_);
+    if (!directPeerId.isEmpty() && !peerIds.contains(directPeerId)) peerIds.push_back(directPeerId);
+    peerIds.removeAll(QString());
+    std::sort(peerIds.begin(), peerIds.end());
+    if (!selfId_.isEmpty() && peerIds.contains(selfId_)) {
+      peerIds.removeAll(selfId_);
+      peerIds.push_front(selfId_);
+    }
+
+    constexpr int kDmAvatarSize = 80;
+    constexpr int kDmAvatarSpacing = 16;
+    if (!dmAvatarLayout_ || !dmAvatarRow_) return;
+    while (auto* item = dmAvatarLayout_->takeAt(0)) {
+      if (item->widget()) item->widget()->deleteLater();
+      delete item;
+    }
+    const int count = std::max(1, static_cast<int>(peerIds.size()));
+    const int totalW = count * kDmAvatarSize + std::max(0, count - 1) * kDmAvatarSpacing;
+    dmAvatarRow_->setFixedWidth(totalW);
+    dmAvatarRow_->setFixedHeight(kDmAvatarSize + 8);
+    for (const auto& peerId : peerIds) {
+      QString display;
+      if (peerId == selfId_) {
+        display = profile_.selfName.trimmed().isEmpty() ? QString("Me") : profile_.selfName.trimmed();
+      } else {
+        display = serverPeerDisplayName(peerId, serverMemberHintName(peerId));
+      }
+
+      QString avatarPath;
+      if (peerId == selfId_) {
+        avatarPath = profile_.selfAvatarPath;
+      } else if (const auto* f = profile_.findFriend(peerId)) {
+        avatarPath = f->avatarPath;
+      }
+      if (avatarPath.isEmpty()) {
+        const auto candidate = Profile::peerAvatarFile(peerId);
+        if (QFileInfo::exists(candidate)) avatarPath = candidate;
+      }
+
+      auto* avatar = new QLabel(dmAvatarRow_);
+      avatar->setPixmap(dmCallAvatarTile(peerId, avatarPath, QSize(kDmAvatarSize, kDmAvatarSize), peerId == selfId_));
+      avatar->setFixedSize(kDmAvatarSize, kDmAvatarSize);
+      avatar->setToolTip(display);
+      dmAvatarLayout_->addWidget(avatar);
+    }
+    return;
+  }
+
+  if (dmAvatarRow_) {
+    dmAvatarRow_->setVisible(false);
+    dmAvatarRow_->setMinimumWidth(0);
+    dmAvatarRow_->setMaximumWidth(QWIDGETSIZE_MAX);
+  }
+  if (videoTiles_) videoTiles_->setVisible(true);
+  videoTiles_->setFlow(QListView::LeftToRight);
+  videoTiles_->setWrapping(true);
+  videoTiles_->setResizeMode(QListView::Adjust);
+  videoTiles_->setSpacing(10);
+  videoTiles_->setMinimumWidth(0);
+  videoTiles_->setMaximumWidth(QWIDGETSIZE_MAX);
+  videoTiles_->setMinimumHeight(220);
+  videoTiles_->setMaximumHeight(QWIDGETSIZE_MAX);
+  videoTiles_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+  videoTiles_->setContentsMargins(0, 0, 0, 0);
+  if (profile_.darkMode) {
+    videoTiles_->setStyleSheet(
+        "QListWidget#videoTiles { padding: 3px; background-color: #141414; color: #dcdcdc; border: 1px solid "
+        "#3a3a3a; }");
+  } else {
+    videoTiles_->setStyleSheet("QListWidget#videoTiles { padding: 3px; }");
   }
 
   QStringList peerIds;
@@ -3563,13 +3972,12 @@ void MainWindow::refreshVideoPanel() {
     if (joinedServerVoiceKey_ == key && !selfId_.isEmpty() && !peerIds.contains(selfId_)) {
       peerIds.push_back(selfId_);
     }
-    if (callActive && !activeCallPeer_.isEmpty() && !peerIds.contains(activeCallPeer_)) {
-      peerIds.push_back(activeCallPeer_);
-    }
   } else {
-    if (!selfId_.isEmpty()) peerIds.push_back(selfId_);
-    const auto pid = !remoteVideoPeerId_.isEmpty() ? remoteVideoPeerId_ : activeCallPeer_;
-    if (!pid.isEmpty() && !peerIds.contains(pid)) peerIds.push_back(pid);
+    if (directLocalLive && !selfId_.isEmpty()) peerIds.push_back(selfId_);
+    const auto pid = directPeerId;
+    const bool wantRemoteTile = !pid.isEmpty() &&
+                                (directRemoteLive || (directRemoteAvailable && !isWatchingPeerVideo(pid)));
+    if (wantRemoteTile && !peerIds.contains(pid)) peerIds.push_back(pid);
   }
 
   peerIds.removeAll(QString());
@@ -3609,6 +4017,7 @@ void MainWindow::refreshVideoPanel() {
     auto* item = new QListWidgetItem();
     item->setData(kRolePeerId, peerId);
     item->setData(kRoleWatchOverlay, false);
+    item->setData(kRoleDmCallAvatar, false);
 
     QString display;
     if (peerId == selfId_) {
@@ -3658,6 +4067,9 @@ void MainWindow::refreshVideoPanel() {
 
 void MainWindow::refreshCallButton() {
   if (!callBtn_) return;
+  const bool dark = profile_.darkMode;
+  const bool callSessionActive =
+      !joinedServerVoiceKey_.isEmpty() || (!activeCallPeer_.isEmpty() && !activeCallState_.isEmpty());
   if (webcamBtn_) {
     const bool hasCamera = !profile_.video.devicePath.trimmed().isEmpty();
     if (!hasCamera && webcamEnabled_) {
@@ -3666,11 +4078,13 @@ void MainWindow::refreshCallButton() {
       localVideoFrame_ = QImage();
     }
     const bool inVoiceContext =
+        callSessionActive ||
         (!selectedServerId_.isEmpty() && !selectedServerChannelId_.isEmpty() && selectedServerChannelVoice_) ||
         !currentPeerId().isEmpty();
     webcamBtn_->setEnabled(hasCamera && inVoiceContext);
     webcamBtn_->setChecked(webcamEnabled_ && hasCamera);
-    webcamBtn_->setText(!hasCamera ? "No Camera" : (webcamEnabled_ ? "Camera On" : "Camera Off"));
+    webcamBtn_->setIcon(discordCameraIcon(!webcamEnabled_, dark, false));
+    webcamBtn_->setToolTip(!hasCamera ? "No camera configured" : (webcamEnabled_ ? "Turn camera off" : "Turn camera on"));
   }
   if (screenShareBtn_) {
     const bool hasScreens = !QGuiApplication::screens().isEmpty();
@@ -3678,46 +4092,67 @@ void MainWindow::refreshCallButton() {
       screenShareEnabled_ = false;
     }
     const bool inVoiceContext =
+        callSessionActive ||
         (!selectedServerId_.isEmpty() && !selectedServerChannelId_.isEmpty() && selectedServerChannelVoice_) ||
         !currentPeerId().isEmpty();
     screenShareBtn_->setEnabled(hasScreens && inVoiceContext);
     screenShareBtn_->setChecked(screenShareEnabled_ && hasScreens);
-    screenShareBtn_->setText(!hasScreens ? "No Display" : (screenShareEnabled_ ? "Screen On" : "Screen Off"));
+    screenShareBtn_->setIcon(discordScreenIcon(dark, false));
+    screenShareBtn_->setToolTip(!hasScreens ? "No display available"
+                                            : (screenShareEnabled_ ? "Stop screen sharing" : "Start screen sharing"));
   }
 
+  bool callEnabled = false;
+  QString callText = "Call";
   if (!selectedServerId_.isEmpty() && !selectedServerChannelId_.isEmpty()) {
     if (!selectedServerChannelVoice_) {
-      callBtn_->setEnabled(false);
-      callBtn_->setText("Call");
-      return;
+      callEnabled = false;
+      callText = "Call";
+    } else {
+      const auto key = serverChannelChatKey(selectedServerId_, selectedServerChannelId_);
+      const bool joined = (joinedServerVoiceKey_ == key);
+      callEnabled = true;
+      callText = joined ? "Leave Voice" : "Join Voice";
     }
-    const auto key = serverChannelChatKey(selectedServerId_, selectedServerChannelId_);
-    const bool joined = (joinedServerVoiceKey_ == key);
-    callBtn_->setEnabled(true);
-    callBtn_->setText(joined ? "Leave Voice" : "Join Voice");
-    return;
+  } else {
+    const auto pid = currentPeerId();
+    if (pid.isEmpty()) {
+      callEnabled = false;
+      callText = "Call";
+    } else {
+      const bool callActiveForThis =
+          (!activeCallPeer_.isEmpty() && activeCallPeer_ == pid && !activeCallState_.isEmpty());
+      if (callActiveForThis) {
+        callEnabled = true;
+        callText = "Hang up";
+      } else {
+        const auto* f = profile_.findFriend(pid);
+        const bool accepted = (f && f->status == Profile::FriendStatus::Accepted);
+        const bool online = presenceStateFor(pid) != kPresenceOffline;
+        callEnabled = accepted && online;
+        callText = "Call";
+      }
+    }
   }
+  callBtn_->setEnabled(callEnabled);
+  callBtn_->setText(callText);
 
-  const auto pid = currentPeerId();
-  if (pid.isEmpty()) {
-    callBtn_->setEnabled(false);
-    callBtn_->setText("Call");
-    return;
+  if (callControlsBar_) callControlsBar_->setVisible(callSessionActive);
+  if (callBtn_) callBtn_->setVisible(!callSessionActive);
+  if (disconnectBtn_) disconnectBtn_->setEnabled(callSessionActive);
+  if (micBtn_) {
+    micBtn_->setEnabled(callSessionActive);
+    {
+      const QSignalBlocker block(*micBtn_);
+      micBtn_->setChecked(localMicMuted_);
+    }
+    micBtn_->setIcon(discordMicIcon(localMicMuted_, dark));
+    micBtn_->setToolTip(localMicMuted_ ? "Unmute microphone" : "Mute microphone");
   }
-
-  const bool callActiveForThis =
-      (!activeCallPeer_.isEmpty() && activeCallPeer_ == pid && !activeCallState_.isEmpty());
-  if (callActiveForThis) {
-    callBtn_->setEnabled(true);
-    callBtn_->setText("Hang up");
-    return;
-  }
-
-  const auto* f = profile_.findFriend(pid);
-  const bool accepted = (f && f->status == Profile::FriendStatus::Accepted);
-  const bool online = presenceStateFor(pid) != kPresenceOffline;
-  callBtn_->setEnabled(accepted && online);
-  callBtn_->setText("Call");
+  if (micMoreBtn_) micMoreBtn_->setProperty("danger", localMicMuted_);
+  if (disconnectBtn_) disconnectBtn_->setIcon(discordHangupIcon(dark));
+  if (micMoreBtn_) micMoreBtn_->setEnabled(callSessionActive);
+  if (camMoreBtn_) camMoreBtn_->setEnabled(callSessionActive);
 }
 
 void MainWindow::appendMessage(const QString& peerId, const QString& label, const QString& text, bool incoming) {

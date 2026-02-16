@@ -21,8 +21,10 @@ class QJsonObject;
 class QStackedWidget;
 class QTimer;
 class QWidget;
+class QHBoxLayout;
 class QResizeEvent;
 class QNetworkAccessManager;
+class QToolButton;
 
 class MainWindow : public QMainWindow {
   Q_OBJECT
@@ -144,6 +146,11 @@ private:
 
   QLabel* headerLabel_ = nullptr;
   QPushButton* callBtn_ = nullptr;
+  QWidget* callControlsBar_ = nullptr;
+  QPushButton* micBtn_ = nullptr;
+  QToolButton* micMoreBtn_ = nullptr;
+  QToolButton* camMoreBtn_ = nullptr;
+  QPushButton* disconnectBtn_ = nullptr;
   QPushButton* webcamBtn_ = nullptr;
   QPushButton* screenShareBtn_ = nullptr;
   QPushButton* exitExpandedBtn_ = nullptr;
@@ -152,6 +159,8 @@ private:
   QListWidget* voiceGallery_ = nullptr;
   QWidget* videoPanel_ = nullptr;
   QListWidget* videoTiles_ = nullptr;
+  QWidget* dmAvatarRow_ = nullptr;
+  QHBoxLayout* dmAvatarLayout_ = nullptr;
   QString remoteVideoPeerId_;
   bool remoteVideoActive_ = false;
   bool localVideoActive_ = false;
@@ -188,6 +197,7 @@ private:
 
   QString activeCallPeer_;
   QString activeCallState_;
+  bool localMicMuted_ = false;
   bool webcamEnabled_ = false;
   bool screenShareEnabled_ = false;
   QString screenShareDisplayName_;
