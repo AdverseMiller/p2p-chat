@@ -9,7 +9,9 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/opt.h>
+#include <libavutil/pixdesc.h>
 #include <libavutil/error.h>
 #include <libswscale/swscale.h>
 }
@@ -17,6 +19,8 @@ extern "C" {
 
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 #include <string>
@@ -88,6 +92,17 @@ bool Decoder::decode(const uint8_t*, size_t, QImage*, QString* err) {
 bool Decoder::isOpen() const { return false; }
 #else
 namespace {
+
+bool codec_trace_enabled() {
+  static const bool enabled = [] {
+    const char* raw = std::getenv("P2PCHAT_CODEC_TRACE");
+    if (!raw || !*raw) return false;
+    std::string v(raw);
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return v == "1" || v == "true" || v == "yes" || v == "on";
+  }();
+  return enabled;
+}
 
 constexpr uint32_t make_fourcc(char a, char b, char c, char d) {
   return (static_cast<uint32_t>(static_cast<unsigned char>(a)) << 0) |
@@ -306,9 +321,31 @@ QString ffmpeg_err_string(int rc) {
   return QString::fromUtf8(buf);
 }
 
-const AVCodec* decoder_for_codec(Codec codec) {
-  if (codec == Codec::HEVC) return avcodec_find_decoder(AV_CODEC_ID_HEVC);
-  return avcodec_find_decoder(AV_CODEC_ID_H264);
+void codec_trace_log(const std::string& msg) {
+  if (!codec_trace_enabled()) return;
+  common::log("video[trace]: " + msg);
+}
+
+std::vector<const AVCodec*> decoder_candidates(Codec codec) {
+  std::vector<const AVCodec*> out;
+  auto add = [&out](const AVCodec* dec) {
+    if (!dec) return;
+    for (const auto* existing : out) {
+      if (existing == dec) return;
+    }
+    out.push_back(dec);
+  };
+  auto add_name = [&add](const char* name) { add(avcodec_find_decoder_by_name(name)); };
+  auto add_id = [&add](AVCodecID id) { add(avcodec_find_decoder(id)); };
+
+  if (codec == Codec::HEVC) {
+    add_name("hevc_cuvid");
+    add_id(AV_CODEC_ID_HEVC);
+  } else {
+    add_name("h264_cuvid");
+    add_id(AV_CODEC_ID_H264);
+  }
+  return out;
 }
 
 std::optional<Codec> codec_from_avcodec(AVCodecID codec) {
@@ -379,7 +416,9 @@ struct Decoder::Impl {
   const AVCodec* codec = nullptr;
   AVCodecContext* ctx = nullptr;
   AVFrame* frame = nullptr;
+  AVFrame* swFrame = nullptr;
   AVPacket* pkt = nullptr;
+  bool loggedHwTransfer = false;
 };
 
 bool isInputFourccSupported(uint32_t fourcc) {
@@ -497,6 +536,18 @@ bool Encoder::open(const EncodeParams& p, QString* err) {
     return false;
   }
 
+  {
+    QStringList names;
+    for (const auto* c : candidates) {
+      if (c && c->name) names.push_back(QString::fromLatin1(c->name));
+    }
+    codec_trace_log("encoder open request codec=" + codecToString(p.codec).toStdString() +
+                    " size=" + std::to_string(p.width) + "x" + std::to_string(p.height) +
+                    " fps=" + std::to_string(p.fpsDen) + "/" + std::to_string(p.fpsNum) +
+                    " bitrate_kbps=" + std::to_string(p.bitrateKbps) +
+                    " candidates=" + names.join(", ").toStdString());
+  }
+
   QStringList failures;
   for (const AVCodec* candidate : candidates) {
     if (!candidate) continue;
@@ -538,8 +589,11 @@ bool Encoder::open(const EncodeParams& p, QString* err) {
       av_opt_set(impl_->ctx->priv_data, "profile", "main", 0);
     }
 
+    codec_trace_log(std::string("trying encoder=") + (candidate->name ? candidate->name : "unknown"));
     const int openRc = avcodec_open2(impl_->ctx, impl_->codec, nullptr);
     if (openRc < 0) {
+      codec_trace_log(std::string("encoder open failed encoder=") + (candidate->name ? candidate->name : "unknown") +
+                      " err=" + ffmpeg_err_string(openRc).toStdString());
       failures.push_back(QString::fromLatin1(candidate->name) + ": " + ffmpeg_err_string(openRc));
       avcodec_free_context(&impl_->ctx);
       impl_->ctx = nullptr;
@@ -581,6 +635,7 @@ bool Encoder::open(const EncodeParams& p, QString* err) {
   common::log("video: encoder open codec=" + codecToString(codec_).toStdString() +
               " encoder=" + std::string(impl_->codec ? impl_->codec->name : "unknown") +
               " " + std::to_string(impl_->ctx->width) + "x" + std::to_string(impl_->ctx->height));
+  codec_trace_log("encoder open success encoder=" + std::string(impl_->codec ? impl_->codec->name : "unknown"));
   return true;
 }
 
@@ -659,35 +714,74 @@ Decoder::~Decoder() { close(); }
 bool Decoder::open(Codec codec, QString* err) {
   close();
   impl_ = std::make_unique<Impl>();
-  impl_->codec = decoder_for_codec(codec);
-  if (!impl_->codec) {
+  const auto candidates = decoder_candidates(codec);
+  if (candidates.empty()) {
     if (err) *err = "decoder not found";
+    codec_trace_log("decoder open failed: decoder not found for codec=" + codecToString(codec).toStdString());
     return false;
   }
-  impl_->ctx = avcodec_alloc_context3(impl_->codec);
-  if (!impl_->ctx) {
-    if (err) *err = "avcodec_alloc_context3 failed";
-    return false;
+
+  {
+    QStringList names;
+    for (const auto* c : candidates) {
+      if (c && c->name) names.push_back(QString::fromLatin1(c->name));
+    }
+    codec_trace_log("decoder open request codec=" + codecToString(codec).toStdString() +
+                    " candidates=" + names.join(", ").toStdString());
   }
-  impl_->ctx->thread_count = 1;
-  if (avcodec_open2(impl_->ctx, impl_->codec, nullptr) < 0) {
-    if (err) *err = "avcodec_open2 failed";
+
+  QStringList failures;
+  for (const AVCodec* candidate : candidates) {
+    if (!candidate) continue;
+    impl_->codec = candidate;
+    impl_->ctx = avcodec_alloc_context3(impl_->codec);
+    if (!impl_->ctx) {
+      failures.push_back(QString::fromLatin1(candidate->name) + ": alloc failed");
+      continue;
+    }
+    impl_->ctx->thread_count = 1;
+    codec_trace_log(std::string("trying decoder=") + (candidate->name ? candidate->name : "unknown"));
+    const int openRc = avcodec_open2(impl_->ctx, impl_->codec, nullptr);
+    if (openRc < 0) {
+      codec_trace_log(std::string("decoder open failed decoder=") + (candidate->name ? candidate->name : "unknown") +
+                      " err=" + ffmpeg_err_string(openRc).toStdString());
+      failures.push_back(QString::fromLatin1(candidate->name) + ": " + ffmpeg_err_string(openRc));
+      avcodec_free_context(&impl_->ctx);
+      impl_->ctx = nullptr;
+      continue;
+    }
+    break;
+  }
+
+  if (!impl_->ctx || !impl_->codec) {
+    if (err) {
+      *err = failures.isEmpty() ? QString("avcodec_open2 failed")
+                                : QString("avcodec_open2 failed (%1)").arg(failures.join("; "));
+    }
     close();
     return false;
   }
+
   impl_->frame = av_frame_alloc();
+  impl_->swFrame = av_frame_alloc();
   impl_->pkt = av_packet_alloc();
-  if (!impl_->frame || !impl_->pkt) {
+  if (!impl_->frame || !impl_->swFrame || !impl_->pkt) {
     if (err) *err = "alloc frame/packet failed";
+    codec_trace_log("decoder open failed: alloc frame/packet");
     close();
     return false;
   }
+  common::log("video: decoder open codec=" + codecToString(codec).toStdString() +
+              " decoder=" + std::string(impl_->codec ? impl_->codec->name : "unknown"));
+  codec_trace_log(std::string("decoder open success codec=") + codecToString(codec).toStdString() +
+                  " decoder=" + (impl_->codec->name ? impl_->codec->name : "unknown"));
   return true;
 }
 
 void Decoder::close() {
   if (!impl_) return;
   if (impl_->pkt) av_packet_free(&impl_->pkt);
+  if (impl_->swFrame) av_frame_free(&impl_->swFrame);
   if (impl_->frame) av_frame_free(&impl_->frame);
   if (impl_->ctx) avcodec_free_context(&impl_->ctx);
   impl_.reset();
@@ -715,7 +809,26 @@ bool Decoder::decode(const uint8_t* data, size_t len, QImage* out, QString* err)
       if (err) *err = "avcodec_receive_frame failed";
       return false;
     }
-    QImage img = avframe_to_qimage(impl_->frame);
+
+    AVFrame* viewFrame = impl_->frame;
+    const auto* pixDesc = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(impl_->frame->format));
+    if (pixDesc && (pixDesc->flags & AV_PIX_FMT_FLAG_HWACCEL)) {
+      av_frame_unref(impl_->swFrame);
+      const int txRc = av_hwframe_transfer_data(impl_->swFrame, impl_->frame, 0);
+      if (txRc < 0) {
+        if (err) *err = "av_hwframe_transfer_data failed";
+        return false;
+      }
+      if (!impl_->loggedHwTransfer) {
+        common::log("video: decoder hwframe transfer active decoder=" +
+                    std::string(impl_->codec ? impl_->codec->name : "unknown"));
+        impl_->loggedHwTransfer = true;
+      }
+      viewFrame = impl_->swFrame;
+    }
+
+    QImage img = avframe_to_qimage(viewFrame);
+    if (viewFrame == impl_->swFrame) av_frame_unref(impl_->swFrame);
     av_frame_unref(impl_->frame);
     if (!img.isNull()) {
       *out = std::move(img);
