@@ -2,6 +2,7 @@
 #include "gui/SettingsDialog.hpp"
 #include "common/identity.hpp"
 #include "common/json.hpp"
+#include "src/video/video_codec.h"
 
 #include <QAction>
 #include <QApplication>
@@ -783,6 +784,18 @@ QString stampFromUtcMs(qint64 tsMs) {
   return makeStamp(hh, mm);
 }
 
+QString detectedProvidersSummary(video::Codec codec) {
+  const auto providers = video::availableEncoderProviders(codec, true);
+  if (providers.empty()) return "none";
+  QStringList keys;
+  for (const auto& provider : providers) {
+    if (provider.key.isEmpty()) continue;
+    keys.push_back(provider.key);
+  }
+  keys.removeDuplicates();
+  return keys.isEmpty() ? "none" : keys.join(", ");
+}
+
 QString friendDisplay(const Profile::FriendEntry& e) {
   if (!e.alias.isEmpty()) return e.alias;
   if (!e.name.isEmpty()) return e.name;
@@ -844,7 +857,10 @@ ChatBackend::VoiceSettings voiceSettingsFromProfile(const Profile::AudioSettings
     v.videoFpsDen = scfg.fpsDen;
     v.videoCodec = scfg.codec.trimmed().toLower();
     if (v.videoCodec == "h265") v.videoCodec = "hevc";
-    if (v.videoCodec != "h264" && v.videoCodec != "hevc") v.videoCodec = "h264";
+    if (v.videoCodec == "av01") v.videoCodec = "av1";
+    if (v.videoCodec != "h264" && v.videoCodec != "hevc" && v.videoCodec != "av1") v.videoCodec = "h264";
+    v.videoProvider = scfg.provider.trimmed().toLower();
+    if (v.videoProvider.isEmpty()) v.videoProvider = "auto";
     v.videoBitrateKbps = scfg.bitrateKbps;
     v.videoEnabled = true;
   } else {
@@ -855,6 +871,7 @@ ChatBackend::VoiceSettings voiceSettingsFromProfile(const Profile::AudioSettings
     v.videoFpsNum = vcfg.fpsNum;
     v.videoFpsDen = vcfg.fpsDen;
     v.videoCodec = vcfg.codec;
+    v.videoProvider = "auto";
     v.videoBitrateKbps = vcfg.bitrateKbps;
     v.videoEnabled = webcamEnabled && !vcfg.devicePath.isEmpty();
   }
@@ -986,6 +1003,10 @@ MainWindow::MainWindow(QString keyPassword, QWidget* parent)
   webcamEnabled_ = false;
   applyTheme(profile_.darkMode);
   refreshSelfProfileWidget();
+
+  std::cout << "video: detected providers h264=" << detectedProvidersSummary(video::Codec::H264).toStdString()
+            << " hevc=" << detectedProvidersSummary(video::Codec::HEVC).toStdString()
+            << " av1=" << detectedProvidersSummary(video::Codec::AV1).toStdString() << std::endl;
 
   connect(&backend_, &ChatBackend::registered, this,
           [this](QString selfId, QString observedIp, quint16 udpPort) {

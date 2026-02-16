@@ -99,6 +99,7 @@ public:
     int fpsDen = 15;
     int bitrateKbps = 2500;
     QString codec = "h264";
+    QString provider = "auto";
     QString lastDisplayName;
   };
 

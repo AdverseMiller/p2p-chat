@@ -66,6 +66,11 @@ uint32_t fourccFromText(const QString& s) {
 
 QString codecDescription(const QString& key) {
   const auto v = key.trimmed().toLower();
+  if (v == "av1" || v == "av01") {
+    return "AV1 re-encodes frames for maximum compression efficiency at similar quality.\n"
+           "Best for low bitrate links, but usually higher encode/decode load and potentially more latency.\n"
+           "Use hardware providers (NVENC/VAAPI/QSV/AMF) when available.";
+  }
   if (v == "hevc" || v == "h265") {
     return "HEVC (H.265) re-encodes frames for lower bitrate at similar quality.\n"
            "Can reduce network usage, but may increase encode/decode load and may be less compatible.\n"
@@ -258,6 +263,7 @@ SettingsDialog::SettingsDialog(const Profile::AudioSettings& initial,
   screenResolution_ = new QComboBox(screenTab);
   screenFps_ = new QComboBox(screenTab);
   screenCodec_ = new QComboBox(screenTab);
+  screenProvider_ = new QComboBox(screenTab);
   screenBitrate_ = new QSpinBox(screenTab);
   screenBitrate_->setRange(100, 20000);
   screenBitrate_->setSuffix(" kbps");
@@ -266,9 +272,9 @@ SettingsDialog::SettingsDialog(const Profile::AudioSettings& initial,
   screenCodec_->setItemData(screenCodec_->count() - 1, codecDescription("h264"), Qt::ToolTipRole);
   screenCodec_->addItem("HEVC (H.265)", "hevc");
   screenCodec_->setItemData(screenCodec_->count() - 1, codecDescription("hevc"), Qt::ToolTipRole);
-  QString wantedScreenCodec = screenInitial_.codec.trimmed().toLower();
-  if (wantedScreenCodec == "h265") wantedScreenCodec = "hevc";
-  if (wantedScreenCodec != "h264" && wantedScreenCodec != "hevc") wantedScreenCodec = "h264";
+  screenCodec_->addItem("AV1", "av1");
+  screenCodec_->setItemData(screenCodec_->count() - 1, codecDescription("av1"), Qt::ToolTipRole);
+  QString wantedScreenCodec = video::codecToString(video::codecFromString(screenInitial_.codec));
   int screenCodecPick = 0;
   for (int i = 0; i < screenCodec_->count(); ++i) {
     if (screenCodec_->itemData(i).toString().trimmed().toLower() == wantedScreenCodec) {
@@ -281,6 +287,11 @@ SettingsDialog::SettingsDialog(const Profile::AudioSettings& initial,
   connect(screenCodec_, &QComboBox::currentIndexChanged, this, [this] {
     if (!screenCodec_) return;
     screenCodec_->setToolTip(screenCodec_->itemData(screenCodec_->currentIndex(), Qt::ToolTipRole).toString());
+    rebuildScreenProviders();
+  });
+  connect(screenProvider_, &QComboBox::currentIndexChanged, this, [this] {
+    if (!screenProvider_) return;
+    screenProvider_->setToolTip(screenProvider_->itemData(screenProvider_->currentIndex(), Qt::ToolTipRole).toString());
   });
 
   auto addRes = [this](const QString& label, int w, int h) {
@@ -339,7 +350,9 @@ SettingsDialog::SettingsDialog(const Profile::AudioSettings& initial,
   sform->addRow("Resolution:", screenResolution_);
   sform->addRow("FPS:", screenFps_);
   sform->addRow("Network codec:", screenCodec_);
+  sform->addRow("Provider:", screenProvider_);
   sform->addRow("Bitrate:", screenBitrate_);
+  rebuildScreenProviders();
   screenRoot->addLayout(sform);
   screenRoot->addStretch(1);
   tabs->addTab(screenTab, "Screen");
@@ -494,15 +507,15 @@ void SettingsDialog::rebuildVideoDevices() {
 void SettingsDialog::rebuildVideoCodecs() {
   if (!videoCodec_ || !videoDevice_) return;
   const QSignalBlocker block(videoCodec_);
-  QString wanted = videoInitial_.codec.trimmed().toLower();
-  if (wanted != "h264" && wanted != "hevc" && wanted != "h265") wanted = "h264";
-  if (wanted == "h265") wanted = "hevc";
+  QString wanted = video::codecToString(video::codecFromString(videoInitial_.codec));
 
   videoCodec_->clear();
   videoCodec_->addItem("H264", "h264");
   videoCodec_->setItemData(videoCodec_->count() - 1, codecDescription("h264"), Qt::ToolTipRole);
   videoCodec_->addItem("HEVC (H.265)", "hevc");
   videoCodec_->setItemData(videoCodec_->count() - 1, codecDescription("hevc"), Qt::ToolTipRole);
+  videoCodec_->addItem("AV1", "av1");
+  videoCodec_->setItemData(videoCodec_->count() - 1, codecDescription("av1"), Qt::ToolTipRole);
 
   int pick = 0;
   for (int i = 0; i < videoCodec_->count(); ++i) {
@@ -689,6 +702,49 @@ void SettingsDialog::rebuildVideoFps() {
   if (pick >= 0) videoFps_->setCurrentIndex(pick);
 }
 
+void SettingsDialog::rebuildScreenProviders() {
+  if (!screenProvider_ || !screenCodec_) return;
+  const QSignalBlocker block(screenProvider_);
+
+  QString wanted = screenProvider_->currentData().toString();
+  if (wanted.isEmpty()) wanted = screenInitial_.provider;
+  wanted = video::normalizeProviderKey(wanted);
+
+  screenProvider_->clear();
+  screenProvider_->addItem("Auto", "auto");
+  screenProvider_->setItemData(
+      0,
+      "Automatically tries available encoders for this codec and picks the first working provider.",
+      Qt::ToolTipRole);
+
+  const auto providers = video::availableEncoderProviders(video::codecFromString(screenCodec_->currentData().toString()),
+                                                          true);
+  bool preferredTagged = false;
+  for (const auto& provider : providers) {
+    QString label = provider.label;
+    if (provider.hardware && !preferredTagged) {
+      label += " (preferred)";
+      preferredTagged = true;
+    }
+    screenProvider_->addItem(label, provider.key);
+    const int idx = screenProvider_->count() - 1;
+    QString tip = provider.hardware
+                      ? "Hardware encoder (lower CPU usage than software on most systems)."
+                      : "Software encoder.";
+    screenProvider_->setItemData(idx, tip, Qt::ToolTipRole);
+  }
+
+  int pick = 0;
+  for (int i = 0; i < screenProvider_->count(); ++i) {
+    if (video::normalizeProviderKey(screenProvider_->itemData(i).toString()) == wanted) {
+      pick = i;
+      break;
+    }
+  }
+  screenProvider_->setCurrentIndex(pick);
+  screenProvider_->setToolTip(screenProvider_->itemData(pick, Qt::ToolTipRole).toString());
+}
+
 void SettingsDialog::setPreviewImage(const QImage& img) {
   if (!previewLabel_) return;
   if (img.isNull()) {
@@ -836,9 +892,7 @@ Profile::VideoSettings SettingsDialog::videoSettings() const {
   if (s.height < 16) s.height = 16;
   if (s.fpsNum <= 0) s.fpsNum = 1;
   if (s.fpsDen <= 0) s.fpsDen = 30;
-  s.codec = s.codec.trimmed().toLower();
-  if (s.codec == "h265") s.codec = "hevc";
-  if (s.codec != "h264" && s.codec != "hevc") s.codec = "h264";
+  s.codec = video::codecToString(video::codecFromString(s.codec));
   return s;
 }
 
@@ -868,9 +922,9 @@ Profile::ScreenSettings SettingsDialog::screenSettings() const {
   }
   if (screenBitrate_) s.bitrateKbps = screenBitrate_->value();
   if (screenCodec_) s.codec = screenCodec_->currentData().toString();
-  s.codec = s.codec.trimmed().toLower();
-  if (s.codec == "h265") s.codec = "hevc";
-  if (s.codec != "h264" && s.codec != "hevc") s.codec = "h264";
+  if (screenProvider_) s.provider = screenProvider_->currentData().toString();
+  s.codec = video::codecToString(video::codecFromString(s.codec));
+  s.provider = video::normalizeProviderKey(s.provider);
   if (s.fpsNum <= 0) s.fpsNum = 1;
   if (s.fpsDen <= 0) s.fpsDen = 15;
   if (s.bitrateKbps < 100) s.bitrateKbps = 100;

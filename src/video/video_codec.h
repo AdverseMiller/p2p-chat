@@ -15,12 +15,20 @@ namespace video {
 enum class Codec {
   H264,
   HEVC,
+  AV1,
 };
 
 struct EncodedFrame;
 
 QString codecToString(Codec c);
 Codec codecFromString(const QString& s);
+QString normalizeProviderKey(const QString& s);
+struct EncoderProvider {
+  QString key;
+  QString label;
+  bool hardware = false;
+};
+std::vector<EncoderProvider> availableEncoderProviders(Codec codec, bool runtimeValidate = false);
 bool isInputFourccSupported(uint32_t fourcc);
 std::optional<Codec> codecFromInputFourcc(uint32_t fourcc);
 bool isPassthroughCompatible(uint32_t fourcc, Codec networkCodec);
@@ -46,11 +54,13 @@ struct EncodedFrame {
 
 struct EncodeParams {
   Codec codec = Codec::H264;
+  QString provider = "auto";
   int width = 640;
   int height = 480;
   int fpsNum = 30;
   int fpsDen = 1;
   int bitrateKbps = 1500;
+  bool silent = false;
 };
 
 bool convertRawFrameToI420(const RawFrame& in, I420Frame* out, QString* err = nullptr);

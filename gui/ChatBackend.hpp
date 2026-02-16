@@ -35,6 +35,7 @@ public:
     int videoFpsNum = 1;
     int videoFpsDen = 30;
     QString videoCodec = "h264";
+    QString videoProvider = "auto";
     int videoBitrateKbps = 1500;
     bool videoEnabled = true;
   };

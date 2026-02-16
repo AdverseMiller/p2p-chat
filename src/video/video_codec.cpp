@@ -10,6 +10,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/log.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/error.h>
@@ -22,10 +23,21 @@ extern "C" {
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <span>
 #include <string>
 #include <vector>
 #include <QStringList>
+#include <cstdio>
+
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace video {
 
@@ -35,6 +47,8 @@ QString codecToString(Codec c) {
       return "h264";
     case Codec::HEVC:
       return "hevc";
+    case Codec::AV1:
+      return "av1";
   }
   return "h264";
 }
@@ -42,7 +56,15 @@ QString codecToString(Codec c) {
 Codec codecFromString(const QString& s) {
   const auto v = s.trimmed().toLower();
   if (v == "hevc" || v == "h265") return Codec::HEVC;
+  if (v == "av1" || v == "av01") return Codec::AV1;
   return Codec::H264;
+}
+
+QString normalizeProviderKey(const QString& s) {
+  const auto key = s.trimmed().toLower();
+  if (key.isEmpty()) return "auto";
+  if (key == "h264" || key == "hevc" || key == "h265" || key == "av1" || key == "av01") return "auto";
+  return key;
 }
 
 #if !defined(P2PCHAT_VIDEO)
@@ -51,6 +73,7 @@ struct Decoder::Impl {};
 
 bool isInputFourccSupported(uint32_t) { return false; }
 std::optional<Codec> codecFromInputFourcc(uint32_t) { return std::nullopt; }
+std::vector<EncoderProvider> availableEncoderProviders(Codec, bool) { return {}; }
 bool isPassthroughCompatible(uint32_t, Codec) { return false; }
 bool passthroughFrame(const RawFrame&, Codec, EncodedFrame*, QString* err) {
   if (err) *err = "video codec unavailable on this build";
@@ -104,6 +127,102 @@ bool codec_trace_enabled() {
   return enabled;
 }
 
+bool provider_probe_verbose_enabled() {
+  static const bool enabled = [] {
+    const char* raw = std::getenv("P2PCHAT_PROVIDER_PROBE_VERBOSE");
+    if (!raw || !*raw) return false;
+    std::string v(raw);
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return v == "1" || v == "true" || v == "yes" || v == "on";
+  }();
+  return enabled;
+}
+
+class ScopedStdioSilence {
+public:
+  explicit ScopedStdioSilence(bool enabled) : enabled_(enabled) {
+    if (!enabled_) return;
+
+    old_av_log_level_ = av_log_get_level();
+    av_log_set_level(AV_LOG_QUIET);
+
+#if defined(_WIN32)
+    null_fd_ = _open("NUL", _O_WRONLY);
+    if (null_fd_ < 0) {
+      enabled_ = false;
+      av_log_set_level(old_av_log_level_);
+      return;
+    }
+    old_stdout_fd_ = _dup(_fileno(stdout));
+    old_stderr_fd_ = _dup(_fileno(stderr));
+    if (old_stdout_fd_ < 0 || old_stderr_fd_ < 0) {
+      enabled_ = false;
+      cleanup_fds();
+      av_log_set_level(old_av_log_level_);
+      return;
+    }
+    _dup2(null_fd_, _fileno(stdout));
+    _dup2(null_fd_, _fileno(stderr));
+#else
+    null_fd_ = ::open("/dev/null", O_WRONLY);
+    if (null_fd_ < 0) {
+      enabled_ = false;
+      av_log_set_level(old_av_log_level_);
+      return;
+    }
+    old_stdout_fd_ = ::dup(STDOUT_FILENO);
+    old_stderr_fd_ = ::dup(STDERR_FILENO);
+    if (old_stdout_fd_ < 0 || old_stderr_fd_ < 0) {
+      enabled_ = false;
+      cleanup_fds();
+      av_log_set_level(old_av_log_level_);
+      return;
+    }
+    ::dup2(null_fd_, STDOUT_FILENO);
+    ::dup2(null_fd_, STDERR_FILENO);
+#endif
+  }
+
+  ~ScopedStdioSilence() {
+    if (enabled_) {
+#if defined(_WIN32)
+      _dup2(old_stdout_fd_, _fileno(stdout));
+      _dup2(old_stderr_fd_, _fileno(stderr));
+#else
+      ::dup2(old_stdout_fd_, STDOUT_FILENO);
+      ::dup2(old_stderr_fd_, STDERR_FILENO);
+#endif
+    }
+    cleanup_fds();
+    if (old_av_log_level_ >= 0) av_log_set_level(old_av_log_level_);
+  }
+
+  ScopedStdioSilence(const ScopedStdioSilence&) = delete;
+  ScopedStdioSilence& operator=(const ScopedStdioSilence&) = delete;
+
+private:
+  void cleanup_fds() {
+#if defined(_WIN32)
+    if (old_stdout_fd_ >= 0) _close(old_stdout_fd_);
+    if (old_stderr_fd_ >= 0) _close(old_stderr_fd_);
+    if (null_fd_ >= 0) _close(null_fd_);
+#else
+    if (old_stdout_fd_ >= 0) ::close(old_stdout_fd_);
+    if (old_stderr_fd_ >= 0) ::close(old_stderr_fd_);
+    if (null_fd_ >= 0) ::close(null_fd_);
+#endif
+    old_stdout_fd_ = -1;
+    old_stderr_fd_ = -1;
+    null_fd_ = -1;
+  }
+
+  bool enabled_ = false;
+  int old_av_log_level_ = -1;
+  int old_stdout_fd_ = -1;
+  int old_stderr_fd_ = -1;
+  int null_fd_ = -1;
+};
+
 constexpr uint32_t make_fourcc(char a, char b, char c, char d) {
   return (static_cast<uint32_t>(static_cast<unsigned char>(a)) << 0) |
          (static_cast<uint32_t>(static_cast<unsigned char>(b)) << 8) |
@@ -152,6 +271,10 @@ std::optional<AVCodecID> fourcc_to_compressed_codec(uint32_t fourcc) {
   }
   if (fourcc == make_fourcc('H', '2', '6', '4')) return AV_CODEC_ID_H264;
   if (fourcc == make_fourcc('H', 'E', 'V', 'C')) return AV_CODEC_ID_HEVC;
+  if (fourcc == make_fourcc('A', 'V', '0', '1') ||
+      fourcc == make_fourcc('A', 'V', '1', 'F')) {
+    return AV_CODEC_ID_AV1;
+  }
   return std::nullopt;
 }
 
@@ -288,6 +411,33 @@ bool compressed_to_i420(const RawFrame& in, AVCodecID codecId, I420Frame* out, Q
   return false;
 }
 
+bool is_hardware_provider(const QString& key) {
+  return key == "nvenc" || key == "vaapi" || key == "qsv" || key == "amf" || key == "v4l2m2m" ||
+         key == "videotoolbox";
+}
+
+QString provider_key_from_encoder_name(const char* name) {
+  if (!name || !*name) return "software";
+  const QString s = QString::fromLatin1(name).trimmed().toLower();
+  if (s.contains("nvenc")) return "nvenc";
+  if (s.contains("vaapi")) return "vaapi";
+  if (s.contains("qsv")) return "qsv";
+  if (s.contains("amf")) return "amf";
+  if (s.contains("v4l2m2m")) return "v4l2m2m";
+  if (s.contains("videotoolbox")) return "videotoolbox";
+  return "software";
+}
+
+QString provider_label_for_key(const QString& key) {
+  if (key == "nvenc") return "NVIDIA NVENC";
+  if (key == "vaapi") return "VAAPI";
+  if (key == "qsv") return "Intel Quick Sync";
+  if (key == "amf") return "AMD AMF";
+  if (key == "v4l2m2m") return "V4L2 M2M";
+  if (key == "videotoolbox") return "VideoToolbox";
+  return "Software";
+}
+
 std::vector<const AVCodec*> encoder_candidates(Codec want) {
   std::vector<const AVCodec*> out;
   auto add = [&out](const AVCodec* codec) {
@@ -300,15 +450,34 @@ std::vector<const AVCodec*> encoder_candidates(Codec want) {
   auto add_name = [&add](const char* name) { add(avcodec_find_encoder_by_name(name)); };
   auto add_id = [&add](AVCodecID id) { add(avcodec_find_encoder(id)); };
   if (want == Codec::HEVC) {
-    // Prefer NVENC first when available, then software, then V4L2 wrappers.
+    // Prefer hardware encoders first.
     add_name("hevc_nvenc");
-    add_name("libx265");
+    add_name("hevc_vaapi");
+    add_name("hevc_qsv");
+    add_name("hevc_amf");
     add_name("hevc_v4l2m2m");
+    add_name("hevc_videotoolbox");
+    add_name("libx265");
     add_id(AV_CODEC_ID_HEVC);
+  } else if (want == Codec::AV1) {
+    add_name("av1_nvenc");
+    add_name("av1_vaapi");
+    add_name("av1_qsv");
+    add_name("av1_amf");
+    add_name("av1_v4l2m2m");
+    add_name("av1_videotoolbox");
+    add_name("libsvtav1");
+    add_name("librav1e");
+    add_name("libaom-av1");
+    add_id(AV_CODEC_ID_AV1);
   } else {
     add_name("h264_nvenc");
-    add_name("libx264");
+    add_name("h264_vaapi");
+    add_name("h264_qsv");
+    add_name("h264_amf");
     add_name("h264_v4l2m2m");
+    add_name("h264_videotoolbox");
+    add_name("libx264");
     add_id(AV_CODEC_ID_H264);
   }
   return out;
@@ -340,6 +509,9 @@ std::vector<const AVCodec*> decoder_candidates(Codec codec) {
   if (codec == Codec::HEVC) {
     add_name("hevc_cuvid");
     add_id(AV_CODEC_ID_HEVC);
+  } else if (codec == Codec::AV1) {
+    add_name("av1_cuvid");
+    add_id(AV_CODEC_ID_AV1);
   } else {
     add_name("h264_cuvid");
     add_id(AV_CODEC_ID_H264);
@@ -350,6 +522,7 @@ std::vector<const AVCodec*> decoder_candidates(Codec codec) {
 std::optional<Codec> codec_from_avcodec(AVCodecID codec) {
   if (codec == AV_CODEC_ID_H264) return Codec::H264;
   if (codec == AV_CODEC_ID_HEVC) return Codec::HEVC;
+  if (codec == AV_CODEC_ID_AV1) return Codec::AV1;
   return std::nullopt;
 }
 
@@ -406,6 +579,63 @@ QImage avframe_to_qimage(const AVFrame* frame) {
 
 } // namespace
 
+std::vector<EncoderProvider> availableEncoderProviders(Codec codec, bool runtimeValidate) {
+  std::vector<EncoderProvider> out;
+  std::vector<QString> seen;
+  for (const auto* enc : encoder_candidates(codec)) {
+    if (!enc) continue;
+    const QString key = provider_key_from_encoder_name(enc->name);
+    if (key.isEmpty()) continue;
+    if (std::find(seen.begin(), seen.end(), key) != seen.end()) continue;
+    seen.push_back(key);
+    out.push_back(EncoderProvider{
+        .key = key,
+        .label = provider_label_for_key(key),
+        .hardware = is_hardware_provider(key),
+    });
+  }
+  if (!runtimeValidate) return out;
+
+  static std::mutex probeMu;
+  static std::map<std::pair<int, std::string>, bool> probeCache;
+  auto providerAvailable = [&](const EncoderProvider& provider) -> bool {
+    const auto cacheKey = std::make_pair(static_cast<int>(codec), provider.key.toStdString());
+    {
+      std::lock_guard<std::mutex> lk(probeMu);
+      const auto it = probeCache.find(cacheKey);
+      if (it != probeCache.end()) return it->second;
+    }
+
+    EncodeParams probeParams;
+    probeParams.codec = codec;
+    probeParams.provider = provider.key;
+    probeParams.width = 320;
+    probeParams.height = 180;
+    probeParams.fpsNum = 30;
+    probeParams.fpsDen = 1;
+    probeParams.bitrateKbps = 500;
+    probeParams.silent = true;
+    QString err;
+    const bool quietProbe = !provider_probe_verbose_enabled() && !codec_trace_enabled();
+    ScopedStdioSilence silencer(quietProbe);
+    Encoder probe;
+    const bool ok = probe.open(probeParams, &err);
+    probe.close();
+    {
+      std::lock_guard<std::mutex> lk(probeMu);
+      probeCache[cacheKey] = ok;
+    }
+    return ok;
+  };
+
+  std::vector<EncoderProvider> filtered;
+  filtered.reserve(out.size());
+  for (const auto& provider : out) {
+    if (providerAvailable(provider)) filtered.push_back(provider);
+  }
+  return filtered;
+}
+
 struct Encoder::Impl {
   const AVCodec* codec = nullptr;
   AVCodecContext* ctx = nullptr;
@@ -452,6 +682,8 @@ bool passthroughFrame(const RawFrame& in, Codec networkCodec, EncodedFrame* out,
   std::span<const uint8_t> span(out->bytes.data(), out->bytes.size());
   if (networkCodec == Codec::HEVC) {
     out->keyframe = has_hevc_idr(span);
+  } else if (networkCodec == Codec::AV1) {
+    out->keyframe = false;
   } else {
     out->keyframe = has_h264_idr(span);
   }
@@ -532,9 +764,28 @@ bool Encoder::open(const EncodeParams& p, QString* err) {
   codec_ = p.codec;
   impl_ = std::make_unique<Impl>();
 
-  const auto candidates = encoder_candidates(p.codec);
+  const QString requestedProvider = normalizeProviderKey(p.provider);
+  std::vector<const AVCodec*> candidates = encoder_candidates(p.codec);
+  if (requestedProvider != "auto") {
+    std::vector<const AVCodec*> filtered;
+    filtered.reserve(candidates.size());
+    for (const auto* candidate : candidates) {
+      if (!candidate) continue;
+      if (provider_key_from_encoder_name(candidate->name) == requestedProvider) {
+        filtered.push_back(candidate);
+      }
+    }
+    candidates.swap(filtered);
+  }
+
   if (candidates.empty()) {
-    if (err) *err = "no suitable video encoder found";
+    if (err) {
+      if (requestedProvider == "auto") {
+        *err = "no suitable video encoder found";
+      } else {
+        *err = QString("no suitable video encoder found for provider '%1'").arg(requestedProvider);
+      }
+    }
     return false;
   }
 
@@ -547,6 +798,7 @@ bool Encoder::open(const EncodeParams& p, QString* err) {
                     " size=" + std::to_string(p.width) + "x" + std::to_string(p.height) +
                     " fps=" + std::to_string(p.fpsDen) + "/" + std::to_string(p.fpsNum) +
                     " bitrate_kbps=" + std::to_string(p.bitrateKbps) +
+                    " provider=" + requestedProvider.toStdString() +
                     " candidates=" + names.join(", ").toStdString());
   }
 
@@ -589,6 +841,14 @@ bool Encoder::open(const EncodeParams& p, QString* err) {
         av_opt_set(impl_->ctx->priv_data, "tune", "zerolatency", 0);
       }
       av_opt_set(impl_->ctx->priv_data, "profile", "main", 0);
+    }
+    else if (impl_->codec->id == AV_CODEC_ID_AV1) {
+      if (isNvenc) {
+        av_opt_set(impl_->ctx->priv_data, "preset", "p1", 0);
+        av_opt_set(impl_->ctx->priv_data, "tune", "ll", 0);
+      } else {
+        av_opt_set(impl_->ctx->priv_data, "preset", "ultrafast", 0);
+      }
     }
 
     codec_trace_log(std::string("trying encoder=") + (candidate->name ? candidate->name : "unknown"));
@@ -634,9 +894,12 @@ bool Encoder::open(const EncodeParams& p, QString* err) {
     return false;
   }
 
-  common::log("video: encoder open codec=" + codecToString(codec_).toStdString() +
-              " encoder=" + std::string(impl_->codec ? impl_->codec->name : "unknown") +
-              " " + std::to_string(impl_->ctx->width) + "x" + std::to_string(impl_->ctx->height));
+  if (!p.silent) {
+    common::log("video: encoder open codec=" + codecToString(codec_).toStdString() +
+                " provider=" + requestedProvider.toStdString() +
+                " encoder=" + std::string(impl_->codec ? impl_->codec->name : "unknown") +
+                " " + std::to_string(impl_->ctx->width) + "x" + std::to_string(impl_->ctx->height));
+  }
   codec_trace_log("encoder open success encoder=" + std::string(impl_->codec ? impl_->codec->name : "unknown"));
   return true;
 }

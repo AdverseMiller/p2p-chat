@@ -205,7 +205,8 @@ Profile Profile::load(const QString& path, QString* errorOut) {
     if (p.video.bitrateKbps > 20000) p.video.bitrateKbps = 20000;
     p.video.codec = p.video.codec.trimmed().toLower();
     if (p.video.codec == "h265") p.video.codec = "hevc";
-    if (p.video.codec != "h264" && p.video.codec != "hevc") p.video.codec = "h264";
+    if (p.video.codec == "av01") p.video.codec = "av1";
+    if (p.video.codec != "h264" && p.video.codec != "hevc" && p.video.codec != "av1") p.video.codec = "h264";
   }
 
   if (root.value("screen").isObject()) {
@@ -216,6 +217,7 @@ Profile Profile::load(const QString& path, QString* errorOut) {
     p.screen.fpsDen = s.value("fpsDen").toInt(p.screen.fpsDen);
     p.screen.bitrateKbps = s.value("bitrateKbps").toInt(p.screen.bitrateKbps);
     p.screen.codec = s.value("codec").toString(p.screen.codec);
+    p.screen.provider = s.value("provider").toString(p.screen.provider);
     p.screen.lastDisplayName = s.value("lastDisplayName").toString(p.screen.lastDisplayName);
     if (p.screen.width < 0) p.screen.width = 0;
     if (p.screen.height < 0) p.screen.height = 0;
@@ -229,7 +231,10 @@ Profile Profile::load(const QString& path, QString* errorOut) {
     if (p.screen.bitrateKbps > 20000) p.screen.bitrateKbps = 20000;
     p.screen.codec = p.screen.codec.trimmed().toLower();
     if (p.screen.codec == "h265") p.screen.codec = "hevc";
-    if (p.screen.codec != "h264" && p.screen.codec != "hevc") p.screen.codec = "h264";
+    if (p.screen.codec == "av01") p.screen.codec = "av1";
+    if (p.screen.codec != "h264" && p.screen.codec != "hevc" && p.screen.codec != "av1") p.screen.codec = "h264";
+    p.screen.provider = p.screen.provider.trimmed().toLower();
+    if (p.screen.provider.isEmpty()) p.screen.provider = "auto";
   }
 
   const auto arr = root.value("friends").toArray();
@@ -408,6 +413,7 @@ bool Profile::save(QString* errorOut) const {
     s["fpsDen"] = screen.fpsDen;
     s["bitrateKbps"] = screen.bitrateKbps;
     s["codec"] = screen.codec;
+    s["provider"] = screen.provider;
     s["lastDisplayName"] = screen.lastDisplayName;
     root["screen"] = s;
   }

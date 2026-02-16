@@ -48,6 +48,7 @@ private:
   void rebuildVideoFormats();
   void rebuildVideoSizes();
   void rebuildVideoFps();
+  void rebuildScreenProviders();
   void startPreview();
   void stopPreview();
   void setPreviewImage(const QImage& img);
@@ -85,6 +86,7 @@ private:
   QComboBox* screenFps_ = nullptr;
   QSpinBox* screenBitrate_ = nullptr;
   QComboBox* screenCodec_ = nullptr;
+  QComboBox* screenProvider_ = nullptr;
 
   class PreviewState;
   std::unique_ptr<PreviewState> preview_;
