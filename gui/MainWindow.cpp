@@ -1211,6 +1211,9 @@ MainWindow::MainWindow(QString keyPassword, QWidget* parent)
       for (auto it = voiceOccupantsByChannel_.begin(); it != voiceOccupantsByChannel_.end(); ++it) {
         it.value().remove(peerId);
       }
+      for (auto it = voiceLiveByChannel_.begin(); it != voiceLiveByChannel_.end(); ++it) {
+        it.value().remove(peerId);
+      }
     }
     refreshFriendPresenceRow(peerId);
     rebuildServerList();
@@ -1869,6 +1872,7 @@ void MainWindow::buildUi() {
       if (joinedServerVoiceKey_ == key) {
         broadcastVoicePresence(selectedServerId_, selectedServerChannelId_, false);
         voiceOccupantsByChannel_[key].remove(selfId_);
+        voiceLiveByChannel_[key].remove(selfId_);
         joinedServerVoiceKey_.clear();
         backend_.stopVoiceChannel();
         statusBar()->showMessage("Left voice channel", 3000);
@@ -1879,10 +1883,16 @@ void MainWindow::buildUi() {
           if (!prevServer.isEmpty() && !prevChannel.isEmpty()) {
             broadcastVoicePresence(prevServer, prevChannel, false);
             voiceOccupantsByChannel_[joinedServerVoiceKey_].remove(selfId_);
+            voiceLiveByChannel_[joinedServerVoiceKey_].remove(selfId_);
           }
         }
         joinedServerVoiceKey_ = key;
         voiceOccupantsByChannel_[key].insert(selfId_);
+        if (webcamEnabled_ || screenShareEnabled_) {
+          voiceLiveByChannel_[key].insert(selfId_);
+        } else {
+          voiceLiveByChannel_[key].remove(selfId_);
+        }
         broadcastVoicePresence(selectedServerId_, selectedServerChannelId_, true);
         statusBar()->showMessage("Joined voice channel", 4000);
       }
@@ -1922,6 +1932,7 @@ void MainWindow::buildUi() {
       if (!serverId.isEmpty() && !channelId.isEmpty()) {
         broadcastVoicePresence(serverId, channelId, false);
         voiceOccupantsByChannel_[joinedServerVoiceKey_].remove(selfId_);
+        voiceLiveByChannel_[joinedServerVoiceKey_].remove(selfId_);
       }
       joinedServerVoiceKey_.clear();
       backend_.stopVoiceChannel();
@@ -1979,7 +1990,10 @@ void MainWindow::buildUi() {
                                                             webcamEnabled_,
                                                             screenShareEnabled_,
                                                             screenShareDisplayName_));
-      if (!joinedServerVoiceKey_.isEmpty()) maybeSyncVoiceCallForJoinedChannel();
+      if (!joinedServerVoiceKey_.isEmpty()) {
+        maybeSyncVoiceCallForJoinedChannel();
+        announceJoinedVoicePresence();
+      }
       statusBar()->showMessage(webcamEnabled_ ? "Webcam enabled" : "Webcam disabled", 3000);
     }
   });
@@ -2024,7 +2038,10 @@ void MainWindow::buildUi() {
                                                             webcamEnabled_,
                                                             screenShareEnabled_,
                                                             screenShareDisplayName_));
-      if (!joinedServerVoiceKey_.isEmpty()) maybeSyncVoiceCallForJoinedChannel();
+      if (!joinedServerVoiceKey_.isEmpty()) {
+        maybeSyncVoiceCallForJoinedChannel();
+        announceJoinedVoicePresence();
+      }
       statusBar()->showMessage(screenShareEnabled_ ? "Screen share enabled" : "Screen share disabled", 3000);
     }
   });
@@ -2342,10 +2359,7 @@ void MainWindow::rebuildServerList() {
         memberItem->setData(kRolePeerId, id);
         memberItem->setData(kRoleIndentPx, 24);
         memberItem->setData(kRolePresenceState, presenceStateFor(id));
-        const bool liveSharing = (id == selfId_)
-                                     ? ((webcamEnabled_ || screenShareEnabled_) && localVideoActive_)
-                                     : remoteVideoAvailable_.value(
-                                           id, remoteVideoFrames_.contains(id) && !remoteVideoFrames_.value(id).isNull());
+        const bool liveSharing = voiceLiveByChannel_.value(key).contains(id);
         memberItem->setData(kRoleVoiceLive, liveSharing);
         QString avatarPath = (id == selfId_) ? profile_.selfAvatarPath : (f ? f->avatarPath : QString());
         if (avatarPath.isEmpty() && shouldShowNonFriendAvatar(id, hinted)) {
@@ -3333,8 +3347,23 @@ void MainWindow::broadcastVoicePresence(const QString& serverId, const QString& 
   payload["channel_id"] = channelId;
   payload["member_id"] = selfId_;
   payload["joined"] = joined;
+  const bool live = joined && (webcamEnabled_ || screenShareEnabled_);
+  payload["live"] = live;
   payload["issued_ms"] = static_cast<double>(nowUtcMs());
   payload["nonce"] = makeServerObjectId();
+
+  const auto key = serverChannelChatKey(serverId, channelId);
+  if (joined) {
+    voiceOccupantsByChannel_[key].insert(selfId_);
+    if (live) {
+      voiceLiveByChannel_[key].insert(selfId_);
+    } else {
+      voiceLiveByChannel_[key].remove(selfId_);
+    }
+  } else {
+    voiceOccupantsByChannel_[key].remove(selfId_);
+    voiceLiveByChannel_[key].remove(selfId_);
+  }
 
   for (const auto& m : s->members) {
     if (m.id.isEmpty() || m.id == selfId_) continue;
@@ -3419,6 +3448,7 @@ void MainWindow::handleServerVoicePresence(const QString& peerId, const QJsonObj
   const auto channelId = payload.value("channel_id").toString();
   const auto memberId = payload.value("member_id").toString();
   const bool joined = payload.value("joined").toBool(false);
+  const bool live = payload.value("live").toBool(false);
   if (serverId.isEmpty() || channelId.isEmpty() || memberId.isEmpty()) return;
   if (memberId != peerId) return;
 
@@ -3438,8 +3468,14 @@ void MainWindow::handleServerVoicePresence(const QString& peerId, const QJsonObj
   const auto key = serverChannelChatKey(serverId, channelId);
   if (joined) {
     voiceOccupantsByChannel_[key].insert(memberId);
+    if (live) {
+      voiceLiveByChannel_[key].insert(memberId);
+    } else {
+      voiceLiveByChannel_[key].remove(memberId);
+    }
   } else {
     voiceOccupantsByChannel_[key].remove(memberId);
+    voiceLiveByChannel_[key].remove(memberId);
   }
   rebuildServerList();
   refreshServerMembersPane();
@@ -3500,6 +3536,14 @@ void MainWindow::sanitizeVoiceOccupantsForServer(const QString& serverId) {
 
   const QString prefix = QString("srv__%1__ch__").arg(serverId);
   for (auto it = voiceOccupantsByChannel_.begin(); it != voiceOccupantsByChannel_.end(); ++it) {
+    if (!it.key().startsWith(prefix)) continue;
+    QSet<QString> next;
+    for (const auto& id : it.value()) {
+      if (allowed.contains(id)) next.insert(id);
+    }
+    it.value() = next;
+  }
+  for (auto it = voiceLiveByChannel_.begin(); it != voiceLiveByChannel_.end(); ++it) {
     if (!it.key().startsWith(prefix)) continue;
     QSet<QString> next;
     for (const auto& id : it.value()) {
@@ -3572,6 +3616,13 @@ void MainWindow::removeServer(const QString& serverId) {
       ++it;
     }
   }
+  for (auto it = voiceLiveByChannel_.begin(); it != voiceLiveByChannel_.end();) {
+    if (it.key().startsWith(prefix)) {
+      it = voiceLiveByChannel_.erase(it);
+    } else {
+      ++it;
+    }
+  }
   for (int i = 0; i < profile_.servers.size(); ++i) {
     if (profile_.servers[i].id != serverId) continue;
     profile_.servers.removeAt(i);
@@ -3599,6 +3650,7 @@ void MainWindow::removeServerChannel(const QString& serverId, const QString& cha
   if (!s) return;
   const auto key = serverChannelChatKey(serverId, channelId);
   voiceOccupantsByChannel_.remove(key);
+  voiceLiveByChannel_.remove(key);
   for (int i = 0; i < s->channels.size(); ++i) {
     if (s->channels[i].id == channelId) {
       s->channels.removeAt(i);

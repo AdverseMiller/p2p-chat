@@ -181,6 +181,7 @@ private:
   bool selectedServerChannelVoice_ = false;
   QString joinedServerVoiceKey_;
   QMap<QString, QSet<QString>> voiceOccupantsByChannel_; // key: serverChannelChatKey(server, channel)
+  QMap<QString, QSet<QString>> voiceLiveByChannel_; // key: serverChannelChatKey(server, channel)
   QString selfId_;
   QMap<QString, QVector<Profile::ChatMessage>> chatCache_;
   QMap<QString, bool> rendezvousOnline_;
