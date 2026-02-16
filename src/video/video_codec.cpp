@@ -299,7 +299,6 @@ std::vector<const AVCodec*> encoder_candidates(Codec want) {
   };
   auto add_name = [&add](const char* name) { add(avcodec_find_encoder_by_name(name)); };
   auto add_id = [&add](AVCodecID id) { add(avcodec_find_encoder(id)); };
-
   if (want == Codec::HEVC) {
     // Prefer NVENC first when available, then software, then V4L2 wrappers.
     add_name("hevc_nvenc");

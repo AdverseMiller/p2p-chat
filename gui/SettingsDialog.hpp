@@ -21,6 +21,7 @@ public:
                           const Profile::VideoSettings& video_initial,
                           const Profile::ScreenSettings& screen_initial,
                           bool share_identity_non_friends,
+                          bool hide_local_stream_preview_default,
                           bool signed_only_server_messages,
                           QWidget* parent = nullptr);
   ~SettingsDialog() override;
@@ -29,12 +30,14 @@ public:
   Profile::VideoSettings videoSettings() const;
   Profile::ScreenSettings screenSettings() const;
   bool shareIdentityWithNonFriends() const;
+  bool hideLocalStreamPreviewByDefault() const;
   bool signedOnlyServerMessages() const;
 
   static bool edit(Profile::AudioSettings* inOut,
                    Profile::VideoSettings* video_in_out,
                    Profile::ScreenSettings* screen_in_out,
                    bool* share_identity_non_friends,
+                   bool* hide_local_stream_preview_default,
                    bool* signed_only_server_messages,
                    QWidget* parent = nullptr);
 
@@ -63,6 +66,7 @@ private:
   QComboBox* frameMs_ = nullptr;
   QComboBox* channels_ = nullptr;
   QCheckBox* shareIdentityCheck_ = nullptr;
+  QCheckBox* hideLocalPreviewDefaultCheck_ = nullptr;
   QCheckBox* signedOnlyServerMessagesCheck_ = nullptr;
 
   // Video tab

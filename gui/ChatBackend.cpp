@@ -8,6 +8,9 @@
 #include "src/video/v4l2_capture.h"
 #include "src/video/video_codec.h"
 #include "src/video/video_packetizer.h"
+#if defined(P2PCHAT_X11_SHM)
+#include "src/video/x11_shm_capture.h"
+#endif
 
 #include <QCoreApplication>
 #include <QPointer>
@@ -15,6 +18,13 @@
 #include <QTimer>
 #include <QScreen>
 #include <QGuiApplication>
+#if defined(P2PCHAT_VIDEO) && __has_include(<QScreenCapture>) && __has_include(<QMediaCaptureSession>) && __has_include(<QVideoSink>) && __has_include(<QVideoFrame>)
+#define P2PCHAT_QT_SCREEN_CAPTURE 1
+#include <QMediaCaptureSession>
+#include <QScreenCapture>
+#include <QVideoFrame>
+#include <QVideoSink>
+#endif
 
 #include <boost/asio.hpp>
 
@@ -23,6 +33,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -112,6 +123,10 @@ QString normalize_video_codec(const QString& raw) {
   return "h264";
 }
 
+video::Codec opposite_video_codec(video::Codec codec) {
+  return codec == video::Codec::HEVC ? video::Codec::H264 : video::Codec::HEVC;
+}
+
 bool debug_logs_enabled() {
   static const bool enabled = [] {
 #if !defined(NDEBUG)
@@ -140,6 +155,60 @@ bool running_as_root() {
   return false;
 #else
   return ::geteuid() == 0;
+#endif
+}
+
+bool is_x11_platform();
+
+bool prefer_qt_screen_capture_backend() {
+#if defined(P2PCHAT_QT_SCREEN_CAPTURE) && defined(__linux__)
+  const char* raw = std::getenv("P2PCHAT_SCREEN_BACKEND");
+  if (!raw || !*raw) return !is_x11_platform(); // on X11 prefer x11shm backend by default
+  QString v = QString::fromUtf8(raw).trimmed().toLower();
+  if (v == "x11" || v == "legacy" || v == "grabwindow") return false;
+  if (v == "x11shm" || v == "xshm" || v == "x11-shm") return false;
+  if (v == "qt" || v == "qtscreen" || v == "portal") return true;
+  return !is_x11_platform();
+#else
+  return false;
+#endif
+}
+
+bool allow_legacy_screen_fallback() {
+#if defined(P2PCHAT_QT_SCREEN_CAPTURE) && defined(__linux__)
+  const char* raw = std::getenv("P2PCHAT_SCREEN_ALLOW_LEGACY_FALLBACK");
+  if (!raw || !*raw) return false;
+  QString v = QString::fromUtf8(raw).trimmed().toLower();
+  return v == "1" || v == "true" || v == "yes" || v == "on";
+#else
+  return true;
+#endif
+}
+
+bool is_x11_platform() {
+#if defined(__linux__)
+  const QString platform = QGuiApplication::platformName().trimmed().toLower();
+  if (platform.contains("xcb") || platform == "x11") return true;
+  const char* session = std::getenv("XDG_SESSION_TYPE");
+  if (session && *session) {
+    const QString s = QString::fromUtf8(session).trimmed().toLower();
+    if (s == "x11") return true;
+    if (s == "wayland") return false;
+  }
+#endif
+  return false;
+}
+
+bool prefer_x11_shm_screen_backend() {
+#if defined(P2PCHAT_X11_SHM) && defined(__linux__)
+  const char* raw = std::getenv("P2PCHAT_SCREEN_BACKEND");
+  if (raw && *raw) {
+    QString v = QString::fromUtf8(raw).trimmed().toLower();
+    return v == "x11shm" || v == "xshm" || v == "x11-shm";
+  }
+  return is_x11_platform();
+#else
+  return false;
 #endif
 }
 
@@ -2143,6 +2212,7 @@ struct ChatBackend::Impl {
   int callFrameMs = 20;
   int callChannels = 1;
   QString callVideoCodec = "h264";
+  QString callRemoteVideoCodec = "h264";
   bool callRemoteVideoEnabled = false;
   bool callRemoteWatchingVideo = true;
   ChatBackend::VoiceSettings callSettings;
@@ -2202,6 +2272,7 @@ struct ChatBackend::Impl {
     QString peerId;
     QString callId;
     video::Codec codec = video::Codec::H264;
+    video::Codec rxCodec = video::Codec::H264;
     bool passthrough = false;
     uint32_t captureFourcc = 0;
     int width = 640;
@@ -2220,13 +2291,38 @@ struct ChatBackend::Impl {
     bool sharing = false;
     bool screenShare = false;
     QString screenName;
+    bool qtScreenBackend = false;
+    bool x11ShmBackend = false;
+    QString screenBackendName = "legacy";
+    int screenMinIntervalMs = 33;
+    uint64_t lastScreenFrameMs = 0;
+    std::atomic<bool> screenCaptureStop{false};
+    std::atomic<bool> remoteWatching{true};
+    std::thread screenCaptureThread;
+    std::mutex screenWorkMu;
+    std::condition_variable screenWorkCv;
+    bool screenWorkStop = false;
+    bool screenWorkHasFrame = false;
+    QImage screenWorkFrame;
+    std::thread screenWorkThread;
     QSet<QString> txPeers;
     std::unordered_map<std::string, std::unique_ptr<video::Decoder>> channelDecoders;
+    std::unordered_map<std::string, video::Codec> channelDecoderCodecs;
+    std::unordered_map<std::string, video::Codec> channelPeerCodecHints;
     std::unordered_map<std::string, uint64_t> channelDecodeFailures;
     std::unordered_map<std::string, uint64_t> channelLastKeyframeReqMs;
 
     std::unique_ptr<video::V4L2Capture> capture;
+#if defined(P2PCHAT_X11_SHM)
+    std::unique_ptr<video::X11ShmCapture> screenCaptureX11Shm;
+#endif
     QPointer<QTimer> screenTimer;
+#if defined(P2PCHAT_QT_SCREEN_CAPTURE)
+    QPointer<QScreenCapture> screenCaptureQt;
+    QPointer<QMediaCaptureSession> screenSessionQt;
+    QPointer<QVideoSink> screenSinkQt;
+    QPointer<QTimer> screenFallbackTimerQt;
+#endif
     video::Encoder encoder;
     video::Decoder decoder;
   };
@@ -2292,6 +2388,7 @@ struct ChatBackend::Impl {
     callFrameMs = 20;
     callChannels = 1;
     callVideoCodec = "h264";
+    callRemoteVideoCodec = "h264";
     callRemoteVideoEnabled = false;
     callRemoteWatchingVideo = true;
     callSettings = {};
@@ -2960,6 +3057,39 @@ struct ChatBackend::Impl {
       videoRt->screenTimer->deleteLater();
       videoRt->screenTimer = nullptr;
     }
+    videoRt->screenCaptureStop.store(true, std::memory_order_relaxed);
+    if (videoRt->screenCaptureThread.joinable()) videoRt->screenCaptureThread.join();
+    {
+      std::lock_guard lk(videoRt->screenWorkMu);
+      videoRt->screenWorkStop = true;
+      videoRt->screenWorkHasFrame = false;
+      videoRt->screenWorkFrame = QImage();
+    }
+    videoRt->screenWorkCv.notify_all();
+    if (videoRt->screenWorkThread.joinable()) videoRt->screenWorkThread.join();
+#if defined(P2PCHAT_QT_SCREEN_CAPTURE)
+    if (videoRt->screenFallbackTimerQt) {
+      videoRt->screenFallbackTimerQt->stop();
+      videoRt->screenFallbackTimerQt->deleteLater();
+      videoRt->screenFallbackTimerQt = nullptr;
+    }
+    if (videoRt->screenCaptureQt) {
+      videoRt->screenCaptureQt->stop();
+      videoRt->screenCaptureQt->deleteLater();
+      videoRt->screenCaptureQt = nullptr;
+    }
+    if (videoRt->screenSinkQt) {
+      videoRt->screenSinkQt->deleteLater();
+      videoRt->screenSinkQt = nullptr;
+    }
+    if (videoRt->screenSessionQt) {
+      videoRt->screenSessionQt->deleteLater();
+      videoRt->screenSessionQt = nullptr;
+    }
+#endif
+#if defined(P2PCHAT_X11_SHM)
+    videoRt->screenCaptureX11Shm.reset();
+#endif
     if (videoRt->capture) videoRt->capture->stop();
     videoRt->encoder.close();
     videoRt->decoder.close();
@@ -2994,14 +3124,20 @@ struct ChatBackend::Impl {
     const QString runtimePeerId = channelMode ? QString() : callPeerId;
     const QString runtimeCallId = channelMode ? QString("__voice_channel__") : callId;
     const bool wantCapture = settings.videoEnabled && !settings.videoDevicePath.trimmed().isEmpty();
-    const auto selectedCodec = channelMode
-                                   ? resolve_network_video_codec(settings)
-                                   : (callVideoCodec.trimmed().isEmpty() ? QString("h264") : callVideoCodec.trimmed().toLower());
+    const auto selectedTxCodec = channelMode
+                                     ? resolve_network_video_codec(settings)
+                                     : (callVideoCodec.trimmed().isEmpty() ? QString("h264")
+                                                                           : callVideoCodec.trimmed().toLower());
+    const auto selectedRxCodec = channelMode
+                                     ? selectedTxCodec
+                                     : (callRemoteVideoCodec.trimmed().isEmpty() ? QString("h264")
+                                                                                 : callRemoteVideoCodec.trimmed().toLower());
     const bool useScreenCapture = settings.videoDevicePath.startsWith("screen://");
     const QString selectedScreenName =
         useScreenCapture ? settings.videoDevicePath.mid(static_cast<int>(std::strlen("screen://"))).trimmed() : QString();
     const uint32_t selectedFourcc = useScreenCapture ? 0u : parse_fourcc_text(settings.videoFourcc);
-    const auto selectedNetworkCodec = video::codecFromString(selectedCodec);
+    const auto selectedNetworkCodec = video::codecFromString(selectedTxCodec);
+    const auto selectedRxCodecEnum = video::codecFromString(selectedRxCodec);
     const bool canPassthrough = !useScreenCapture && video::isPassthroughCompatible(selectedFourcc, selectedNetworkCodec);
     int selectedWidth = settings.videoWidth;
     int selectedHeight = settings.videoHeight;
@@ -3037,7 +3173,8 @@ struct ChatBackend::Impl {
         videoRt->screenShare == useScreenCapture &&
         videoRt->screenName == selectedScreenName &&
         videoRt->captureFourcc == selectedFourcc &&
-        video::codecToString(videoRt->codec) == video::codecToString(video::codecFromString(selectedCodec)) &&
+        video::codecToString(videoRt->codec) == video::codecToString(video::codecFromString(selectedTxCodec)) &&
+        (channelMode || videoRt->rxCodec == selectedRxCodecEnum) &&
         videoRt->sharing == wantCapture;
     const bool samePeers = !videoRt || !channelMode ? true : (videoRt->txPeers == voiceChannelPeers);
     if (same && samePeers) return;
@@ -3048,7 +3185,8 @@ struct ChatBackend::Impl {
     vr->channelMode = channelMode;
     vr->peerId = runtimePeerId;
     vr->callId = runtimeCallId;
-    vr->codec = video::codecFromString(selectedCodec);
+    vr->codec = video::codecFromString(selectedTxCodec);
+    vr->rxCodec = selectedRxCodecEnum;
     vr->passthrough = useScreenCapture ? false : canPassthrough;
     vr->screenShare = useScreenCapture;
     vr->screenName = selectedScreenName;
@@ -3059,11 +3197,12 @@ struct ChatBackend::Impl {
     vr->fpsDen = selectedFpsDen;
     vr->bitrateKbps = selectedBitrate;
     vr->streamId = 1;
+    vr->remoteWatching.store(callRemoteWatchingVideo, std::memory_order_relaxed);
     if (channelMode) vr->txPeers = voiceChannelPeers;
 
     QString err;
     if (!channelMode) {
-      if (!vr->decoder.open(vr->codec, &err)) {
+      if (!vr->decoder.open(vr->rxCodec, &err)) {
         emit q->logLine("video: decoder unavailable: " + err);
         return;
       }
@@ -3090,14 +3229,6 @@ struct ChatBackend::Impl {
         return;
       }
       vr->codec = vr->encoder.codec();
-      if (!channelMode) {
-        vr->decoder.close();
-        if (!vr->decoder.open(vr->codec, &err)) {
-          emit q->logLine("video: decoder unavailable: " + err);
-          vr->encoder.close();
-          return;
-        }
-      }
     }
 
     auto sendEncodedFrames = [this](const std::vector<video::EncodedFrame>& out) {
@@ -3140,57 +3271,264 @@ struct ChatBackend::Impl {
       }
 
       const double fps = static_cast<double>(std::max(1, vr->fpsDen)) / static_cast<double>(std::max(1, vr->fpsNum));
-      const int intervalMs = std::clamp(static_cast<int>(std::lround(1000.0 / std::max(1.0, fps))), 16, 250);
-      vr->screenTimer = new QTimer(q);
-      vr->screenTimer->setInterval(intervalMs);
-      QObject::connect(vr->screenTimer, &QTimer::timeout, q, [this, runtimePeerId, sendEncodedFrames] {
-        if (!videoRt || !videoRt->screenShare) return;
-        if (!videoRt->channelMode && videoRt->peerId != runtimePeerId) return;
-        auto* screen = find_screen_by_name(videoRt->screenName);
-        if (!screen) return;
-        QPixmap shot = screen->grabWindow(0);
-        if (shot.isNull()) return;
-        QImage frame = shot.toImage();
-        if (frame.isNull()) return;
-        if (frame.width() != videoRt->width || frame.height() != videoRt->height) {
-          frame = frame.scaled(videoRt->width, videoRt->height, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
-        }
-        if (localVideoPreviewEnabled.load(std::memory_order_relaxed)) {
-          emit q->localVideoFrame(frame);
-        }
+      const int requestedIntervalMs = std::clamp(static_cast<int>(std::lround(1000.0 / std::max(1.0, fps))), 16, 250);
+      int intervalMs = requestedIntervalMs;
+#if defined(__linux__)
+      // On X11, high-frequency desktop capture can thrash compositor/game frame pacing.
+      // Cap capture rate unless user explicitly opts out.
+      const char* capRaw = std::getenv("P2PCHAT_X11_CAPTURE_MAX_FPS");
+      int x11CapFps = 20;
+      if (capRaw && *capRaw) {
+        bool ok = false;
+        const int parsed = QString::fromUtf8(capRaw).trimmed().toInt(&ok);
+        if (ok && parsed >= 5 && parsed <= 60) x11CapFps = parsed;
+      }
+      if (is_x11_platform()) {
+        const int cappedInterval = std::max(16, static_cast<int>(std::lround(1000.0 / static_cast<double>(x11CapFps))));
+        intervalMs = std::max(intervalMs, cappedInterval);
+      }
+#endif
+      vr->screenMinIntervalMs = intervalMs;
 
-        video::I420Frame i420;
-        QString cvtErr;
-        if (!video::qimageToI420(frame, &i420, &cvtErr)) {
-          videoRt->convertFailures++;
-          if (debug_logs_enabled() && (videoRt->convertFailures % 30) == 1) {
-            emit q->logLine("[dbg] screen convert failed err=" + cvtErr);
+      vr->screenWorkStop = false;
+      vr->screenWorkHasFrame = false;
+      vr->screenWorkFrame = QImage();
+      vr->screenWorkThread = std::thread([this, rt = vr.get()] {
+        while (true) {
+          QImage frame;
+          {
+            std::unique_lock lk(rt->screenWorkMu);
+            rt->screenWorkCv.wait(lk, [rt] { return rt->screenWorkStop || rt->screenWorkHasFrame; });
+            if (rt->screenWorkStop) break;
+            frame = std::move(rt->screenWorkFrame);
+            rt->screenWorkHasFrame = false;
           }
-          return;
-        }
+          if (frame.isNull()) continue;
+          if (frame.width() != rt->width || frame.height() != rt->height) {
+            frame = frame.scaled(rt->width, rt->height, Qt::IgnoreAspectRatio, Qt::FastTransformation);
+          }
+          if (localVideoPreviewEnabled.load(std::memory_order_relaxed)) {
+            postToQt([this, frame]() mutable { emit q->localVideoFrame(frame); });
+          }
 
-        std::vector<video::EncodedFrame> out;
-        QString encErr;
-        if (!videoRt->encoder.encode(i420, &out, &encErr)) {
-          videoRt->encodeFailures++;
-          if (debug_logs_enabled() && (videoRt->encodeFailures % 30) == 1) {
-            emit q->logLine("[dbg] screen encode failed err=" + encErr);
+          if (!rt->channelMode && !rt->remoteWatching.load(std::memory_order_relaxed)) continue;
+          if (rt->channelMode && rt->txPeers.isEmpty()) continue;
+
+          video::I420Frame i420;
+          QString cvtErr;
+          if (!video::qimageToI420(frame, &i420, &cvtErr)) {
+            rt->convertFailures++;
+            if (debug_logs_enabled() && (rt->convertFailures % 30) == 1) {
+              postToQt([this, cvtErr] { emit q->logLine("[dbg] screen convert failed err=" + cvtErr); });
+            }
+            continue;
           }
-          return;
+
+          std::vector<video::EncodedFrame> out;
+          QString encErr;
+          if (!rt->encoder.encode(i420, &out, &encErr)) {
+            rt->encodeFailures++;
+            if (debug_logs_enabled() && (rt->encodeFailures % 30) == 1) {
+              postToQt([this, encErr] { emit q->logLine("[dbg] screen encode failed err=" + encErr); });
+            }
+            continue;
+          }
+
+          QStringList peers;
+          if (rt->channelMode) {
+            peers = rt->txPeers.values();
+          } else if (!rt->peerId.isEmpty()) {
+            peers.push_back(rt->peerId);
+          }
+          if (peers.isEmpty()) continue;
+
+          for (const auto& ef : out) {
+            for (const auto& peerId : peers) {
+              const auto pid = peerId.toStdString();
+              const auto bytes = ef.bytes;
+              const bool key = ef.keyframe;
+              const uint32_t pts = static_cast<uint32_t>(ef.ptsMs & 0xFFFFFFFFu);
+              boost::asio::post(io, [this, pid, bytes, key, pts]() mutable {
+                auto it = udp_sessions.find(pid);
+                if (it == udp_sessions.end() || !it->second) return;
+                it->second->send_video_frame(bytes, key, pts);
+              });
+            }
+            rt->txFrames++;
+            if (debug_logs_enabled() && (rt->txFrames % 60) == 1) {
+              postToQt([this, size = static_cast<int>(ef.bytes.size()), key = ef.keyframe] {
+                emit q->logLine("[dbg] video tx frame bytes=" + QString::number(size) +
+                                " key=" + QString::number(key ? 1 : 0));
+              });
+            }
+          }
+          rt->captureFrames++;
         }
-        sendEncodedFrames(out);
       });
-      vr->screenTimer->start();
+
       vr->sharing = true;
       videoRt = std::move(vr);
+
+      auto enqueueScreenFrame = [this, runtimePeerId](QImage frame) {
+        if (!videoRt || !videoRt->screenShare) return;
+        if (!videoRt->channelMode && videoRt->peerId != runtimePeerId) return;
+        if (frame.isNull()) return;
+        {
+          std::lock_guard lk(videoRt->screenWorkMu);
+          videoRt->screenWorkFrame = std::move(frame);
+          videoRt->screenWorkHasFrame = true;
+        }
+        videoRt->screenWorkCv.notify_one();
+      };
+
+      auto startLegacyScreenGrab = [this, runtimePeerId, enqueueScreenFrame]() {
+        if (!videoRt || !videoRt->screenShare || videoRt->screenTimer) return;
+        videoRt->qtScreenBackend = false;
+        videoRt->x11ShmBackend = false;
+        videoRt->screenBackendName = "legacy";
+        videoRt->screenTimer = new QTimer(q);
+        videoRt->screenTimer->setInterval(videoRt->screenMinIntervalMs);
+        QObject::connect(videoRt->screenTimer, &QTimer::timeout, q, [this, runtimePeerId, enqueueScreenFrame] {
+          if (!videoRt || !videoRt->screenShare) return;
+          if (!videoRt->channelMode && videoRt->peerId != runtimePeerId) return;
+          auto* screen = find_screen_by_name(videoRt->screenName);
+          if (!screen) return;
+          QPixmap shot = screen->grabWindow(0);
+          if (shot.isNull()) return;
+          enqueueScreenFrame(shot.toImage());
+        });
+        videoRt->screenTimer->start();
+      };
+
+      auto startX11ShmScreenGrab = [this, enqueueScreenFrame]() -> bool {
+#if defined(P2PCHAT_X11_SHM)
+        if (!videoRt || !videoRt->screenShare || videoRt->screenCaptureThread.joinable()) return false;
+        auto* screen = find_screen_by_name(videoRt->screenName);
+        if (!screen) return false;
+        const QRect g = screen->geometry();
+        auto cap = std::make_unique<video::X11ShmCapture>();
+        QString openErr;
+        if (!cap->open(g.x(), g.y(), g.width(), g.height(), &openErr)) {
+          if (debug_logs_enabled()) emit q->logLine("[dbg] x11shm open failed: " + openErr);
+          return false;
+        }
+        videoRt->screenCaptureX11Shm = std::move(cap);
+        videoRt->screenCaptureStop.store(false, std::memory_order_relaxed);
+        videoRt->qtScreenBackend = false;
+        videoRt->x11ShmBackend = true;
+        videoRt->screenBackendName = "x11shm";
+        videoRt->screenCaptureThread = std::thread([this, rt = videoRt.get(), enqueueScreenFrame] {
+          uint64_t failCount = 0;
+          auto nextTick = std::chrono::steady_clock::now();
+          while (!rt->screenCaptureStop.load(std::memory_order_relaxed)) {
+            bool workerBusy = false;
+            {
+              std::lock_guard lk(rt->screenWorkMu);
+              workerBusy = rt->screenWorkHasFrame;
+            }
+            if (!workerBusy) {
+              QImage frame;
+              QString grabErr;
+              if (rt->screenCaptureX11Shm && rt->screenCaptureX11Shm->grab(&frame, &grabErr)) {
+                enqueueScreenFrame(std::move(frame));
+              } else {
+                failCount++;
+                if (debug_logs_enabled() && (failCount % 100) == 1) {
+                  postToQt([this, grabErr] { emit q->logLine("[dbg] x11shm grab failed: " + grabErr); });
+                }
+              }
+            }
+
+            nextTick += std::chrono::milliseconds(std::max(1, rt->screenMinIntervalMs));
+            const auto now = std::chrono::steady_clock::now();
+            if (nextTick > now) {
+              std::this_thread::sleep_until(nextTick);
+            } else {
+              nextTick = now;
+            }
+          }
+        });
+        return true;
+#else
+        (void)enqueueScreenFrame;
+        return false;
+#endif
+      };
+
+#if defined(P2PCHAT_QT_SCREEN_CAPTURE)
+      bool startedCapture = false;
+      if (prefer_x11_shm_screen_backend()) {
+        startedCapture = startX11ShmScreenGrab();
+      }
+      bool startedQtCapture = false;
+      if (!startedCapture && prefer_qt_screen_capture_backend()) {
+        auto* screen = find_screen_by_name(videoRt->screenName);
+        if (screen) {
+          videoRt->qtScreenBackend = true;
+          videoRt->x11ShmBackend = false;
+          videoRt->screenBackendName = "qt";
+          videoRt->screenCaptureQt = new QScreenCapture(q);
+          videoRt->screenSessionQt = new QMediaCaptureSession(q);
+          videoRt->screenSinkQt = new QVideoSink(q);
+          videoRt->screenSessionQt->setScreenCapture(videoRt->screenCaptureQt);
+          videoRt->screenSessionQt->setVideoSink(videoRt->screenSinkQt);
+          videoRt->screenCaptureQt->setScreen(screen);
+          QObject::connect(videoRt->screenSinkQt, &QVideoSink::videoFrameChanged, q, [this, enqueueScreenFrame](const QVideoFrame& vf) {
+            if (!videoRt || !videoRt->screenShare || !videoRt->qtScreenBackend) return;
+            const uint64_t nowMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                             std::chrono::steady_clock::now().time_since_epoch())
+                                                             .count());
+            if ((nowMs - videoRt->lastScreenFrameMs) < static_cast<uint64_t>(std::max(1, videoRt->screenMinIntervalMs))) return;
+            videoRt->lastScreenFrameMs = nowMs;
+            QImage frame = vf.toImage();
+            if (frame.isNull()) return;
+            enqueueScreenFrame(std::move(frame));
+          });
+          videoRt->screenCaptureQt->start();
+          startedQtCapture = true;
+
+          if (allow_legacy_screen_fallback()) {
+            videoRt->screenFallbackTimerQt = new QTimer(q);
+            videoRt->screenFallbackTimerQt->setSingleShot(true);
+            videoRt->screenFallbackTimerQt->setInterval(5000);
+            QObject::connect(videoRt->screenFallbackTimerQt, &QTimer::timeout, q, [this, startLegacyScreenGrab] {
+              if (!videoRt || !videoRt->screenShare || !videoRt->qtScreenBackend) return;
+              if (videoRt->captureFrames > 0) return;
+              emit q->logLine("video: Qt screen capture produced no frames; falling back to legacy X grab");
+              if (videoRt->screenCaptureQt) {
+                videoRt->screenCaptureQt->stop();
+                videoRt->screenCaptureQt->deleteLater();
+                videoRt->screenCaptureQt = nullptr;
+              }
+              if (videoRt->screenSinkQt) {
+                videoRt->screenSinkQt->deleteLater();
+                videoRt->screenSinkQt = nullptr;
+              }
+              if (videoRt->screenSessionQt) {
+                videoRt->screenSessionQt->deleteLater();
+                videoRt->screenSessionQt = nullptr;
+              }
+              startLegacyScreenGrab();
+            });
+            videoRt->screenFallbackTimerQt->start();
+          }
+        }
+      }
+      startedCapture = startedCapture || startedQtCapture;
+      if (!startedCapture) startLegacyScreenGrab();
+#else
+      if (!startX11ShmScreenGrab()) startLegacyScreenGrab();
+#endif
       emit q->logLine("video: screen sharing started (" +
-                      QString("%1 %2x%3 @ %4/%5 bitrate=%6kbps")
+                      QString("%1 %2x%3 @ %4/%5 bitrate=%6kbps backend=%7 effective_fps<=%8")
                           .arg(videoRt->screenName)
                           .arg(videoRt->width)
                           .arg(videoRt->height)
                           .arg(videoRt->fpsNum)
                           .arg(videoRt->fpsDen)
-                          .arg(videoRt->bitrateKbps) +
+                          .arg(videoRt->bitrateKbps)
+                          .arg(videoRt->screenBackendName)
+                          .arg(QString::number(std::max(1, static_cast<int>(std::lround(1000.0 / std::max(1, videoRt->screenMinIntervalMs)))))) +
                       ")");
       return;
     }
@@ -3295,14 +3633,25 @@ struct ChatBackend::Impl {
       if (!videoRt->txPeers.contains(peerId)) return;
       const auto key = peerId.toStdString();
       auto& decPtr = videoRt->channelDecoders[key];
-      if (!decPtr) {
-        decPtr = std::make_unique<video::Decoder>();
+      const auto hintedIt = videoRt->channelPeerCodecHints.find(key);
+      const auto hintedCodec = hintedIt != videoRt->channelPeerCodecHints.end() ? hintedIt->second : video::Codec::H264;
+      auto openDecoder = [&](video::Codec codec) -> bool {
+        decPtr.reset();
+        auto decoder = std::make_unique<video::Decoder>();
         QString openErr;
-        if (!decPtr->open(videoRt->codec, &openErr)) {
-          decPtr.reset();
-          if (debug_logs_enabled()) emit q->logLine("[dbg] video decoder open failed peer=" + peerId + " err=" + openErr);
-          return;
+        if (!decoder->open(codec, &openErr)) {
+          if (debug_logs_enabled()) {
+            emit q->logLine("[dbg] video decoder open failed peer=" + peerId +
+                            " codec=" + video::codecToString(codec) + " err=" + openErr);
+          }
+          return false;
         }
+        decPtr = std::move(decoder);
+        videoRt->channelDecoderCodecs[key] = codec;
+        return true;
+      };
+      if (!decPtr) {
+        if (!openDecoder(hintedCodec)) return;
       }
       QImage img;
       QString err;
@@ -3322,6 +3671,32 @@ struct ChatBackend::Impl {
       fails++;
       if (debug_logs_enabled() && (fails % 20) == 1) {
         emit q->logLine("[dbg] video decode failed peer=" + peerId + " err=" + err + " bytes=" + QString::number(encoded.size()));
+      }
+      if (fails >= 8) {
+        const auto currentIt = videoRt->channelDecoderCodecs.find(key);
+        const auto currentCodec = currentIt != videoRt->channelDecoderCodecs.end() ? currentIt->second : hintedCodec;
+        const auto fallbackCodec = opposite_video_codec(currentCodec);
+        if (fallbackCodec != currentCodec && openDecoder(fallbackCodec)) {
+          QImage retryImg;
+          QString retryErr;
+          if (decPtr->decode(reinterpret_cast<const uint8_t*>(encoded.constData()),
+                             static_cast<size_t>(encoded.size()),
+                             &retryImg,
+                             &retryErr)) {
+            videoRt->channelPeerCodecHints[key] = fallbackCodec;
+            videoRt->channelDecodeFailures[key] = 0;
+            videoRt->rxFrames++;
+            if (debug_logs_enabled()) {
+              emit q->logLine("[dbg] video codec autodetect peer=" + peerId +
+                              " codec=" + video::codecToString(fallbackCodec));
+            }
+            if (!retryImg.isNull()) {
+              emit q->remoteVideoAvailabilityChanged(peerId, true);
+              emit q->remoteVideoFrame(peerId, retryImg);
+            }
+            return;
+          }
+        }
       }
       const uint64_t nowMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                                        std::chrono::steady_clock::now().time_since_epoch())
@@ -3353,6 +3728,33 @@ struct ChatBackend::Impl {
     videoRt->decodeFailures++;
     if (debug_logs_enabled() && (videoRt->decodeFailures % 20) == 1) {
       emit q->logLine("[dbg] video decode failed err=" + err + " bytes=" + QString::number(encoded.size()));
+    }
+    if (videoRt->decodeFailures >= 8) {
+      const auto fallbackCodec = opposite_video_codec(videoRt->rxCodec);
+      videoRt->decoder.close();
+      QString openErr;
+      if (videoRt->decoder.open(fallbackCodec, &openErr)) {
+        QImage retryImg;
+        QString retryErr;
+        if (videoRt->decoder.decode(reinterpret_cast<const uint8_t*>(encoded.constData()),
+                                    static_cast<size_t>(encoded.size()),
+                                    &retryImg,
+                                    &retryErr)) {
+          videoRt->rxCodec = fallbackCodec;
+          callRemoteVideoCodec = video::codecToString(fallbackCodec);
+          videoRt->decodeFailures = 0;
+          videoRt->rxFrames++;
+          if (debug_logs_enabled()) {
+            emit q->logLine("[dbg] video codec autodetect peer=" + peerId +
+                            " codec=" + video::codecToString(fallbackCodec));
+          }
+          if (!retryImg.isNull()) emit q->remoteVideoFrame(peerId, retryImg);
+          return;
+        }
+      } else if (debug_logs_enabled()) {
+        emit q->logLine("[dbg] video decoder reopen failed codec=" + video::codecToString(fallbackCodec) +
+                        " err=" + openErr);
+      }
     }
     const uint64_t nowMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                                      std::chrono::steady_clock::now().time_since_epoch())
@@ -3469,6 +3871,20 @@ struct ChatBackend::Impl {
         if (!cid.isEmpty() && cid != "__voice_channel__") return;
         const bool enabled =
             inner.contains("enabled") && inner["enabled"].is_boolean() ? inner["enabled"].get<bool>() : false;
+        const QString remoteVideoCodec =
+            inner.contains("video_codec") && inner["video_codec"].is_string()
+                ? normalize_video_codec(QString::fromStdString(inner["video_codec"].get<std::string>()))
+                : QString();
+        if (!remoteVideoCodec.isEmpty() && videoRt && videoRt->channelMode) {
+          const auto key = peerId.toStdString();
+          const auto codec = video::codecFromString(remoteVideoCodec);
+          videoRt->channelPeerCodecHints[key] = codec;
+          auto cur = videoRt->channelDecoderCodecs.find(key);
+          if (cur != videoRt->channelDecoderCodecs.end() && cur->second != codec) {
+            videoRt->channelDecoders.erase(key);
+            videoRt->channelDecoderCodecs.erase(cur);
+          }
+        }
         if (!enabled) {
           emit q->remoteVideoFrame(peerId, QImage());
         } else {
@@ -3477,7 +3893,8 @@ struct ChatBackend::Impl {
         emit q->remoteVideoAvailabilityChanged(peerId, enabled);
         if (debug_logs_enabled()) {
           emit q->logLine("[dbg] video_state(channel) from peer=" + peerId +
-                          " enabled=" + QString::number(enabled ? 1 : 0));
+                          " enabled=" + QString::number(enabled ? 1 : 0) +
+                          (remoteVideoCodec.isEmpty() ? "" : " codec=" + remoteVideoCodec));
         }
         return;
       }
@@ -3493,7 +3910,26 @@ struct ChatBackend::Impl {
               ? normalize_video_codec(QString::fromStdString(inner["video_codec"].get<std::string>()))
               : QString();
       callRemoteVideoEnabled = enabled;
-      if (!remoteVideoCodec.isEmpty()) callVideoCodec = remoteVideoCodec;
+      if (!remoteVideoCodec.isEmpty()) {
+        callRemoteVideoCodec = remoteVideoCodec;
+        if (videoRt && !videoRt->channelMode && videoRt->peerId == peerId) {
+          const auto wantedCodec = video::codecFromString(remoteVideoCodec);
+          if (videoRt->rxCodec != wantedCodec) {
+            videoRt->decoder.close();
+            QString openErr;
+            if (videoRt->decoder.open(wantedCodec, &openErr)) {
+              videoRt->rxCodec = wantedCodec;
+              videoRt->decodeFailures = 0;
+              if (debug_logs_enabled()) {
+                emit q->logLine("[dbg] video decoder switched peer=" + peerId + " codec=" + remoteVideoCodec);
+              }
+            } else if (debug_logs_enabled()) {
+              emit q->logLine("[dbg] video decoder switch failed peer=" + peerId + " codec=" + remoteVideoCodec +
+                              " err=" + openErr);
+            }
+          }
+        }
+      }
       if (!enabled) {
         emit q->remoteVideoFrame(peerId, QImage());
       } else {
@@ -3502,7 +3938,7 @@ struct ChatBackend::Impl {
       emit q->remoteVideoAvailabilityChanged(peerId, enabled);
       if (debug_logs_enabled()) {
         emit q->logLine("[dbg] video_state from peer=" + peerId + " enabled=" + QString::number(enabled ? 1 : 0) +
-                        " codec=" + (remoteVideoCodec.isEmpty() ? callVideoCodec : remoteVideoCodec));
+                        " codec=" + (remoteVideoCodec.isEmpty() ? callRemoteVideoCodec : remoteVideoCodec));
       }
 #endif
       return;
@@ -3519,6 +3955,9 @@ struct ChatBackend::Impl {
       const bool watching =
           inner.contains("watching") && inner["watching"].is_boolean() ? inner["watching"].get<bool>() : true;
       callRemoteWatchingVideo = watching;
+      if (videoRt && !videoRt->channelMode && videoRt->peerId == peerId) {
+        videoRt->remoteWatching.store(watching, std::memory_order_relaxed);
+      }
       if (watching && videoRt && videoRt->peerId == peerId && videoRt->sharing && !videoRt->passthrough) {
         videoRt->encoder.requestKeyframe();
       }
@@ -3576,14 +4015,14 @@ struct ChatBackend::Impl {
       callBitrate = std::clamp(bitrate, 8000, 128000);
       callRemoteVideoEnabled = remoteVideoEnabled;
       callRemoteWatchingVideo = true;
-      if (!remoteVideoCodec.isEmpty()) callVideoCodec = remoteVideoCodec;
+      if (!remoteVideoCodec.isEmpty()) callRemoteVideoCodec = remoteVideoCodec;
       emit q->remoteVideoAvailabilityChanged(callPeerId, callRemoteVideoEnabled);
       if (debug_logs_enabled()) {
         emit q->logLine("[dbg] incoming call offer peer=" + callPeerId + " call_id=" + callId +
                         " frameMs=" + QString::number(callFrameMs) + " bitrate=" + QString::number(callBitrate) +
                         " channels=" + QString::number(callChannels) +
                         " remoteVideo=" + QString::number(callRemoteVideoEnabled ? 1 : 0) +
-                        " codec=" + callVideoCodec);
+                        " codec=" + callRemoteVideoCodec);
       }
       emit q->callStateChanged(callPeerId, "incoming");
       emit q->incomingCall(callPeerId);
@@ -3618,14 +4057,14 @@ struct ChatBackend::Impl {
       callChannels = (remoteChannels == 2) ? 2 : 1;
       callRemoteAccepted = true;
       callRemoteVideoEnabled = remoteVideoEnabled;
-      if (!remoteVideoCodec.isEmpty()) callVideoCodec = remoteVideoCodec;
+      if (!remoteVideoCodec.isEmpty()) callRemoteVideoCodec = remoteVideoCodec;
       emit q->remoteVideoAvailabilityChanged(callPeerId, callRemoteVideoEnabled);
       if (debug_logs_enabled()) {
         emit q->logLine("[dbg] call_answer accepted by peer=" + peerId + " call_id=" + callId +
                         " negotiatedFrameMs=" + QString::number(callFrameMs) +
                         " channels=" + QString::number(callChannels) +
                         " remoteVideo=" + QString::number(callRemoteVideoEnabled ? 1 : 0) +
-                        " codec=" + callVideoCodec);
+                        " codec=" + callRemoteVideoCodec);
       }
       emit q->callStateChanged(callPeerId, "connecting");
       maybeStartVoiceQt();
@@ -4939,6 +5378,7 @@ void ChatBackend::startCall(const QString& peerId, const VoiceSettings& settings
   impl_->callRemoteVideoEnabled = false;
   impl_->callRemoteWatchingVideo = true;
   impl_->callVideoCodec = resolve_network_video_codec(settings);
+  impl_->callRemoteVideoCodec = "h264";
   impl_->callSettings = settings;
   impl_->callFrameMs = (settings.frameMs == 10) ? 10 : 20;
   impl_->callChannels = (settings.channels == 2) ? 2 : 1;
@@ -5044,6 +5484,7 @@ void ChatBackend::answerCall(const QString& peerId, bool accept, const VoiceSett
   impl_->callChannels = (negotiatedChannels == 2) ? 2 : 1;
   impl_->callBitrate = std::clamp(settings.bitrate, 8000, 128000);
   impl_->callLocalAccepted = true;
+  impl_->callVideoCodec = resolve_network_video_codec(settings);
 
   emit callStateChanged(peerId, "connecting");
   if (debug_logs_enabled()) {

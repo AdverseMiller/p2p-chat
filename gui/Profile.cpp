@@ -159,6 +159,7 @@ Profile Profile::load(const QString& path, QString* errorOut) {
   p.darkMode = root.value("darkMode").toBool(false);
   p.shareIdentityWithNonFriendsInServers = root.value("shareIdentityWithNonFriendsInServers").toBool(false);
   p.signedOnlyServerMessages = root.value("signedOnlyServerMessages").toBool(false);
+  p.hideLocalStreamPreviewInServerByDefault = root.value("hideLocalStreamPreviewInServerByDefault").toBool(false);
   if (root.value("mutedVoicePeerIds").isArray()) {
     const auto muted = root.value("mutedVoicePeerIds").toArray();
     for (const auto& v : muted) {
@@ -364,6 +365,7 @@ bool Profile::save(QString* errorOut) const {
   root["darkMode"] = darkMode;
   root["shareIdentityWithNonFriendsInServers"] = shareIdentityWithNonFriendsInServers;
   root["signedOnlyServerMessages"] = signedOnlyServerMessages;
+  root["hideLocalStreamPreviewInServerByDefault"] = hideLocalStreamPreviewInServerByDefault;
   {
     QJsonArray muted;
     for (const auto& id : mutedVoicePeerIds) {

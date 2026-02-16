@@ -1320,8 +1320,10 @@ void MainWindow::buildUi() {
                              &profile_.video,
                              &profile_.screen,
                              &profile_.shareIdentityWithNonFriendsInServers,
+                             &profile_.hideLocalStreamPreviewInServerByDefault,
                              &profile_.signedOnlyServerMessages,
                              this)) {
+      setSelfStreamPreviewHiddenInServer(profile_.hideLocalStreamPreviewInServerByDefault);
       if (profile_.video.devicePath.trimmed().isEmpty()) webcamEnabled_ = false;
       backend_.updateVoiceSettings(voiceSettingsFromProfile(profile_.audio,
                                                             profile_.video,
@@ -2098,6 +2100,7 @@ void MainWindow::loadProfile() {
     if (id.isEmpty()) continue;
     mutedVoicePeerIds_.insert(id);
   }
+  selfStreamPreviewHiddenInServer_ = profile_.hideLocalStreamPreviewInServerByDefault;
   screenShareDisplayName_ = profile_.screen.lastDisplayName;
   screenShareEnabled_ = false;
   if (darkModeAction_) darkModeAction_->setChecked(profile_.darkMode);

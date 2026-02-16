@@ -101,6 +101,7 @@ SettingsDialog::SettingsDialog(const Profile::AudioSettings& initial,
                                const Profile::VideoSettings& video_initial,
                                const Profile::ScreenSettings& screen_initial,
                                bool share_identity_non_friends,
+                               bool hide_local_stream_preview_default,
                                bool signed_only_server_messages,
                                QWidget* parent)
     : QDialog(parent), initial_(initial), videoInitial_(video_initial), screenInitial_(screen_initial) {
@@ -349,6 +350,13 @@ SettingsDialog::SettingsDialog(const Profile::AudioSettings& initial,
   shareIdentityCheck_ = new QCheckBox("Allow non-friends in servers to see my username and profile picture", privacyTab);
   shareIdentityCheck_->setChecked(share_identity_non_friends);
   privacyRoot->addWidget(shareIdentityCheck_);
+  hideLocalPreviewDefaultCheck_ =
+      new QCheckBox("Hide my local stream preview by default in server voice channels", privacyTab);
+  hideLocalPreviewDefaultCheck_->setChecked(hide_local_stream_preview_default);
+  hideLocalPreviewDefaultCheck_->setToolTip(
+      "When enabled, your own webcam/screenshare preview tile is hidden by default in server voice channels.\n"
+      "This only affects your local UI; other peers still see your stream if you are sharing.");
+  privacyRoot->addWidget(hideLocalPreviewDefaultCheck_);
   signedOnlyServerMessagesCheck_ = new QCheckBox("Signed-only server messages (ignore unsigned /say)", privacyTab);
   signedOnlyServerMessagesCheck_->setChecked(signed_only_server_messages);
   signedOnlyServerMessagesCheck_->setToolTip(
@@ -874,6 +882,10 @@ bool SettingsDialog::shareIdentityWithNonFriends() const {
   return shareIdentityCheck_ ? shareIdentityCheck_->isChecked() : false;
 }
 
+bool SettingsDialog::hideLocalStreamPreviewByDefault() const {
+  return hideLocalPreviewDefaultCheck_ ? hideLocalPreviewDefaultCheck_->isChecked() : false;
+}
+
 bool SettingsDialog::signedOnlyServerMessages() const {
   return signedOnlyServerMessagesCheck_ ? signedOnlyServerMessagesCheck_->isChecked() : false;
 }
@@ -882,15 +894,18 @@ bool SettingsDialog::edit(Profile::AudioSettings* inOut,
                           Profile::VideoSettings* video_in_out,
                           Profile::ScreenSettings* screen_in_out,
                           bool* share_identity_non_friends,
+                          bool* hide_local_stream_preview_default,
                           bool* signed_only_server_messages,
                           QWidget* parent) {
-  if (!inOut || !video_in_out || !screen_in_out || !share_identity_non_friends || !signed_only_server_messages) {
+  if (!inOut || !video_in_out || !screen_in_out || !share_identity_non_friends ||
+      !hide_local_stream_preview_default || !signed_only_server_messages) {
     return false;
   }
   SettingsDialog dlg(*inOut,
                      *video_in_out,
                      *screen_in_out,
                      *share_identity_non_friends,
+                     *hide_local_stream_preview_default,
                      *signed_only_server_messages,
                      parent);
   if (dlg.exec() != QDialog::Accepted) return false;
@@ -898,6 +913,7 @@ bool SettingsDialog::edit(Profile::AudioSettings* inOut,
   *video_in_out = dlg.videoSettings();
   *screen_in_out = dlg.screenSettings();
   *share_identity_non_friends = dlg.shareIdentityWithNonFriends();
+  *hide_local_stream_preview_default = dlg.hideLocalStreamPreviewByDefault();
   *signed_only_server_messages = dlg.signedOnlyServerMessages();
   return true;
 }

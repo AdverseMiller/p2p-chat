@@ -113,6 +113,7 @@ public:
   bool darkMode = false;
   bool shareIdentityWithNonFriendsInServers = false;
   bool signedOnlyServerMessages = false;
+  bool hideLocalStreamPreviewInServerByDefault = false;
   QVector<QString> mutedVoicePeerIds;
   AudioSettings audio;
   VideoSettings video;

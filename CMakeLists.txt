@@ -108,6 +108,9 @@ find_package(Threads REQUIRED)
 include(CheckIncludeFileCXX)
 
 find_package(PkgConfig)
+if(UNIX AND NOT APPLE)
+  find_package(X11 QUIET)
+endif()
 
 find_package(Qt6 QUIET COMPONENTS Core Widgets Multimedia Network)
 
@@ -196,6 +199,14 @@ if(Qt6Widgets_FOUND)
     src/video/video_packetizer.cpp
     src/video/video_packetizer.h
   )
+  set(P2PCHAT_HAVE_X11_SHM OFF)
+  if(UNIX AND NOT APPLE AND X11_FOUND AND TARGET X11::X11 AND TARGET X11::Xext)
+    list(APPEND P2PCHAT_VIDEO_SOURCES
+      src/video/x11_shm_capture.cpp
+      src/video/x11_shm_capture.h
+    )
+    set(P2PCHAT_HAVE_X11_SHM ON)
+  endif()
 
   add_executable(p2p_chat_gui
     gui/main.cpp
@@ -231,6 +242,10 @@ if(Qt6Widgets_FOUND)
     target_link_libraries(p2p_chat_gui PRIVATE ${OPUS_LIBRARIES})
     if(P2PCHAT_HAVE_VIDEO_FFMPEG)
       target_compile_definitions(p2p_chat_gui PRIVATE P2PCHAT_VIDEO)
+      if(P2PCHAT_HAVE_X11_SHM)
+        target_compile_definitions(p2p_chat_gui PRIVATE P2PCHAT_X11_SHM)
+        target_link_libraries(p2p_chat_gui PRIVATE X11::X11 X11::Xext)
+      endif()
       target_include_directories(p2p_chat_gui PRIVATE ${AVCODEC_INCLUDE_DIRS} ${AVUTIL_INCLUDE_DIRS} ${SWSCALE_INCLUDE_DIRS})
       target_link_libraries(p2p_chat_gui PRIVATE ${AVCODEC_LIBRARIES} ${AVUTIL_LIBRARIES} ${SWSCALE_LIBRARIES})
     else()
