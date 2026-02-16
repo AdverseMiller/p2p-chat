@@ -867,6 +867,57 @@ public:
 
   void send_control(json inner) { enqueue_secure(std::move(inner)); }
 
+#if defined(P2PCHAT_VIDEO)
+  void pump_video_send_queue() {
+    if (closed_) {
+      video_send_inflight_ = false;
+      video_send_queue_.clear();
+      video_send_queue_bytes_ = 0;
+      return;
+    }
+    if (video_send_inflight_) return;
+    if (video_send_queue_.empty()) return;
+    if (peer_ep_.port() == 0) return;
+    video_send_inflight_ = true;
+    auto buf = video_send_queue_.front();
+    auto self = shared_from_this();
+    socket_.async_send_to(boost::asio::buffer(*buf), peer_ep_, [self, buf](const boost::system::error_code&, std::size_t) {
+      if (!self->video_send_queue_.empty()) {
+        const auto sent = self->video_send_queue_.front();
+        if (sent) {
+          if (self->video_send_queue_bytes_ >= sent->size()) {
+            self->video_send_queue_bytes_ -= sent->size();
+          } else {
+            self->video_send_queue_bytes_ = 0;
+          }
+        }
+        self->video_send_queue_.pop_front();
+      }
+      self->video_send_inflight_ = false;
+      self->pump_video_send_queue();
+    });
+  }
+
+  bool enqueue_video_packet(std::shared_ptr<std::vector<uint8_t>> buf) {
+    if (!buf || buf->empty()) return false;
+    constexpr std::size_t kMaxVideoQueuePackets = 256;
+    constexpr std::size_t kMaxVideoQueueBytes = 2 * 1024 * 1024;
+    if (video_send_queue_.size() >= kMaxVideoQueuePackets ||
+        (video_send_queue_bytes_ + buf->size()) > kMaxVideoQueueBytes) {
+      video_tx_drop_queue_++;
+      if (debug_logs_enabled() && (video_tx_drop_queue_ % 50) == 1) {
+        dlog("video tx drop: queue full packets=" + std::to_string(video_send_queue_.size()) +
+             " bytes=" + std::to_string(video_send_queue_bytes_));
+      }
+      return false;
+    }
+    video_send_queue_bytes_ += buf->size();
+    video_send_queue_.push_back(std::move(buf));
+    pump_video_send_queue();
+    return true;
+  }
+#endif
+
   void send_video_frame(const std::vector<uint8_t>& encoded, bool keyframe, uint32_t pts_ms) {
 #if !defined(P2PCHAT_VIDEO)
     (void)encoded;
@@ -877,6 +928,20 @@ public:
     if (!voice_ready()) return;
     if (peer_ep_.port() == 0) return;
     if (encoded.empty()) return;
+    constexpr std::size_t kVideoDropNonKeyQueuePackets = 96;
+    constexpr std::size_t kVideoDropAnyQueuePackets = 220;
+    if (!keyframe && video_send_queue_.size() >= kVideoDropNonKeyQueuePackets) {
+      if (debug_logs_enabled() && ((++video_tx_drop_queue_) % 50) == 1) {
+        dlog("video tx drop: congestion(non-key) queue_packets=" + std::to_string(video_send_queue_.size()));
+      }
+      return;
+    }
+    if (video_send_queue_.size() >= kVideoDropAnyQueuePackets) {
+      if (debug_logs_enabled() && ((++video_tx_drop_queue_) % 50) == 1) {
+        dlog("video tx drop: congestion(hard) queue_packets=" + std::to_string(video_send_queue_.size()));
+      }
+      return;
+    }
 
     video::VideoPktHdr h {};
     h.flags = keyframe ? video::kVideoFlagKeyframe : 0;
@@ -912,7 +977,7 @@ public:
       write_u32be(out.data() + 20, parsed.hdr.ptsMs);
       std::memcpy(out.data() + sizeof(video::VideoPktHdr), ct->data(), ct->size());
       auto buf = std::make_shared<std::vector<uint8_t>>(std::move(out));
-      socket_.async_send_to(boost::asio::buffer(*buf), peer_ep_, [buf](const boost::system::error_code&, std::size_t) {});
+      enqueue_video_packet(std::move(buf));
     }
 #endif
   }
@@ -1691,6 +1756,10 @@ private:
   uint64_t voice_rx_decrypt_fail_ = 0;
   uint32_t video_stream_id_ = 1;
   uint32_t video_next_frame_id_ = 1;
+  bool video_send_inflight_ = false;
+  std::size_t video_send_queue_bytes_ = 0;
+  uint64_t video_tx_drop_queue_ = 0;
+  std::deque<std::shared_ptr<std::vector<uint8_t>>> video_send_queue_;
   video::Reassembler video_reasm_;
   video::JitterBuffer video_jitter_;
 
