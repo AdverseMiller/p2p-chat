@@ -14,6 +14,7 @@ namespace video {
 
 enum class Codec {
   H264,
+  HEVC,
 };
 
 struct EncodedFrame;

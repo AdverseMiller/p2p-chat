@@ -65,7 +65,11 @@ uint32_t fourccFromText(const QString& s) {
 
 QString codecDescription(const QString& key) {
   const auto v = key.trimmed().toLower();
-  (void)v;
+  if (v == "hevc" || v == "h265") {
+    return "HEVC (H.265) re-encodes frames for lower bitrate at similar quality.\n"
+           "Can reduce network usage, but may increase encode/decode load and may be less compatible.\n"
+           "When the selected pixel format already outputs HEVC, passthrough is used automatically (preferred).";
+  }
   return "H.264 re-encodes camera frames to H.264 for network transport.\n"
          "Best default compatibility and quality/bitrate efficiency across peers.\n"
          "When the selected pixel format already outputs H.264, passthrough is used automatically (preferred).";
@@ -251,10 +255,31 @@ SettingsDialog::SettingsDialog(const Profile::AudioSettings& initial,
   auto* sform = new QFormLayout();
   screenResolution_ = new QComboBox(screenTab);
   screenFps_ = new QComboBox(screenTab);
+  screenCodec_ = new QComboBox(screenTab);
   screenBitrate_ = new QSpinBox(screenTab);
   screenBitrate_->setRange(100, 20000);
   screenBitrate_->setSuffix(" kbps");
   screenBitrate_->setValue(screenInitial_.bitrateKbps);
+  screenCodec_->addItem("H264", "h264");
+  screenCodec_->setItemData(screenCodec_->count() - 1, codecDescription("h264"), Qt::ToolTipRole);
+  screenCodec_->addItem("HEVC (H.265)", "hevc");
+  screenCodec_->setItemData(screenCodec_->count() - 1, codecDescription("hevc"), Qt::ToolTipRole);
+  QString wantedScreenCodec = screenInitial_.codec.trimmed().toLower();
+  if (wantedScreenCodec == "h265") wantedScreenCodec = "hevc";
+  if (wantedScreenCodec != "h264" && wantedScreenCodec != "hevc") wantedScreenCodec = "h264";
+  int screenCodecPick = 0;
+  for (int i = 0; i < screenCodec_->count(); ++i) {
+    if (screenCodec_->itemData(i).toString().trimmed().toLower() == wantedScreenCodec) {
+      screenCodecPick = i;
+      break;
+    }
+  }
+  screenCodec_->setCurrentIndex(screenCodecPick);
+  screenCodec_->setToolTip(screenCodec_->itemData(screenCodecPick, Qt::ToolTipRole).toString());
+  connect(screenCodec_, &QComboBox::currentIndexChanged, this, [this] {
+    if (!screenCodec_) return;
+    screenCodec_->setToolTip(screenCodec_->itemData(screenCodec_->currentIndex(), Qt::ToolTipRole).toString());
+  });
 
   auto addRes = [this](const QString& label, int w, int h) {
     if (!screenResolution_) return;
@@ -311,6 +336,7 @@ SettingsDialog::SettingsDialog(const Profile::AudioSettings& initial,
 
   sform->addRow("Resolution:", screenResolution_);
   sform->addRow("FPS:", screenFps_);
+  sform->addRow("Network codec:", screenCodec_);
   sform->addRow("Bitrate:", screenBitrate_);
   screenRoot->addLayout(sform);
   screenRoot->addStretch(1);
@@ -459,11 +485,15 @@ void SettingsDialog::rebuildVideoDevices() {
 void SettingsDialog::rebuildVideoCodecs() {
   if (!videoCodec_ || !videoDevice_) return;
   const QSignalBlocker block(videoCodec_);
-  const QString wanted = "h264";
+  QString wanted = videoInitial_.codec.trimmed().toLower();
+  if (wanted != "h264" && wanted != "hevc" && wanted != "h265") wanted = "h264";
+  if (wanted == "h265") wanted = "hevc";
 
   videoCodec_->clear();
   videoCodec_->addItem("H264", "h264");
   videoCodec_->setItemData(videoCodec_->count() - 1, codecDescription("h264"), Qt::ToolTipRole);
+  videoCodec_->addItem("HEVC (H.265)", "hevc");
+  videoCodec_->setItemData(videoCodec_->count() - 1, codecDescription("hevc"), Qt::ToolTipRole);
 
   int pick = 0;
   for (int i = 0; i < videoCodec_->count(); ++i) {
@@ -763,7 +793,9 @@ Profile::VideoSettings SettingsDialog::videoSettings() const {
   if (s.height < 16) s.height = 16;
   if (s.fpsNum <= 0) s.fpsNum = 1;
   if (s.fpsDen <= 0) s.fpsDen = 30;
-  s.codec = "h264";
+  s.codec = s.codec.trimmed().toLower();
+  if (s.codec == "h265") s.codec = "hevc";
+  if (s.codec != "h264" && s.codec != "hevc") s.codec = "h264";
   return s;
 }
 
@@ -792,6 +824,10 @@ Profile::ScreenSettings SettingsDialog::screenSettings() const {
     if (okDen) s.fpsDen = fpsDen;
   }
   if (screenBitrate_) s.bitrateKbps = screenBitrate_->value();
+  if (screenCodec_) s.codec = screenCodec_->currentData().toString();
+  s.codec = s.codec.trimmed().toLower();
+  if (s.codec == "h265") s.codec = "hevc";
+  if (s.codec != "h264" && s.codec != "hevc") s.codec = "h264";
   if (s.fpsNum <= 0) s.fpsNum = 1;
   if (s.fpsDen <= 0) s.fpsDen = 15;
   if (s.bitrateKbps < 100) s.bitrateKbps = 100;

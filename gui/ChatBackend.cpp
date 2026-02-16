@@ -100,12 +100,14 @@ uint32_t parse_fourcc_text(const QString& s) {
 
 QString resolve_network_video_codec(const ChatBackend::VoiceSettings& settings) {
   const auto requested = settings.videoCodec.trimmed().toLower();
+  if (requested == "hevc" || requested == "h265") return "hevc";
   if (requested == "h264") return "h264";
   return "h264";
 }
 
 QString normalize_video_codec(const QString& raw) {
   const auto requested = raw.trimmed().toLower();
+  if (requested == "hevc" || requested == "h265") return "hevc";
   if (requested == "h264") return "h264";
   return "h264";
 }

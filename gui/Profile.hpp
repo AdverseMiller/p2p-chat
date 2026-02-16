@@ -98,6 +98,7 @@ public:
     int fpsNum = 1;    // denominator-style (fps = den / num)
     int fpsDen = 15;
     int bitrateKbps = 2500;
+    QString codec = "h264";
     QString lastDisplayName;
   };
 

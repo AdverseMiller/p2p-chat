@@ -10,6 +10,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
+#include <libavutil/error.h>
 #include <libswscale/swscale.h>
 }
 #endif
@@ -19,6 +20,8 @@ extern "C" {
 #include <cstring>
 #include <span>
 #include <string>
+#include <vector>
+#include <QStringList>
 
 namespace video {
 
@@ -26,12 +29,15 @@ QString codecToString(Codec c) {
   switch (c) {
     case Codec::H264:
       return "h264";
+    case Codec::HEVC:
+      return "hevc";
   }
   return "h264";
 }
 
 Codec codecFromString(const QString& s) {
-  (void)s;
+  const auto v = s.trimmed().toLower();
+  if (v == "hevc" || v == "h265") return Codec::HEVC;
   return Codec::H264;
 }
 
@@ -267,30 +273,47 @@ bool compressed_to_i420(const RawFrame& in, AVCodecID codecId, I420Frame* out, Q
   return false;
 }
 
-const AVCodec* pick_encoder(Codec want, Codec* outCodec) {
-  if (want != Codec::H264) return nullptr;
-  if (const AVCodec* c = avcodec_find_encoder_by_name("libx264")) {
-    *outCodec = Codec::H264;
-    return c;
+std::vector<const AVCodec*> encoder_candidates(Codec want) {
+  std::vector<const AVCodec*> out;
+  auto add = [&out](const AVCodec* codec) {
+    if (!codec) return;
+    for (const auto* existing : out) {
+      if (existing == codec) return;
+    }
+    out.push_back(codec);
+  };
+  auto add_name = [&add](const char* name) { add(avcodec_find_encoder_by_name(name)); };
+  auto add_id = [&add](AVCodecID id) { add(avcodec_find_encoder(id)); };
+
+  if (want == Codec::HEVC) {
+    // Prefer NVENC first when available, then software, then V4L2 wrappers.
+    add_name("hevc_nvenc");
+    add_name("libx265");
+    add_name("hevc_v4l2m2m");
+    add_id(AV_CODEC_ID_HEVC);
+  } else {
+    add_name("h264_nvenc");
+    add_name("libx264");
+    add_name("h264_v4l2m2m");
+    add_id(AV_CODEC_ID_H264);
   }
-  if (const AVCodec* c = avcodec_find_encoder_by_name("h264_v4l2m2m")) {
-    *outCodec = Codec::H264;
-    return c;
-  }
-  if (const AVCodec* c = avcodec_find_encoder(AV_CODEC_ID_H264)) {
-    *outCodec = Codec::H264;
-    return c;
-  }
-  return nullptr;
+  return out;
+}
+
+QString ffmpeg_err_string(int rc) {
+  char buf[AV_ERROR_MAX_STRING_SIZE] = {0};
+  av_strerror(rc, buf, sizeof(buf));
+  return QString::fromUtf8(buf);
 }
 
 const AVCodec* decoder_for_codec(Codec codec) {
-  if (codec != Codec::H264) return nullptr;
+  if (codec == Codec::HEVC) return avcodec_find_decoder(AV_CODEC_ID_HEVC);
   return avcodec_find_decoder(AV_CODEC_ID_H264);
 }
 
 std::optional<Codec> codec_from_avcodec(AVCodecID codec) {
   if (codec == AV_CODEC_ID_H264) return Codec::H264;
+  if (codec == AV_CODEC_ID_HEVC) return Codec::HEVC;
   return std::nullopt;
 }
 
@@ -306,6 +329,22 @@ bool has_h264_idr(std::span<const uint8_t> data) {
     if (start == std::string::npos || start >= n) continue;
     const uint8_t nal = data[start] & 0x1Fu;
     if (nal == 5 || nal == 7 || nal == 8) return true;
+  }
+  return false;
+}
+
+bool has_hevc_idr(std::span<const uint8_t> data) {
+  const auto n = data.size();
+  for (size_t i = 0; i + 5 < n; ++i) {
+    size_t start = std::string::npos;
+    if (i + 3 < n && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
+      start = i + 3;
+    } else if (i + 4 < n && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1) {
+      start = i + 4;
+    }
+    if (start == std::string::npos || start >= n) continue;
+    const uint8_t nal = static_cast<uint8_t>((data[start] >> 1) & 0x3Fu);
+    if (nal == 19 || nal == 20 || nal == 21) return true; // IDR/CRA
   }
   return false;
 }
@@ -370,8 +409,11 @@ bool passthroughFrame(const RawFrame& in, Codec networkCodec, EncodedFrame* out,
   out->bytes = in.bytes;
   out->ptsMs = in.monotonicUs / 1000ull;
   std::span<const uint8_t> span(out->bytes.data(), out->bytes.size());
-  (void)networkCodec;
-  out->keyframe = has_h264_idr(span);
+  if (networkCodec == Codec::HEVC) {
+    out->keyframe = has_hevc_idr(span);
+  } else {
+    out->keyframe = has_h264_idr(span);
+  }
   return true;
 }
 
@@ -448,32 +490,75 @@ bool Encoder::open(const EncodeParams& p, QString* err) {
   close();
   codec_ = p.codec;
   impl_ = std::make_unique<Impl>();
-  impl_->codec = pick_encoder(p.codec, &codec_);
-  if (!impl_->codec) {
+
+  const auto candidates = encoder_candidates(p.codec);
+  if (candidates.empty()) {
     if (err) *err = "no suitable video encoder found";
     return false;
   }
-  impl_->ctx = avcodec_alloc_context3(impl_->codec);
-  if (!impl_->ctx) {
-    if (err) *err = "avcodec_alloc_context3 failed";
-    return false;
+
+  QStringList failures;
+  for (const AVCodec* candidate : candidates) {
+    if (!candidate) continue;
+    impl_->codec = candidate;
+    impl_->ctx = avcodec_alloc_context3(impl_->codec);
+    if (!impl_->ctx) {
+      failures.push_back(QString::fromLatin1(candidate->name) + ": alloc failed");
+      continue;
+    }
+
+    impl_->ctx->width = std::max(16, p.width);
+    impl_->ctx->height = std::max(16, p.height);
+    impl_->ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+    impl_->ctx->time_base = AVRational{1, 1000}; // ms
+    impl_->ctx->framerate = AVRational{std::max(1, p.fpsNum), std::max(1, p.fpsDen)};
+    impl_->ctx->bit_rate = std::clamp(p.bitrateKbps, 128, 20000) * 1000LL;
+    impl_->ctx->gop_size = std::max(10, std::max(1, p.fpsNum / std::max(1, p.fpsDen)) * 2);
+    impl_->ctx->max_b_frames = 0;
+    impl_->ctx->thread_count = 1;
+
+    const bool isNvenc = std::strstr(impl_->codec->name, "nvenc") != nullptr;
+    if (impl_->codec->id == AV_CODEC_ID_H264) {
+      if (isNvenc) {
+        av_opt_set(impl_->ctx->priv_data, "preset", "p1", 0);
+        av_opt_set(impl_->ctx->priv_data, "tune", "ll", 0);
+      } else {
+        av_opt_set(impl_->ctx->priv_data, "preset", "ultrafast", 0);
+        av_opt_set(impl_->ctx->priv_data, "tune", "zerolatency", 0);
+        av_opt_set(impl_->ctx->priv_data, "profile", "baseline", 0);
+      }
+    } else if (impl_->codec->id == AV_CODEC_ID_HEVC) {
+      if (isNvenc) {
+        av_opt_set(impl_->ctx->priv_data, "preset", "p1", 0);
+        av_opt_set(impl_->ctx->priv_data, "tune", "ll", 0);
+      } else {
+        av_opt_set(impl_->ctx->priv_data, "preset", "ultrafast", 0);
+        av_opt_set(impl_->ctx->priv_data, "tune", "zerolatency", 0);
+      }
+      av_opt_set(impl_->ctx->priv_data, "profile", "main", 0);
+    }
+
+    const int openRc = avcodec_open2(impl_->ctx, impl_->codec, nullptr);
+    if (openRc < 0) {
+      failures.push_back(QString::fromLatin1(candidate->name) + ": " + ffmpeg_err_string(openRc));
+      avcodec_free_context(&impl_->ctx);
+      impl_->ctx = nullptr;
+      continue;
+    }
+
+    if (const auto normalized = codec_from_avcodec(impl_->codec->id)) {
+      codec_ = *normalized;
+    } else {
+      codec_ = p.codec;
+    }
+    break;
   }
-  impl_->ctx->width = std::max(16, p.width);
-  impl_->ctx->height = std::max(16, p.height);
-  impl_->ctx->pix_fmt = AV_PIX_FMT_YUV420P;
-  impl_->ctx->time_base = AVRational{1, 1000}; // ms
-  impl_->ctx->framerate = AVRational{std::max(1, p.fpsNum), std::max(1, p.fpsDen)};
-  impl_->ctx->bit_rate = std::clamp(p.bitrateKbps, 128, 20000) * 1000LL;
-  impl_->ctx->gop_size = std::max(10, std::max(1, p.fpsNum / std::max(1, p.fpsDen)) * 2);
-  impl_->ctx->max_b_frames = 0;
-  impl_->ctx->thread_count = 1;
-  if (impl_->codec->id == AV_CODEC_ID_H264) {
-    av_opt_set(impl_->ctx->priv_data, "preset", "ultrafast", 0);
-    av_opt_set(impl_->ctx->priv_data, "tune", "zerolatency", 0);
-    av_opt_set(impl_->ctx->priv_data, "profile", "baseline", 0);
-  }
-  if (avcodec_open2(impl_->ctx, impl_->codec, nullptr) < 0) {
-    if (err) *err = "avcodec_open2 failed";
+
+  if (!impl_->ctx || !impl_->codec) {
+    if (err) {
+      *err = failures.isEmpty() ? QString("avcodec_open2 failed")
+                                : QString("avcodec_open2 failed (%1)").arg(failures.join("; "));
+    }
     close();
     return false;
   }
@@ -494,6 +579,7 @@ bool Encoder::open(const EncodeParams& p, QString* err) {
   }
 
   common::log("video: encoder open codec=" + codecToString(codec_).toStdString() +
+              " encoder=" + std::string(impl_->codec ? impl_->codec->name : "unknown") +
               " " + std::to_string(impl_->ctx->width) + "x" + std::to_string(impl_->ctx->height));
   return true;
 }

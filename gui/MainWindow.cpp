@@ -842,7 +842,9 @@ ChatBackend::VoiceSettings voiceSettingsFromProfile(const Profile::AudioSettings
     v.videoHeight = screenH;
     v.videoFpsNum = scfg.fpsNum;
     v.videoFpsDen = scfg.fpsDen;
-    v.videoCodec = "h264";
+    v.videoCodec = scfg.codec.trimmed().toLower();
+    if (v.videoCodec == "h265") v.videoCodec = "hevc";
+    if (v.videoCodec != "h264" && v.videoCodec != "hevc") v.videoCodec = "h264";
     v.videoBitrateKbps = scfg.bitrateKbps;
     v.videoEnabled = true;
   } else {

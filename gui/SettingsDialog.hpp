@@ -80,6 +80,7 @@ private:
   QComboBox* screenResolution_ = nullptr;
   QComboBox* screenFps_ = nullptr;
   QSpinBox* screenBitrate_ = nullptr;
+  QComboBox* screenCodec_ = nullptr;
 
   class PreviewState;
   std::unique_ptr<PreviewState> preview_;

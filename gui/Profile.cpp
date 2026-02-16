@@ -202,7 +202,9 @@ Profile Profile::load(const QString& path, QString* errorOut) {
     if (p.video.fpsDen <= 0) p.video.fpsDen = 30;
     if (p.video.bitrateKbps < 100) p.video.bitrateKbps = 100;
     if (p.video.bitrateKbps > 20000) p.video.bitrateKbps = 20000;
-    p.video.codec = "h264";
+    p.video.codec = p.video.codec.trimmed().toLower();
+    if (p.video.codec == "h265") p.video.codec = "hevc";
+    if (p.video.codec != "h264" && p.video.codec != "hevc") p.video.codec = "h264";
   }
 
   if (root.value("screen").isObject()) {
@@ -212,6 +214,7 @@ Profile Profile::load(const QString& path, QString* errorOut) {
     p.screen.fpsNum = s.value("fpsNum").toInt(p.screen.fpsNum);
     p.screen.fpsDen = s.value("fpsDen").toInt(p.screen.fpsDen);
     p.screen.bitrateKbps = s.value("bitrateKbps").toInt(p.screen.bitrateKbps);
+    p.screen.codec = s.value("codec").toString(p.screen.codec);
     p.screen.lastDisplayName = s.value("lastDisplayName").toString(p.screen.lastDisplayName);
     if (p.screen.width < 0) p.screen.width = 0;
     if (p.screen.height < 0) p.screen.height = 0;
@@ -223,6 +226,9 @@ Profile Profile::load(const QString& path, QString* errorOut) {
     if (p.screen.fpsDen <= 0) p.screen.fpsDen = 15;
     if (p.screen.bitrateKbps < 100) p.screen.bitrateKbps = 100;
     if (p.screen.bitrateKbps > 20000) p.screen.bitrateKbps = 20000;
+    p.screen.codec = p.screen.codec.trimmed().toLower();
+    if (p.screen.codec == "h265") p.screen.codec = "hevc";
+    if (p.screen.codec != "h264" && p.screen.codec != "hevc") p.screen.codec = "h264";
   }
 
   const auto arr = root.value("friends").toArray();
@@ -399,6 +405,7 @@ bool Profile::save(QString* errorOut) const {
     s["fpsNum"] = screen.fpsNum;
     s["fpsDen"] = screen.fpsDen;
     s["bitrateKbps"] = screen.bitrateKbps;
+    s["codec"] = screen.codec;
     s["lastDisplayName"] = screen.lastDisplayName;
     root["screen"] = s;
   }
