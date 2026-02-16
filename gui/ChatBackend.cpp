@@ -2060,6 +2060,7 @@ struct ChatBackend::Impl {
   std::unordered_map<std::string, std::deque<std::string>> queued_outgoing;
   std::unordered_map<std::string, std::deque<json>> queued_control;
   std::unordered_map<std::string, std::string> peer_names;
+  std::atomic<bool> localVideoPreviewEnabled{true};
   std::string self_name;
   std::vector<uint8_t> self_avatar_png;
 
@@ -3085,7 +3086,9 @@ struct ChatBackend::Impl {
         if (frame.width() != videoRt->width || frame.height() != videoRt->height) {
           frame = frame.scaled(videoRt->width, videoRt->height, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
         }
-        emit q->localVideoFrame(frame);
+        if (localVideoPreviewEnabled.load(std::memory_order_relaxed)) {
+          emit q->localVideoFrame(frame);
+        }
 
         video::I420Frame i420;
         QString cvtErr;
@@ -3156,7 +3159,9 @@ struct ChatBackend::Impl {
             }
             return;
           }
-          emit q->localVideoFrame(video::i420ToQImage(i420));
+          if (localVideoPreviewEnabled.load(std::memory_order_relaxed)) {
+            emit q->localVideoFrame(video::i420ToQImage(i420));
+          }
 
           std::vector<video::EncodedFrame> out;
           if (videoRt->passthrough) {
@@ -4641,6 +4646,15 @@ void ChatBackend::setPeerVideoWatch(const QString& peerId, bool watching) {
     impl->sendControlToPeer(pid, std::move(j));
     impl->attemptDelivery(pid, /*silent*/ true);
   });
+}
+
+void ChatBackend::setLocalVideoPreviewEnabled(bool enabled) {
+  if (!impl_) return;
+  const bool prev = impl_->localVideoPreviewEnabled.exchange(enabled, std::memory_order_relaxed);
+  if (prev == enabled) return;
+  if (!enabled && impl_->q) {
+    emit impl_->q->localVideoFrame(QImage());
+  }
 }
 
 void ChatBackend::setVoiceChannelPeers(const QStringList& peerIds, const VoiceSettings& settings) {

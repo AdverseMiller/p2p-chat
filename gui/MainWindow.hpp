@@ -111,6 +111,7 @@ private:
   bool isVoiceMuted(const QString& peerId) const;
   bool isWatchingPeerVideo(const QString& peerId) const;
   void setPeerVideoWatching(const QString& peerId, bool watching);
+  void setSelfStreamPreviewHiddenInServer(bool hidden);
   void setVoiceMuted(const QString& peerId, bool muted);
   void showProfilePopup(const QString& peerId);
   void showGifPopup();
@@ -200,6 +201,7 @@ private:
   bool localMicMuted_ = false;
   bool webcamEnabled_ = false;
   bool screenShareEnabled_ = false;
+  bool selfStreamPreviewHiddenInServer_ = false;
   QString screenShareDisplayName_;
   QString expandedVideoPeerId_;
 };

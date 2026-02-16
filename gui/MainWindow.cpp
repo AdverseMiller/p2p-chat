@@ -2582,6 +2582,7 @@ void MainWindow::showServerPeerContextMenu(const QString& peerId,
   const auto* server = serverId.isEmpty() ? nullptr : profile_.findServer(serverId);
   const bool canKick = (server && !selfId_.isEmpty() && server->ownerId == selfId_ && peerId != selfId_);
   const bool canMute = (peerId != selfId_);
+  const bool canToggleSelfPreview = (!serverId.isEmpty() && !selfId_.isEmpty() && peerId == selfId_);
   const bool canWatchControl =
       (peerId != selfId_) && (peerId == activeCallPeer_ || remoteVideoAvailable_.value(peerId, false) ||
                               remoteVideoFrames_.contains(peerId));
@@ -2589,22 +2590,31 @@ void MainWindow::showServerPeerContextMenu(const QString& peerId,
   QAction* profileAct = nullptr;
   QAction* muteAct = nullptr;
   QAction* watchAct = nullptr;
+  QAction* selfPreviewAct = nullptr;
   QAction* kickAct = nullptr;
   if (allowProfile) profileAct = menu.addAction("View profile...");
+  if (canToggleSelfPreview) {
+    selfPreviewAct =
+        menu.addAction(selfStreamPreviewHiddenInServer_ ? "Show my stream preview" : "Hide my stream preview");
+  }
   if (canMute) muteAct = menu.addAction(isVoiceMuted(peerId) ? "Unmute in voice channels" : "Mute in voice channels");
   if (canWatchControl) {
     watchAct = menu.addAction(isWatchingPeerVideo(peerId) ? "Stop watching stream" : "Watch stream");
   }
   if (canKick) {
-    if (profileAct || muteAct || watchAct) menu.addSeparator();
+    if (profileAct || selfPreviewAct || muteAct || watchAct) menu.addSeparator();
     kickAct = menu.addAction("Kick user");
   }
 
-  if (!profileAct && !muteAct && !watchAct && !kickAct) return;
+  if (!profileAct && !selfPreviewAct && !muteAct && !watchAct && !kickAct) return;
   auto* chosen = menu.exec(globalPos);
   if (!chosen) return;
   if (chosen == profileAct) {
     showProfilePopup(peerId);
+    return;
+  }
+  if (chosen == selfPreviewAct) {
+    setSelfStreamPreviewHiddenInServer(!selfStreamPreviewHiddenInServer_);
     return;
   }
   if (chosen == muteAct) {
@@ -2633,6 +2643,20 @@ bool MainWindow::isVoiceMuted(const QString& peerId) const {
 bool MainWindow::isWatchingPeerVideo(const QString& peerId) const {
   if (peerId.isEmpty()) return false;
   return !stoppedWatchingVideoPeerIds_.contains(peerId);
+}
+
+void MainWindow::setSelfStreamPreviewHiddenInServer(bool hidden) {
+  if (selfStreamPreviewHiddenInServer_ == hidden) return;
+  selfStreamPreviewHiddenInServer_ = hidden;
+  if (hidden) {
+    localVideoActive_ = false;
+    localVideoFrame_ = QImage();
+    if (expandedVideoPeerId_ == selfId_) expandedVideoPeerId_.clear();
+  }
+  refreshVideoPanel();
+  statusBar()->showMessage(hidden ? "Hid your stream preview in server voice channels"
+                                  : "Showing your stream preview in server voice channels",
+                           3500);
 }
 
 void MainWindow::setPeerVideoWatching(const QString& peerId, bool watching) {
@@ -3852,6 +3876,8 @@ void MainWindow::refreshVideoPanel() {
                                        !selectedServerChannelId_.isEmpty());
   const bool inSelectedDirectCallView = (!selectedPeerId_.isEmpty() && selectedPeerId_ == activeCallPeer_);
   const bool inSelectedDirectCall = callActive && inSelectedDirectCallView;
+  const bool hideSelfPreviewInThisView = inSelectedVoiceChannel && selfStreamPreviewHiddenInServer_;
+  backend_.setLocalVideoPreviewEnabled(!hideSelfPreviewInThisView);
   const QString directPeerId = !activeCallPeer_.isEmpty() ? activeCallPeer_ : selectedPeerId_;
   const bool directLocalLive = (webcamEnabled_ || screenShareEnabled_) && localVideoActive_ && !localVideoFrame_.isNull();
   const bool directRemoteLive = !directPeerId.isEmpty() && remoteVideoFrames_.contains(directPeerId) &&
@@ -4048,7 +4074,9 @@ void MainWindow::refreshVideoPanel() {
     const bool remoteAvailable =
         !selfTile && remoteVideoAvailable_.value(peerId, remoteVideoFrames_.contains(peerId) && !remoteVideoFrames_[peerId].isNull());
     const bool showWatchOverlay = remoteAvailable && !watchingRemote;
-    if (selfTile && (webcamEnabled_ || screenShareEnabled_) && localVideoActive_ && !localVideoFrame_.isNull()) {
+    const bool hideSelfLiveTile = selfTile && hideSelfPreviewInThisView;
+    if (!hideSelfLiveTile && selfTile && (webcamEnabled_ || screenShareEnabled_) && localVideoActive_ &&
+        !localVideoFrame_.isNull()) {
       tile = expanded ? roundedContain(localVideoFrame_, QSize(tileW, tileH)) : roundedCover(localVideoFrame_, QSize(tileW, tileH));
     } else if (remoteVideoFrames_.contains(peerId) && !remoteVideoFrames_[peerId].isNull()) {
       tile = expanded ? roundedContain(remoteVideoFrames_[peerId], QSize(tileW, tileH))

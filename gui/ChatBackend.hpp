@@ -62,6 +62,7 @@ public:
   void setServerMembers(const QStringList& peerIds);
   void setPeerMuted(const QString& peerId, bool muted);
   void setPeerVideoWatch(const QString& peerId, bool watching);
+  void setLocalVideoPreviewEnabled(bool enabled);
   void setVoiceChannelPeers(const QStringList& peerIds, const VoiceSettings& settings);
   void stopVoiceChannel();
 

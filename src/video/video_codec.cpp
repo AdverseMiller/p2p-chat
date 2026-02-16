@@ -389,17 +389,20 @@ bool has_hevc_idr(std::span<const uint8_t> data) {
 QImage avframe_to_qimage(const AVFrame* frame) {
   if (!frame || frame->width <= 0 || frame->height <= 0) return {};
   SwsContext* sws = sws_getContext(frame->width, frame->height, static_cast<AVPixelFormat>(frame->format),
-                                   frame->width, frame->height, AV_PIX_FMT_RGB24, SWS_BILINEAR, nullptr, nullptr, nullptr);
+                                   frame->width, frame->height, AV_PIX_FMT_BGRA, SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
   if (!sws) return {};
 
-  std::vector<uint8_t> rgb(static_cast<size_t>(frame->width) * static_cast<size_t>(frame->height) * 3u);
-  uint8_t* dst_data[4] = {rgb.data(), nullptr, nullptr, nullptr};
-  int dst_linesize[4] = {frame->width * 3, 0, 0, 0};
+  QImage img(frame->width, frame->height, QImage::Format_ARGB32);
+  if (img.isNull()) {
+    sws_freeContext(sws);
+    return {};
+  }
+
+  uint8_t* dst_data[4] = {img.bits(), nullptr, nullptr, nullptr};
+  int dst_linesize[4] = {static_cast<int>(img.bytesPerLine()), 0, 0, 0};
   sws_scale(sws, frame->data, frame->linesize, 0, frame->height, dst_data, dst_linesize);
   sws_freeContext(sws);
-
-  QImage img(rgb.data(), frame->width, frame->height, dst_linesize[0], QImage::Format_RGB888);
-  return img.copy();
+  return img;
 }
 
 } // namespace

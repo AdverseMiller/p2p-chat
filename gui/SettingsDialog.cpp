@@ -19,6 +19,7 @@
 #include <QSignalBlocker>
 
 #include <atomic>
+#include <limits>
 #include <mutex>
 
 #if !defined(_WIN32)
@@ -565,6 +566,40 @@ void SettingsDialog::rebuildVideoFormats() {
         break;
       }
     }
+  }
+  if (pick < 0) {
+    auto make4cc = [](char a, char b, char c, char d) -> uint32_t {
+      return static_cast<uint32_t>(static_cast<uint8_t>(a)) |
+             (static_cast<uint32_t>(static_cast<uint8_t>(b)) << 8) |
+             (static_cast<uint32_t>(static_cast<uint8_t>(c)) << 16) |
+             (static_cast<uint32_t>(static_cast<uint8_t>(d)) << 24);
+    };
+    auto preferenceScore = [&](uint32_t fourcc) -> int {
+      // Prefer raw formats that are cheap for encode paths (especially GPU-backed encoders),
+      // and avoid compressed camera formats unless explicitly doing direct passthrough.
+      if (fourcc == make4cc('N', 'V', '1', '2')) return 100;
+      if (fourcc == make4cc('Y', 'U', '1', '2') || fourcc == make4cc('Y', 'V', '1', '2')) return 95;
+      if (fourcc == make4cc('Y', 'U', 'Y', 'V') || fourcc == make4cc('U', 'Y', 'V', 'Y') ||
+          fourcc == make4cc('Y', 'V', 'Y', 'U')) {
+        return 90;
+      }
+      if (fourcc == make4cc('R', 'G', 'B', '3') || fourcc == make4cc('B', 'G', 'R', '3')) return 80;
+      if (fourcc == make4cc('G', 'R', 'E', 'Y')) return 70;
+      if (fourcc == make4cc('M', 'J', 'P', 'G') || fourcc == make4cc('J', 'P', 'E', 'G')) return 20;
+      if (video::codecFromInputFourcc(fourcc).has_value()) return 30;
+      return 60;
+    };
+    int bestIdx = -1;
+    int bestScore = std::numeric_limits<int>::min();
+    for (int i = 0; i < videoFormat_->count(); ++i) {
+      const uint32_t fourcc = static_cast<uint32_t>(videoFormat_->itemData(i, kRoleVideoFourcc).toUInt());
+      const int score = preferenceScore(fourcc);
+      if (score > bestScore) {
+        bestScore = score;
+        bestIdx = i;
+      }
+    }
+    pick = bestIdx;
   }
   if (pick < 0 && videoFormat_->count() > 0) pick = 0;
   if (pick >= 0) videoFormat_->setCurrentIndex(pick);
