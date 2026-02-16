@@ -267,6 +267,7 @@ SettingsDialog::SettingsDialog(const Profile::AudioSettings& initial,
   addRes("3840x2160", 3840, 2160);
   addRes("2560x1440", 2560, 1440);
   addRes("1920x1080", 1920, 1080);
+  addRes("1664x936", 1664, 936);
   addRes("1600x900", 1600, 900);
   addRes("1366x768", 1366, 768);
   addRes("1280x720", 1280, 720);
