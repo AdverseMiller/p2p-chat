@@ -156,6 +156,29 @@ struct AeadKey {
   uint64_t counter = 0;
 };
 
+enum class AeadCipher {
+  Chacha20Poly1305,
+  Aes128Gcm,
+};
+
+inline constexpr std::string_view kAeadChacha20Poly1305 = "chacha20-poly1305";
+inline constexpr std::string_view kAeadAes128Gcm = "aes-128-gcm";
+
+inline std::string_view aead_cipher_to_string(AeadCipher c) {
+  switch (c) {
+    case AeadCipher::Aes128Gcm:
+      return kAeadAes128Gcm;
+    case AeadCipher::Chacha20Poly1305:
+    default:
+      return kAeadChacha20Poly1305;
+  }
+}
+
+inline AeadCipher aead_cipher_from_string(std::string_view s) {
+  if (s == kAeadAes128Gcm || s == "aes128-gcm" || s == "aes128gcm") return AeadCipher::Aes128Gcm;
+  return AeadCipher::Chacha20Poly1305;
+}
+
 inline std::array<uint8_t, 12> make_nonce(AeadKey& k) {
   std::array<uint8_t, 12> nonce{};
   nonce[0] = k.nonce_prefix[0];
@@ -245,6 +268,108 @@ inline std::optional<std::vector<uint8_t>> aead_chacha20poly1305_decrypt(std::sp
   if (!ok) return std::nullopt;
   out.resize(outlen);
   return out;
+}
+
+inline std::optional<std::vector<uint8_t>> aead_aes128gcm_encrypt(std::span<const uint8_t> key,
+                                                                  std::span<const uint8_t> nonce12,
+                                                                  std::span<const uint8_t> aad,
+                                                                  std::span<const uint8_t> plaintext) {
+  if (key.size() < 16 || nonce12.size() != 12) return std::nullopt;
+  EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+  if (!ctx) return std::nullopt;
+
+  std::vector<uint8_t> out;
+  out.resize(plaintext.size() + 16);
+  int len = 0;
+  int outlen = 0;
+
+  bool ok = EVP_EncryptInit_ex(ctx, EVP_aes_128_gcm(), nullptr, nullptr, nullptr) == 1;
+  ok = ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, nullptr) == 1;
+  ok = ok && EVP_EncryptInit_ex(ctx, nullptr, nullptr, key.data(), nonce12.data()) == 1;
+  if (!aad.empty()) {
+    ok = ok && EVP_EncryptUpdate(ctx, nullptr, &len, aad.data(), static_cast<int>(aad.size())) == 1;
+  }
+  ok = ok && EVP_EncryptUpdate(ctx,
+                               out.data(),
+                               &len,
+                               plaintext.data(),
+                               static_cast<int>(plaintext.size())) == 1;
+  outlen = len;
+  ok = ok && EVP_EncryptFinal_ex(ctx, out.data() + outlen, &len) == 1;
+  outlen += len;
+  ok = ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, out.data() + plaintext.size()) == 1;
+  EVP_CIPHER_CTX_free(ctx);
+  if (!ok) return std::nullopt;
+  out.resize(plaintext.size() + 16);
+  return out;
+}
+
+inline std::optional<std::vector<uint8_t>> aead_aes128gcm_decrypt(std::span<const uint8_t> key,
+                                                                  std::span<const uint8_t> nonce12,
+                                                                  std::span<const uint8_t> aad,
+                                                                  std::span<const uint8_t> ciphertext_and_tag) {
+  if (key.size() < 16 || nonce12.size() != 12) return std::nullopt;
+  if (ciphertext_and_tag.size() < 16) return std::nullopt;
+  const std::size_t ctlen = ciphertext_and_tag.size() - 16;
+
+  EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+  if (!ctx) return std::nullopt;
+
+  std::vector<uint8_t> out;
+  out.resize(ctlen);
+  int len = 0;
+  int outlen = 0;
+
+  bool ok = EVP_DecryptInit_ex(ctx, EVP_aes_128_gcm(), nullptr, nullptr, nullptr) == 1;
+  ok = ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, nullptr) == 1;
+  ok = ok && EVP_DecryptInit_ex(ctx, nullptr, nullptr, key.data(), nonce12.data()) == 1;
+  if (!aad.empty()) {
+    ok = ok && EVP_DecryptUpdate(ctx, nullptr, &len, aad.data(), static_cast<int>(aad.size())) == 1;
+  }
+  ok = ok && EVP_DecryptUpdate(ctx,
+                               out.data(),
+                               &len,
+                               ciphertext_and_tag.data(),
+                               static_cast<int>(ctlen)) == 1;
+  outlen = len;
+  ok = ok && EVP_CIPHER_CTX_ctrl(ctx,
+                                 EVP_CTRL_AEAD_SET_TAG,
+                                 16,
+                                 const_cast<uint8_t*>(ciphertext_and_tag.data() + ctlen)) == 1;
+  ok = ok && EVP_DecryptFinal_ex(ctx, out.data() + outlen, &len) == 1;
+  outlen += len;
+  EVP_CIPHER_CTX_free(ctx);
+  if (!ok) return std::nullopt;
+  out.resize(outlen);
+  return out;
+}
+
+inline std::optional<std::vector<uint8_t>> aead_encrypt(AeadCipher cipher,
+                                                        std::span<const uint8_t> key,
+                                                        std::span<const uint8_t> nonce12,
+                                                        std::span<const uint8_t> aad,
+                                                        std::span<const uint8_t> plaintext) {
+  switch (cipher) {
+    case AeadCipher::Aes128Gcm:
+      return aead_aes128gcm_encrypt(key, nonce12, aad, plaintext);
+    case AeadCipher::Chacha20Poly1305:
+    default:
+      return aead_chacha20poly1305_encrypt(key, nonce12, aad, plaintext);
+  }
+}
+
+inline std::optional<std::vector<uint8_t>> aead_decrypt(AeadCipher cipher,
+                                                        std::span<const uint8_t> key,
+                                                        std::span<const uint8_t> nonce12,
+                                                        std::span<const uint8_t> aad,
+                                                        std::span<const uint8_t> ciphertext_and_tag) {
+  switch (cipher) {
+    case AeadCipher::Aes128Gcm:
+      return aead_aes128gcm_decrypt(key, nonce12, aad, ciphertext_and_tag);
+    case AeadCipher::Chacha20Poly1305:
+    default:
+      return aead_chacha20poly1305_decrypt(key, nonce12, aad, ciphertext_and_tag);
+  }
 }
 
 } // namespace common

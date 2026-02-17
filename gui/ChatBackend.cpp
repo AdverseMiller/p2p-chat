@@ -167,6 +167,33 @@ bool debug_logs_enabled() {
   return enabled;
 }
 
+constexpr common::AeadCipher kStreamCipher = common::AeadCipher::Aes128Gcm;
+
+std::string stream_cipher_to_wire(common::AeadCipher cipher) {
+  return std::string(common::aead_cipher_to_string(cipher));
+}
+
+std::vector<std::string> supported_stream_ciphers_wire() {
+  return {stream_cipher_to_wire(kStreamCipher)};
+}
+
+bool supports_stream_cipher(const json& j, common::AeadCipher want) {
+  if (j.contains("aead_supported") && j["aead_supported"].is_array()) {
+    for (const auto& v : j["aead_supported"]) {
+      if (!v.is_string()) continue;
+      if (common::aead_cipher_from_string(v.get<std::string>()) == want) return true;
+    }
+    return false;
+  }
+  if (j.contains("aead_pref") && j["aead_pref"].is_string()) {
+    return common::aead_cipher_from_string(j["aead_pref"].get<std::string>()) == want;
+  }
+  if (j.contains("aead") && j["aead"].is_string()) {
+    return common::aead_cipher_from_string(j["aead"].get<std::string>()) == want;
+  }
+  return false;
+}
+
 bool running_as_root() {
 #if defined(_WIN32)
   return false;
@@ -381,6 +408,7 @@ public:
               std::function<std::string(const std::string&)> get_self_name,
               std::function<std::vector<uint8_t>()> get_self_avatar_png,
               std::function<bool(const std::string&)> allow_peer,
+              common::AeadCipher preferred_cipher,
               std::string expected_peer_id = {})
       : socket_(std::move(socket)),
         role_(role),
@@ -389,6 +417,8 @@ public:
         get_self_name_(std::move(get_self_name)),
         get_self_avatar_png_(std::move(get_self_avatar_png)),
         allow_peer_(std::move(allow_peer)),
+        preferred_cipher_(preferred_cipher),
+        negotiated_cipher_(kStreamCipher),
         expected_peer_id_(std::move(expected_peer_id)),
         writer_(std::make_shared<common::JsonWriteQueue<tcp::socket>>(socket_)) {}
 
@@ -524,6 +554,8 @@ private:
     hello["id"] = self_id_;
     hello["eph"] = eph_b64;
     hello["sig"] = sig;
+    hello["aead_pref"] = stream_cipher_to_wire(kStreamCipher);
+    hello["aead_supported"] = supported_stream_ciphers_wire();
     writer_->send(std::move(hello));
     wait_for_secure_hello_ack();
   }
@@ -548,6 +580,10 @@ private:
     const std::string init_id = j["id"].get<std::string>();
     if (!common::is_valid_id(init_id)) return send_error_and_close("invalid peer id");
     if (allow_peer_ && !allow_peer_(init_id)) return send_error_and_close("not friends");
+    if (!supports_stream_cipher(j, kStreamCipher)) {
+      return send_error_and_close("peer does not support required stream cipher");
+    }
+    negotiated_cipher_ = kStreamCipher;
 
     const std::string init_eph_b64 = j["eph"].get<std::string>();
     const auto init_eph = common::base64url_decode(init_eph_b64);
@@ -577,6 +613,7 @@ private:
     ack["id"] = self_id_;
     ack["eph"] = resp_eph_b64;
     ack["sig"] = ack_sig;
+    ack["aead"] = stream_cipher_to_wire(negotiated_cipher_);
     writer_->send(std::move(ack));
     wait_for_secure_finish();
   }
@@ -614,6 +651,11 @@ private:
 
       self->peer_id_ = resp_id;
       self->peer_eph_pub_ = *resp_eph;
+      if (!j.contains("aead") || !j["aead"].is_string() ||
+          common::aead_cipher_from_string(j["aead"].get<std::string>()) != kStreamCipher) {
+        return self->send_error_and_close("peer selected unsupported stream cipher");
+      }
+      self->negotiated_cipher_ = kStreamCipher;
 
       // Send finish signature binding initiator to full transcript.
       const std::string fin_msg = self->transcript_ + "|init";
@@ -715,8 +757,11 @@ private:
     const uint64_t seq = send_key_.counter; // make_nonce increments; keep seq consistent with counter pre-increment.
     const std::string aad = transcript_ + "|msg|" + std::to_string(seq);
     const auto nonce = common::make_nonce(send_key_);
-    const auto ct = common::aead_chacha20poly1305_encrypt(
-        send_key_.key, nonce, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(aad.data()), aad.size()),
+    const auto ct = common::aead_encrypt(
+        negotiated_cipher_,
+        send_key_.key,
+        nonce,
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(aad.data()), aad.size()),
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(pt.data()), pt.size()));
     if (!ct) return close();
 
@@ -763,7 +808,8 @@ private:
         if (!ct) return self->send_error_and_close("bad ct");
         const std::string aad = self->transcript_ + "|msg|" + std::to_string(seq);
         const auto nonce = self->make_recv_nonce(seq);
-        const auto pt = common::aead_chacha20poly1305_decrypt(
+        const auto pt = common::aead_decrypt(
+            self->negotiated_cipher_,
             self->recv_key_.key,
             nonce,
             std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(aad.data()), aad.size()),
@@ -820,6 +866,8 @@ private:
   std::string peer_name_;
   std::string expected_peer_id_;
   std::function<bool(const std::string&)> allow_peer_;
+  common::AeadCipher preferred_cipher_ = kStreamCipher;
+  common::AeadCipher negotiated_cipher_ = kStreamCipher;
   std::shared_ptr<common::JsonWriteQueue<tcp::socket>> writer_;
   bool ready_ = false;
   bool closed_ = false;
@@ -859,6 +907,7 @@ public:
                  std::function<std::string(const std::string&)> get_self_name,
                  std::function<std::vector<uint8_t>()> get_self_avatar_png,
                  std::function<bool(const std::string&)> allow_peer,
+                 common::AeadCipher preferred_cipher,
                  std::string expected_peer_id = {},
                  std::function<void(const std::string&)> debug_log = {})
       : socket_(socket),
@@ -869,6 +918,8 @@ public:
         get_self_name_(std::move(get_self_name)),
         get_self_avatar_png_(std::move(get_self_avatar_png)),
         allow_peer_(std::move(allow_peer)),
+        preferred_cipher_(preferred_cipher),
+        negotiated_cipher_(kStreamCipher),
         expected_peer_id_(std::move(expected_peer_id)),
         debug_log_(std::move(debug_log)),
         punch_timer_(socket_.get_executor()),
@@ -1060,7 +1111,8 @@ public:
       auto key = voice_send_key_;
       key.counter = nonce_seq;
       const auto nonce = common::make_nonce(key);
-      const auto ct = common::aead_chacha20poly1305_encrypt(
+      const auto ct = common::aead_encrypt(
+          negotiated_cipher_,
           voice_send_key_.key,
           nonce,
           std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(aad.data()), aad.size()),
@@ -1123,7 +1175,8 @@ public:
     const uint64_t seq = voice_send_key_.counter;
     const std::string aad = transcript_ + "|voice|" + std::to_string(seq);
     const auto nonce = common::make_nonce(voice_send_key_);
-    const auto ct = common::aead_chacha20poly1305_encrypt(
+    const auto ct = common::aead_encrypt(
+        negotiated_cipher_,
         voice_send_key_.key,
         nonce,
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(aad.data()), aad.size()),
@@ -1188,7 +1241,8 @@ public:
 
     const std::string aad = transcript_ + "|voice|" + std::to_string(seq);
     const auto nonce = make_voice_recv_nonce(seq);
-    const auto pt = common::aead_chacha20poly1305_decrypt(
+    const auto pt = common::aead_decrypt(
+        negotiated_cipher_,
         voice_recv_key_,
         nonce,
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(aad.data()), aad.size()),
@@ -1241,7 +1295,8 @@ public:
     nonce[9] = static_cast<uint8_t>((nonce_seq >> 16) & 0xFF);
     nonce[10] = static_cast<uint8_t>((nonce_seq >> 8) & 0xFF);
     nonce[11] = static_cast<uint8_t>(nonce_seq & 0xFF);
-    const auto pt = common::aead_chacha20poly1305_decrypt(
+    const auto pt = common::aead_decrypt(
+        negotiated_cipher_,
         voice_recv_key_,
         nonce,
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(aad.data()), aad.size()),
@@ -1360,6 +1415,8 @@ private:
     hello["id"] = self_id_;
     hello["eph"] = eph_b64;
     hello["sig"] = sig;
+    hello["aead_pref"] = stream_cipher_to_wire(kStreamCipher);
+    hello["aead_supported"] = supported_stream_ciphers_wire();
 
     hello_sent_ = true;
     last_hs_msg_ = hello;
@@ -1397,6 +1454,8 @@ private:
       dlog("reject secure_hello: allow_peer=false id=" + init_id);
       return close();
     }
+    if (!supports_stream_cipher(j, kStreamCipher)) return close();
+    negotiated_cipher_ = kStreamCipher;
 
     const std::string init_eph_b64 = j["eph"].get<std::string>();
     const auto init_eph = common::base64url_decode(init_eph_b64);
@@ -1422,6 +1481,7 @@ private:
     ack["id"] = self_id_;
     ack["eph"] = resp_eph_b64;
     ack["sig"] = ack_sig;
+    ack["aead"] = stream_cipher_to_wire(negotiated_cipher_);
     last_hs_msg_ = ack;
     send_datagram(ack);
     dlog("sent secure_hello_ack peer_id=" + peer_id_);
@@ -1453,6 +1513,11 @@ private:
 
     peer_id_ = resp_id;
     peer_eph_pub_ = *resp_eph;
+    if (!j.contains("aead") || !j["aead"].is_string() ||
+        common::aead_cipher_from_string(j["aead"].get<std::string>()) != kStreamCipher) {
+      return close();
+    }
+    negotiated_cipher_ = kStreamCipher;
 
     const std::string fin_msg = transcript_ + "|init";
     const std::string fin_sig = identity_->sign_bytes_b64url(std::span<const uint8_t>(
@@ -1565,7 +1630,7 @@ private:
     voice_send_key_.counter = 0;
     voice_timestamp_ = 0;
     voice_frame_samples_ = 960; // default 20ms @ 48kHz mono
-    dlog("keys derived ok");
+    dlog("keys derived ok aead=" + stream_cipher_to_wire(negotiated_cipher_));
     return true;
   }
 
@@ -1600,8 +1665,11 @@ private:
     const uint64_t seq = send_key_.counter;
     const std::string aad = transcript_ + "|msg|" + std::to_string(seq);
     const auto nonce = common::make_nonce(send_key_);
-    const auto ct = common::aead_chacha20poly1305_encrypt(
-        send_key_.key, nonce, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(aad.data()), aad.size()),
+    const auto ct = common::aead_encrypt(
+        negotiated_cipher_,
+        send_key_.key,
+        nonce,
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(aad.data()), aad.size()),
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(pt.data()), pt.size()));
     if (!ct) return close();
 
@@ -1687,7 +1755,8 @@ private:
     if (!ready_) return;
     const std::string aad = transcript_ + "|ack|" + std::to_string(seq);
     const auto nonce = make_ack_nonce(ack_send_nonce_prefix_, seq);
-    const auto tag = common::aead_chacha20poly1305_encrypt(
+    const auto tag = common::aead_encrypt(
+        negotiated_cipher_,
         ack_send_key_,
         nonce,
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(aad.data()), aad.size()),
@@ -1710,7 +1779,8 @@ private:
     if (!tag || tag->size() != 16) return;
     const std::string aad = transcript_ + "|ack|" + std::to_string(seq);
     const auto nonce = make_ack_nonce(ack_recv_nonce_prefix_, seq);
-    const auto pt = common::aead_chacha20poly1305_decrypt(
+    const auto pt = common::aead_decrypt(
+        negotiated_cipher_,
         ack_recv_key_,
         nonce,
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(aad.data()), aad.size()),
@@ -1743,7 +1813,8 @@ private:
     if (!ct) return;
     const std::string aad = transcript_ + "|msg|" + std::to_string(seq);
     const auto nonce = make_recv_nonce(seq);
-    const auto pt = common::aead_chacha20poly1305_decrypt(
+    const auto pt = common::aead_decrypt(
+        negotiated_cipher_,
         recv_key_.key,
         nonce,
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(aad.data()), aad.size()),
@@ -1813,6 +1884,8 @@ private:
   std::string peer_name_;
   std::string expected_peer_id_;
   std::function<bool(const std::string&)> allow_peer_;
+  common::AeadCipher preferred_cipher_ = kStreamCipher;
+  common::AeadCipher negotiated_cipher_ = kStreamCipher;
   std::function<void(const std::string&)> debug_log_;
   bool ready_ = false;
   bool closed_ = false;
@@ -2234,6 +2307,7 @@ struct ChatBackend::Impl {
   std::atomic<bool> localVideoPreviewEnabled{true};
   std::string self_name;
   std::vector<uint8_t> self_avatar_png;
+  common::AeadCipher stream_cipher_pref = kStreamCipher;
 
   // Call state (Qt thread only).
   QString callPeerId;
@@ -4463,6 +4537,7 @@ struct ChatBackend::Impl {
             [this](const std::string& pid) { return getSelfNameForPeer(pid); },
             [this] { return getSelfAvatarPng(); },
             [this](const std::string& x) { return isRoutablePeer(x); },
+            stream_cipher_pref,
             std::string{},
             [this](const std::string& s) {
               if (!debug_logs_enabled()) return;
@@ -4678,7 +4753,8 @@ struct ChatBackend::Impl {
         std::move(socket), PeerSession::Role::Acceptor, std::move(selfId), identity,
         [this](const std::string& pid) { return getSelfNameForPeer(pid); },
         [this] { return getSelfAvatarPng(); },
-        [this](const std::string& pid) { return isRoutablePeer(pid); });
+        [this](const std::string& pid) { return isRoutablePeer(pid); },
+        stream_cipher_pref);
     std::weak_ptr<PeerSession> weak = session;
     session->start_accept_with_first(
         std::move(first),
@@ -4793,6 +4869,7 @@ struct ChatBackend::Impl {
         [this](const std::string& pid) { return getSelfNameForPeer(pid); },
         [this] { return getSelfAvatarPng(); },
         [this](const std::string& pid) { return isRoutablePeer(pid); },
+        stream_cipher_pref,
         peer_id,
         [this](const std::string& s) {
           if (!debug_logs_enabled()) return;
@@ -4886,6 +4963,7 @@ struct ChatBackend::Impl {
         [this](const std::string& pid) { return getSelfNameForPeer(pid); },
         [this] { return getSelfAvatarPng(); },
         [this](const std::string& pid) { return isRoutablePeer(pid); },
+        stream_cipher_pref,
         std::move(expected_peer_id));
 
     // Store by expected peer id so we don't attempt another connect while handshaking.
@@ -5051,6 +5129,7 @@ void ChatBackend::start(const Options& opt) {
     std::lock_guard lk(impl_->m);
     impl_->self_name = opt.selfName.toStdString();
   }
+  impl_->stream_cipher_pref = kStreamCipher;
 
   // Bind acceptor.
   const uint16_t listenPort = opt.listenPort ? static_cast<uint16_t>(opt.listenPort)
