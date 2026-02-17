@@ -26,6 +26,11 @@
 #include <QVideoSink>
 #endif
 
+#if defined(_WIN32)
+#include <mstcpip.h>
+#include <winsock2.h>
+#endif
+
 #include <boost/asio.hpp>
 
 #include <atomic>
@@ -169,6 +174,22 @@ bool running_as_root() {
   return ::geteuid() == 0;
 #endif
 }
+
+#if defined(_WIN32)
+void disable_udp_connreset(udp::socket& socket) {
+  DWORD bytes = 0;
+  BOOL behavior = FALSE;
+  (void)::WSAIoctl(socket.native_handle(),
+                   SIO_UDP_CONNRESET,
+                   &behavior,
+                   sizeof(behavior),
+                   nullptr,
+                   0,
+                   &bytes,
+                   nullptr,
+                   nullptr);
+}
+#endif
 
 bool is_x11_platform();
 
@@ -4285,6 +4306,9 @@ struct ChatBackend::Impl {
     boost::system::error_code ec;
     udp_socket.open(udp::v4(), ec);
     if (ec) throw std::runtime_error("udp open failed");
+#if defined(_WIN32)
+    disable_udp_connreset(udp_socket);
+#endif
     udp_socket.bind(udp::endpoint(boost::asio::ip::address_v4::any(), port), ec);
     if (ec) throw std::runtime_error("udp bind failed");
     udp_read_loop();
@@ -4295,7 +4319,15 @@ struct ChatBackend::Impl {
     auto remote = std::make_shared<udp::endpoint>();
     udp_socket.async_receive_from(boost::asio::buffer(*buf), *remote,
                                   [this, buf, remote](const boost::system::error_code& ec, std::size_t n) {
-                                    if (ec) return;
+                                    if (ec) {
+                                      if (ec == boost::asio::error::operation_aborted) return;
+                                      if (debug_logs_enabled()) {
+                                        postToQt([this, msg = QString::fromStdString(ec.message())] {
+                                          emit q->logLine("[dbg] udp recv error: " + msg);
+                                        });
+                                      }
+                                      return udp_read_loop();
+                                    }
                                     if (n == 0) return udp_read_loop();
 #if defined(P2PCHAT_VOICE)
                                     if (n >= 20 && read_u32be(buf->data()) == kVoiceMagic) {
