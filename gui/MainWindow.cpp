@@ -340,6 +340,66 @@ QIcon iconFromSvg(const char* svgText, const QString& colorHex = {}) {
   return QIcon(pm);
 }
 
+enum class ControlIconKind {
+  Mic,
+  Camera,
+  Screen,
+  Hangup,
+};
+
+QIcon drawFallbackControlIcon(ControlIconKind kind, const QColor& color, bool slashed = false) {
+  constexpr int kSize = 24;
+  QPixmap pm(kSize, kSize);
+  pm.fill(Qt::transparent);
+
+  QPainter painter(&pm);
+  painter.setRenderHint(QPainter::Antialiasing, true);
+  QPen pen(color, 2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+  painter.setPen(pen);
+  painter.setBrush(Qt::NoBrush);
+
+  switch (kind) {
+    case ControlIconKind::Mic: {
+      painter.drawRoundedRect(QRectF(9, 3, 6, 10), 3, 3);
+      painter.drawArc(QRectF(6, 9, 12, 10), 180 * 16, -180 * 16);
+      painter.drawLine(QPointF(12, 14.5), QPointF(12, 18.5));
+      painter.drawLine(QPointF(9, 18.5), QPointF(15, 18.5));
+      break;
+    }
+    case ControlIconKind::Camera: {
+      painter.drawRoundedRect(QRectF(4, 7, 12, 10), 2, 2);
+      QPainterPath lens;
+      lens.moveTo(16, 10);
+      lens.lineTo(21, 8);
+      lens.lineTo(21, 16);
+      lens.lineTo(16, 14);
+      lens.closeSubpath();
+      painter.fillPath(lens, color);
+      break;
+    }
+    case ControlIconKind::Screen: {
+      painter.drawRoundedRect(QRectF(3, 5, 18, 12), 2, 2);
+      painter.drawLine(QPointF(9, 19), QPointF(15, 19));
+      painter.drawLine(QPointF(12, 17), QPointF(12, 19));
+      break;
+    }
+    case ControlIconKind::Hangup: {
+      QPen hangPen(color, 3.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+      painter.setPen(hangPen);
+      painter.drawArc(QRectF(4, 8.5, 16, 9), 200 * 16, 140 * 16);
+      break;
+    }
+  }
+
+  if (slashed) {
+    QPen slashPen(color, 2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+    painter.setPen(slashPen);
+    painter.drawLine(QPointF(4.5, 19.5), QPointF(19.5, 4.5));
+  }
+
+  return QIcon(pm);
+}
+
 QIcon discordMicIcon(bool muted, bool dark) {
   static const char* kMicOnSvg = R"SVG(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
   <g transform="translate(12 8.5)"><path fill="currentColor" d="M-4,-1.4600000381469727 C-4,-3.6689999103546143 -2.2090001106262207,-5.460000038146973 0,-5.460000038146973 C2.2090001106262207,-5.460000038146973 4,-3.6689999103546143 4,-1.4600000381469727 C4,-1.4600000381469727 4,2.5 4,2.5 C4,4.709000110626221 2.2090001106262207,6.5 0,6.5 C-2.2090001106262207,6.5 -4,4.709000110626221 -4,2.5 C-4,2.5 -4,-1.4600000381469727 -4,-1.4600000381469727z"/></g>
@@ -354,10 +414,26 @@ QIcon discordMicIcon(bool muted, bool dark) {
   <g transform="translate(12 22)"><path fill="currentColor" d="M3,-1 C3.552000045776367,-1 4,-0.5519999861717224 4,0 C4,0.5519999861717224 3.552000045776367,1 3,1 C3,1 -3,1 -3,1 C-3.552000045776367,1 -4,0.5519999861717224 -4,0 C-4,-0.5519999861717224 -3.552000045776367,-1 -3,-1 C-3,-1 3,-1 3,-1z"/></g>
   <g transform="translate(12 12)"><path d="M-10,10 L10,-10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></g>
   </svg>)SVG";
-  static const QIcon onDark = iconFromSvg(kMicOnSvg, "#f2f3f5");
-  static const QIcon onLight = iconFromSvg(kMicOnSvg, "#1d232f");
-  static const QIcon offDark = iconFromSvg(kMicOffSvg, "#f2f3f5");
-  static const QIcon offLight = iconFromSvg(kMicOffSvg, "#1d232f");
+  static const QIcon onDark = [] {
+    auto icon = iconFromSvg(kMicOnSvg, "#f2f3f5");
+    if (icon.isNull()) icon = drawFallbackControlIcon(ControlIconKind::Mic, QColor("#f2f3f5"), false);
+    return icon;
+  }();
+  static const QIcon onLight = [] {
+    auto icon = iconFromSvg(kMicOnSvg, "#1d232f");
+    if (icon.isNull()) icon = drawFallbackControlIcon(ControlIconKind::Mic, QColor("#1d232f"), false);
+    return icon;
+  }();
+  static const QIcon offDark = [] {
+    auto icon = iconFromSvg(kMicOffSvg, "#f2f3f5");
+    if (icon.isNull()) icon = drawFallbackControlIcon(ControlIconKind::Mic, QColor("#f2f3f5"), true);
+    return icon;
+  }();
+  static const QIcon offLight = [] {
+    auto icon = iconFromSvg(kMicOffSvg, "#1d232f");
+    if (icon.isNull()) icon = drawFallbackControlIcon(ControlIconKind::Mic, QColor("#1d232f"), true);
+    return icon;
+  }();
   const QIcon& on = dark ? onDark : onLight;
   const QIcon& off = dark ? offDark : offLight;
   return muted ? off : on;
@@ -373,11 +449,31 @@ QIcon discordCameraIcon(bool offState, bool dark, bool activeOverlay = false) {
   <g transform="translate(20.5 12)"><path fill="currentColor" d="M-2.5,-2.881999969482422 C-2.5,-3.260999917984009 -2.2860000133514404,-3.6070001125335693 -1.9470000267028809,-3.7760000228881836 C-1.9470000267028809,-3.7760000228881836 1.0529999732971191,-5.276000022888184 1.0529999732971191,-5.276000022888184 C1.718000054359436,-5.609000205993652 2.5,-5.125 2.5,-4.381999969482422 C2.5,-4.381999969482422 2.5,4.381999969482422 2.5,4.381999969482422 C2.5,5.125 1.718000054359436,5.609000205993652 1.0529999732971191,5.276000022888184 C1.0529999732971191,5.276000022888184 -1.9470000267028809,3.7760000228881836 -1.9470000267028809,3.7760000228881836 C-2.2860000133514404,3.6070001125335693 -2.5,3.260999917984009 -2.5,2.881999969482422 C-2.5,2.881999969482422 -3.1675777435302734,-0.012422150000929832 -3.1675777435302734,-0.012422150000929832 C-3.1675777435302734,-0.012422150000929832 -2.5,-2.881999969482422 -2.5,-2.881999969482422z"/></g>
   <g transform="translate(12 12)"><path d="M-10,10 L10,-10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></g>
   </svg>)SVG";
-  static const QIcon onDark = iconFromSvg(kCamOnSvg, "#f2f3f5");
-  static const QIcon onLight = iconFromSvg(kCamOnSvg, "#1d232f");
-  static const QIcon offDark = iconFromSvg(kCamOffSvg, "#f2f3f5");
-  static const QIcon offLight = iconFromSvg(kCamOffSvg, "#1d232f");
-  static const QIcon onAccent = iconFromSvg(kCamOnSvg, "#57f287");
+  static const QIcon onDark = [] {
+    auto icon = iconFromSvg(kCamOnSvg, "#f2f3f5");
+    if (icon.isNull()) icon = drawFallbackControlIcon(ControlIconKind::Camera, QColor("#f2f3f5"), false);
+    return icon;
+  }();
+  static const QIcon onLight = [] {
+    auto icon = iconFromSvg(kCamOnSvg, "#1d232f");
+    if (icon.isNull()) icon = drawFallbackControlIcon(ControlIconKind::Camera, QColor("#1d232f"), false);
+    return icon;
+  }();
+  static const QIcon offDark = [] {
+    auto icon = iconFromSvg(kCamOffSvg, "#f2f3f5");
+    if (icon.isNull()) icon = drawFallbackControlIcon(ControlIconKind::Camera, QColor("#f2f3f5"), true);
+    return icon;
+  }();
+  static const QIcon offLight = [] {
+    auto icon = iconFromSvg(kCamOffSvg, "#1d232f");
+    if (icon.isNull()) icon = drawFallbackControlIcon(ControlIconKind::Camera, QColor("#1d232f"), true);
+    return icon;
+  }();
+  static const QIcon onAccent = [] {
+    auto icon = iconFromSvg(kCamOnSvg, "#57f287");
+    if (icon.isNull()) icon = drawFallbackControlIcon(ControlIconKind::Camera, QColor("#57f287"), false);
+    return icon;
+  }();
   const QIcon& on = activeOverlay ? onAccent : (dark ? onDark : onLight);
   const QIcon& off = dark ? offDark : offLight;
   return offState ? off : on;
@@ -389,9 +485,21 @@ QIcon discordScreenIcon(bool dark, bool activeOverlay = false) {
   <g transform="translate(12 12)"><path fill="currentColor" d="M1,7.5 C1,7.776000022888184 1.2239999771118164,8 1.5,8 C1.5,8 3,8 3,8 C3.552000045776367,8 4,8.447999954223633 4,9 C4,9.552000045776367 3.552000045776367,10 3,10 C3,10 -3,10 -3,10 C-3.552000045776367,10 -4,9.552000045776367 -4,9 C-4,8.447999954223633 -3.552000045776367,8 -3,8 C-3,8 -1.5,8 -1.5,8 C-1.2239999771118164,8 -1,7.776000022888184 -1,7.5 C-1,7.5 -1,5.5 -1,5.5 C-1,5.223999977111816 -0.7760000228881836,5 -0.5,5 C-0.5,5 0.5,5 0.5,5 C0.7760000228881836,5 1,5.223999977111816 1,5.5 C1,5.5 1,7.5 1,7.5z"/></g>
   <g transform="translate(12 12)"><path fill="currentColor" d="M6,-4 C6,-4.264999866485596 5.894999980926514,-4.519000053405762 5.706999778747559,-4.706999778747559 C5.706999778747559,-4.706999778747559 2.7070000171661377,-7.706999778747559 2.7070000171661377,-7.706999778747559 C2.315999984741211,-8.097999572753906 1.684000015258789,-8.097999572753906 1.2929999828338623,-7.706999778747559 C0.9020000100135803,-7.315999984741211 0.9020000100135803,-6.684000015258789 1.2929999828338623,-6.293000221252441 C1.2929999828338623,-6.293000221252441 2.5859999656677246,-5 2.5859999656677246,-5 C2.5859999656677246,-5 1,-5 1,-5 C-2.313999891281128,-5 -5,-2.313999891281128 -5,1 C-5,1.5520000457763672 -4.552000045776367,2 -4,2 C-3.447999954223633,2 -3,1.5520000457763672 -3,1 C-3,-1.2089999914169312 -1.2089999914169312,-3 1,-3 C1,-3 2.5859999656677246,-3 2.5859999656677246,-3 C2.5859999656677246,-3 1.2929999828338623,-1.7070000171661377 1.2929999828338623,-1.7070000171661377 C0.9020000100135803,-1.315999984741211 0.9020000100135803,-0.6840000152587891 1.2929999828338623,-0.2930000126361847 C1.684000015258789,0.09799999743700027 2.315999984741211,0.09799999743700027 2.7070000171661377,-0.2930000126361847 C2.7070000171661377,-0.2930000126361847 5.706999778747559,-3.2929999828338623 5.706999778747559,-3.2929999828338623 C5.894999980926514,-3.4809999465942383 6,-3.734999895095825 6,-4z"/></g>
   </svg>)SVG";
-  static const QIcon darkIcon = iconFromSvg(kScreenSvg, "#f2f3f5");
-  static const QIcon lightIcon = iconFromSvg(kScreenSvg, "#1d232f");
-  static const QIcon accentIcon = iconFromSvg(kScreenSvg, "#57f287");
+  static const QIcon darkIcon = [] {
+    auto icon = iconFromSvg(kScreenSvg, "#f2f3f5");
+    if (icon.isNull()) icon = drawFallbackControlIcon(ControlIconKind::Screen, QColor("#f2f3f5"), false);
+    return icon;
+  }();
+  static const QIcon lightIcon = [] {
+    auto icon = iconFromSvg(kScreenSvg, "#1d232f");
+    if (icon.isNull()) icon = drawFallbackControlIcon(ControlIconKind::Screen, QColor("#1d232f"), false);
+    return icon;
+  }();
+  static const QIcon accentIcon = [] {
+    auto icon = iconFromSvg(kScreenSvg, "#57f287");
+    if (icon.isNull()) icon = drawFallbackControlIcon(ControlIconKind::Screen, QColor("#57f287"), false);
+    return icon;
+  }();
   const QIcon& icon = activeOverlay ? accentIcon : (dark ? darkIcon : lightIcon);
   return icon;
 }
@@ -400,8 +508,16 @@ QIcon discordHangupIcon(bool dark) {
   static const char* kHangupSvg = R"SVG(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
   <g transform="translate(12 12.61)"><path fill="currentColor" d="M9.335000038146973,-1.8179999589920044 C4.184999942779541,-6.9670000076293945 -4.164000034332275,-6.9670000076293945 -9.312999725341797,-1.8179999589920044 C-11.690999984741211,0.5609999895095825 -11.35099983215332,3.6040000915527344 -9.555999755859375,5.39900016784668 C-9.300999641418457,5.6539998054504395 -8.909000396728516,5.7129998207092285 -8.59000015258789,5.544000148773193 C-8.59000015258789,5.544000148773193 -4.269999980926514,3.256999969482422 -4.269999980926514,3.256999969482422 C-3.871000051498413,3.0460000038146973 -3.683000087738037,2.5769999027252197 -3.8259999752044678,2.1489999294281006 C-3.8259999752044678,2.1489999294281006 -4.558000087738037,-0.04600000008940697 -4.558000087738037,-0.04600000008940697 C-1.8250000476837158,-1.9980000257492065 1.8459999561309814,-1.9980000257492065 4.578999996185303,-0.04600000008940697 C4.578999996185303,-0.04600000008940697 3.815000057220459,2.757999897003174 3.815000057220459,2.757999897003174 C3.693000078201294,3.2070000171661377 3.9240000247955322,3.677000045776367 4.354000091552734,3.8540000915527344 C4.354000091552734,3.8540000915527344 8.63599967956543,5.617000102996826 8.63599967956543,5.617000102996826 C8.946000099182129,5.744999885559082 9.303000450134277,5.672999858856201 9.539999961853027,5.435999870300293 C11.331999778747559,3.6440000534057617 11.708999633789062,0.5559999942779541 9.335000038146973,-1.8179999589920044z"/></g>
   </svg>)SVG";
-  static const QIcon darkIcon = iconFromSvg(kHangupSvg, "#f2f3f5");
-  static const QIcon lightIcon = iconFromSvg(kHangupSvg, "#1d232f");
+  static const QIcon darkIcon = [] {
+    auto icon = iconFromSvg(kHangupSvg, "#f2f3f5");
+    if (icon.isNull()) icon = drawFallbackControlIcon(ControlIconKind::Hangup, QColor("#f2f3f5"), false);
+    return icon;
+  }();
+  static const QIcon lightIcon = [] {
+    auto icon = iconFromSvg(kHangupSvg, "#1d232f");
+    if (icon.isNull()) icon = drawFallbackControlIcon(ControlIconKind::Hangup, QColor("#1d232f"), false);
+    return icon;
+  }();
   const QIcon& icon = dark ? darkIcon : lightIcon;
   return icon;
 }
