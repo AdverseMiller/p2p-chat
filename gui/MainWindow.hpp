@@ -25,6 +25,8 @@ class QHBoxLayout;
 class QResizeEvent;
 class QNetworkAccessManager;
 class QToolButton;
+class QEvent;
+class QMovie;
 
 class MainWindow : public QMainWindow {
   Q_OBJECT
@@ -32,6 +34,7 @@ public:
   explicit MainWindow(QString keyPassword = {}, QWidget* parent = nullptr);
   ~MainWindow() override;
   void resizeEvent(QResizeEvent* event) override;
+  void changeEvent(QEvent* event) override;
 
 private:
   void buildUi();
@@ -73,7 +76,14 @@ private:
   void handleServerVoicePresence(const QString& peerId, const QJsonObject& payload, const QString& signature);
   void handleServerGlobalSay(const QString& peerId, const QJsonObject& payload);
   void broadcastServerMemberSync(const Profile::ServerEntry& server);
-  void broadcastServerText(const QString& serverId, const QString& channelId, const QString& text);
+  void broadcastServerText(const QString& serverId,
+                           const QString& channelId,
+                           const QString& text,
+                           const QString& replySenderId = {},
+                           const QString& replySenderName = {},
+                           bool replySenderUnknown = false,
+                           const QString& replyText = {},
+                           const QString& replyToMessageId = {});
   void broadcastServerGlobalSay(const QString& serverId, const QString& text);
   void broadcastVoicePresence(const QString& serverId, const QString& channelId, bool joined);
   void appendServerChannelMessage(const QString& serverId,
@@ -82,7 +92,13 @@ private:
                                   const QString& senderName,
                                   const QString& text,
                                   bool incoming,
-                                  bool verified);
+                                  bool verified,
+                                  const QString& replySenderId = {},
+                                  const QString& replySenderName = {},
+                                  bool replySenderUnknown = false,
+                                  const QString& replyText = {},
+                                  const QString& messageId = {},
+                                  const QString& replyToMessageId = {});
   void maybeSyncVoiceCallForJoinedChannel();
   void announceJoinedVoicePresence();
   QString joinedVoiceServerId() const;
@@ -120,12 +136,21 @@ private:
   void kickServerMember(const QString& serverId, const QString& memberId);
 
   void appendMessage(const QString& peerId, const QString& label, const QString& text, bool incoming);
+  void showMessageContextMenu(const QPoint& pos);
   void refreshHeader();
   void refreshSelfProfileWidget();
   void refreshCallButton();
   void refreshVideoPanel();
+  void refreshReplyComposer();
+  void clearPendingReply();
+  void setPendingReply(const Profile::ChatMessage& msg, const QString& displayName);
+  void jumpToMessageById(const QString& messageId);
+  void indexRenderedMessage(const QString& messageId, int blockIndex);
   void maybeFetchGifPreviewsFromText(const QString& text);
   void ensureGifPreview(const QString& gifUrl);
+  bool gifsShouldAnimate() const;
+  void applyGifFrameToDocument(const QString& gifUrl, const QImage& frame);
+  void refreshGifPlaybackPolicy();
 
   Profile profile_;
   QString keyPassword_;
@@ -169,6 +194,10 @@ private:
   QMap<QString, QImage> remoteVideoFrames_;
   QMap<QString, bool> remoteVideoAvailable_;
   QLineEdit* input_ = nullptr;
+  QWidget* replyComposer_ = nullptr;
+  QLabel* replyTitleLabel_ = nullptr;
+  QLabel* replyTextLabel_ = nullptr;
+  QPushButton* replyCancelBtn_ = nullptr;
   QListWidget* serverMembersList_ = nullptr;
 
   // Self profile widget (Chats tab bottom)
@@ -196,6 +225,7 @@ private:
   QSet<QString> pendingGifPreviewUrls_;
   QSet<QString> readyGifPreviewUrls_;
   QMap<QString, QString> gifLocalUrlByRemote_;
+  QMap<QString, QPointer<QMovie>> gifMoviesByRemote_;
 
   QString activeCallPeer_;
   QString activeCallState_;
@@ -205,4 +235,11 @@ private:
   bool selfStreamPreviewHiddenInServer_ = false;
   QString screenShareDisplayName_;
   QString expandedVideoPeerId_;
+  bool pendingReplyActive_ = false;
+  QString pendingReplyToMessageId_;
+  QString pendingReplySenderId_;
+  QString pendingReplySenderName_;
+  bool pendingReplySenderUnknown_ = false;
+  QString pendingReplyText_;
+  QMap<QString, int> renderedMsgBlockById_;
 };

@@ -560,10 +560,16 @@ QVector<Profile::ChatMessage> Profile::loadChat(const QString& peerId, QString* 
     ChatMessage m;
     m.tsMs = static_cast<qint64>(o.value("tsMs").toVariant().toLongLong());
     m.incoming = o.value("incoming").toBool(false);
+    m.messageId = o.value("messageId").toString();
     m.senderId = o.value("senderId").toString();
     m.senderName = o.value("senderName").toString();
     m.senderUnknown = o.value("senderUnknown").toBool(false);
     m.verified = o.value("verified").toBool(false);
+    m.replyToMessageId = o.value("replyToMessageId").toString();
+    m.replySenderId = o.value("replySenderId").toString();
+    m.replySenderName = o.value("replySenderName").toString();
+    m.replySenderUnknown = o.value("replySenderUnknown").toBool(false);
+    m.replyText = o.value("replyText").toString();
     m.text = o.value("text").toString();
     // Sanitize timestamps: corrupted chat logs should not crash rendering.
     constexpr qint64 kMin = 946684800000LL;   // 2000-01-01
@@ -588,10 +594,16 @@ bool Profile::saveChat(const QString& peerId, const QVector<ChatMessage>& msgs, 
     QJsonObject o;
     o["tsMs"] = static_cast<double>(m.tsMs);
     o["incoming"] = m.incoming;
+    if (!m.messageId.isEmpty()) o["messageId"] = m.messageId;
     if (!m.senderId.isEmpty()) o["senderId"] = m.senderId;
     if (!m.senderName.isEmpty()) o["senderName"] = m.senderName;
     if (m.senderUnknown) o["senderUnknown"] = true;
     if (m.verified) o["verified"] = true;
+    if (!m.replyToMessageId.isEmpty()) o["replyToMessageId"] = m.replyToMessageId;
+    if (!m.replySenderId.isEmpty()) o["replySenderId"] = m.replySenderId;
+    if (!m.replySenderName.isEmpty()) o["replySenderName"] = m.replySenderName;
+    if (m.replySenderUnknown) o["replySenderUnknown"] = true;
+    if (!m.replyText.isEmpty()) o["replyText"] = m.replyText;
     o["text"] = m.text;
     arr.push_back(o);
   }

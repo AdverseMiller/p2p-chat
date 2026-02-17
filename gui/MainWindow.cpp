@@ -13,13 +13,16 @@
 #include <QDateTime>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QDesktopServices>
 #include <QDir>
+#include <QEvent>
 #include <QFileDialog>
 #include <QFile>
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QInputDialog>
+#include <QImageReader>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -28,6 +31,7 @@
 #include <QListWidget>
 #include <QListView>
 #include <QMouseEvent>
+#include <QMovie>
 #include <QPlainTextEdit>
 #include <QPainter>
 #include <QPainterPath>
@@ -53,6 +57,8 @@
 #include <QSignalBlocker>
 #include <QTabWidget>
 #include <QTextBrowser>
+#include <QTextBlock>
+#include <QTextDocument>
 #include <QTimer>
 #include <QToolButton>
 #include <QUrl>
@@ -647,7 +653,15 @@ QString chooseDisplayForShare(QWidget* parent, const QString& currentDisplayName
   return list->currentItem()->data(Qt::UserRole).toString();
 }
 
-QString renderLine(const QString& stamp, const QString& who, const QString& text) {
+QString normalizeReplySnippet(const QString& text, int maxLen = 120) {
+  QString out = text;
+  out.replace('\n', ' ');
+  out = out.simplified();
+  if (out.size() > maxLen) out = out.left(maxLen) + "...";
+  return out;
+}
+
+QString formatMessageWithLinks(const QString& raw) {
   static const QRegularExpression kUrlRe(R"((https?://[^\s<>"']+))", QRegularExpression::CaseInsensitiveOption);
 
   auto escapePlain = [](const QString& s) -> QString {
@@ -656,88 +670,161 @@ QString renderLine(const QString& stamp, const QString& who, const QString& text
     return out;
   };
 
-  auto formatMessage = [&](const QString& raw) -> QString {
-    QString html;
-    int pos = 0;
-    auto it = kUrlRe.globalMatch(raw);
-    while (it.hasNext()) {
-      const auto m = it.next();
-      const int start = m.capturedStart(1);
-      const int end = m.capturedEnd(1);
-      if (start < pos) continue;
-      html += escapePlain(raw.mid(pos, start - pos));
+  QString html;
+  int pos = 0;
+  auto it = kUrlRe.globalMatch(raw);
+  while (it.hasNext()) {
+    const auto m = it.next();
+    const int start = m.capturedStart(1);
+    const int end = m.capturedEnd(1);
+    if (start < pos) continue;
+    html += escapePlain(raw.mid(pos, start - pos));
 
-      const QString urlText = m.captured(1);
-      const QString safeUrl = urlText.toHtmlEscaped();
-      const QUrl url(urlText);
-      const QString path = url.path().toLower();
-      const bool isHttp = url.isValid() && (url.scheme() == "http" || url.scheme() == "https");
-      const bool isGif = isHttp && path.endsWith(".gif");
+    const QString urlText = m.captured(1);
+    const QString safeUrl = urlText.toHtmlEscaped();
+    const QUrl url(urlText);
+    const QString path = url.path().toLower();
+    const bool isHttp = url.isValid() && (url.scheme() == "http" || url.scheme() == "https");
+    const bool isGif = isHttp && path.endsWith(".gif");
 
-      if (isGif) {
-        html += QString("<a href=\"%1\">%1</a><br/>"
-                        "<img src=\"%1\" style=\"max-width:320px; max-height:320px; border-radius:6px;\"/>")
-                    .arg(safeUrl);
-      } else {
-        html += QString("<a href=\"%1\">%1</a>").arg(safeUrl);
-      }
-      pos = end;
+    if (isGif) {
+      html += QString("<a href=\"%1\">%1</a><br/>"
+                      "<img src=\"%1\" style=\"max-width:320px; max-height:320px; border-radius:6px;\"/>")
+                  .arg(safeUrl);
+    } else {
+      html += QString("<a href=\"%1\">%1</a>").arg(safeUrl);
     }
-    html += escapePlain(raw.mid(pos));
-    return html;
-  };
+    pos = end;
+  }
+  html += escapePlain(raw.mid(pos));
+  return html;
+}
 
-  return QString("[%1] <b>%2</b>: %3").arg(stamp, who.toHtmlEscaped(), formatMessage(text));
+QString renderReplyBlock(const QString& who, const QString& text, bool unknownUser, const QString& replyToMessageId) {
+  if (text.trimmed().isEmpty()) return {};
+  const QString whoHtml = unknownUser ? QString("<i>%1</i>").arg(who.toHtmlEscaped()) : who.toHtmlEscaped();
+  const QString content = QString("<span style=\"color:#b9bbbe;\">↪ Replying to <b>%1</b></span><br/>"
+                                  "<span style=\"color:#d7d9dc;\">%2</span>")
+                              .arg(whoHtml, formatMessageWithLinks(normalizeReplySnippet(text)));
+  if (replyToMessageId.isEmpty()) {
+    return QString("<span style=\"display:block;margin:2px 0 6px 0;padding:6px 8px;border-left:3px solid #7a7f89;"
+                   "border-radius:6px;background:rgba(114,118,125,0.16);\">%1</span>")
+        .arg(content);
+  }
+  return QString("<a class=\"reply-ref\" href=\"reply://%1\" "
+                 "style=\"display:block;margin:2px 0 6px 0;padding:6px 8px;border-left:3px solid #7a7f89;"
+                 "border-radius:6px;background:rgba(114,118,125,0.16);\">%2</a>")
+      .arg(replyToMessageId.toHtmlEscaped(), content);
+}
+
+QString renderLine(const QString& stamp,
+                   const QString& who,
+                   const QString& text,
+                   const QString& replyWho = {},
+                   const QString& replyText = {},
+                   bool replyUnknown = false,
+                   const QString& replyToMessageId = {}) {
+  const QString replyHtml = renderReplyBlock(replyWho, replyText, replyUnknown, replyToMessageId);
+  const QString body = QString("[%1] <b>%2</b>: %3").arg(stamp, who.toHtmlEscaped(), formatMessageWithLinks(text));
+  return replyHtml.isEmpty() ? body : (replyHtml + body);
 }
 
 QString renderServerLine(const QString& stamp,
                          const QString& who,
                          const QString& text,
                          bool unknownUser,
-                         bool verified) {
-  static const QRegularExpression kUrlRe(R"((https?://[^\s<>"']+))", QRegularExpression::CaseInsensitiveOption);
-  auto escapePlain = [](const QString& s) -> QString {
-    QString out = s.toHtmlEscaped();
-    out.replace('\n', "<br/>");
-    return out;
-  };
-  auto formatMessage = [&](const QString& raw) -> QString {
-    QString html;
-    int pos = 0;
-    auto it = kUrlRe.globalMatch(raw);
-    while (it.hasNext()) {
-      const auto m = it.next();
-      const int start = m.capturedStart(1);
-      const int end = m.capturedEnd(1);
-      if (start < pos) continue;
-      html += escapePlain(raw.mid(pos, start - pos));
-
-      const QString urlText = m.captured(1);
-      const QString safeUrl = urlText.toHtmlEscaped();
-      const QUrl url(urlText);
-      const QString path = url.path().toLower();
-      const bool isHttp = url.isValid() && (url.scheme() == "http" || url.scheme() == "https");
-      const bool isGif = isHttp && path.endsWith(".gif");
-
-      if (isGif) {
-        html += QString("<a href=\"%1\">%1</a><br/>"
-                        "<img src=\"%1\" style=\"max-width:320px; max-height:320px; border-radius:6px;\"/>")
-                    .arg(safeUrl);
-      } else {
-        html += QString("<a href=\"%1\">%1</a>").arg(safeUrl);
-      }
-      pos = end;
-    }
-    html += escapePlain(raw.mid(pos));
-    return html;
-  };
-
+                         bool verified,
+                         const QString& replyWho = {},
+                         const QString& replyText = {},
+                         bool replyUnknown = false,
+                         const QString& replyToMessageId = {}) {
+  const QString replyHtml = renderReplyBlock(replyWho, replyText, replyUnknown, replyToMessageId);
   QString whoHtml = unknownUser ? QString("<i>%1</i>").arg(who.toHtmlEscaped())
                                 : QString("<b>%1</b>").arg(who.toHtmlEscaped());
   const QString marker = verified ? "&#10003;" : "&#9888;";
   const QString markerColor = verified ? "#2e7d32" : "#d18a00";
-  return QString("[%1] <span style=\"color:%2;\">%3</span> %4: %5")
-      .arg(stamp, markerColor, marker, whoHtml, formatMessage(text));
+  const QString body = QString("[%1] <span style=\"color:%2;\">%3</span> %4: %5")
+                           .arg(stamp, markerColor, marker, whoHtml, formatMessageWithLinks(text));
+  return replyHtml.isEmpty() ? body : (replyHtml + body);
+}
+
+constexpr auto kReplyWirePrefix = "\x1Ep2pchat_reply_v1:";
+
+QJsonObject decodeReplyWire(const QString& wire, QString* textOut) {
+  QJsonObject out;
+  if (textOut) *textOut = wire;
+  const QString prefix = QString::fromLatin1(kReplyWirePrefix);
+  if (!wire.startsWith(prefix)) return out;
+
+  const QByteArray encoded = wire.mid(prefix.size()).toLatin1();
+  if (encoded.isEmpty()) return out;
+  const QByteArray decoded = QByteArray::fromBase64(
+      encoded, QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals);
+  if (decoded.isEmpty()) return out;
+
+  QJsonParseError pe{};
+  const auto doc = QJsonDocument::fromJson(decoded, &pe);
+  if (pe.error != QJsonParseError::NoError || !doc.isObject()) return out;
+
+  out = doc.object();
+  const QString payloadText = out.value("text").toString();
+  if (payloadText.isEmpty()) return {};
+  if (textOut) *textOut = payloadText;
+  return out;
+}
+
+QString makeMessageId() {
+  return QUuid::createUuid().toString(QUuid::WithoutBraces);
+}
+
+QString encodeReplyWire(const QString& text,
+                        const QString& messageId,
+                        const QString& replyToMessageId,
+                        const QString& replySenderId,
+                        const QString& replySenderName,
+                        bool replySenderUnknown,
+                        const QString& replyText) {
+  if (text.isEmpty()) return text;
+
+  QJsonObject root;
+  root["text"] = text;
+  if (!messageId.isEmpty()) root["msg_id"] = messageId;
+  if (replyText.trimmed().isEmpty()) {
+    const QByteArray payload = QJsonDocument(root).toJson(QJsonDocument::Compact);
+    const QByteArray encoded = payload.toBase64(QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals);
+    return QString::fromLatin1(kReplyWirePrefix) + QString::fromLatin1(encoded);
+  }
+  QJsonObject reply;
+  if (!replyToMessageId.isEmpty()) reply["message_id"] = replyToMessageId;
+  if (!replySenderId.isEmpty()) reply["sender_id"] = replySenderId;
+  if (!replySenderName.isEmpty()) reply["sender_name"] = replySenderName;
+  if (replySenderUnknown) reply["sender_unknown"] = true;
+  reply["text"] = normalizeReplySnippet(replyText, 240);
+  root["reply"] = reply;
+
+  const QByteArray payload = QJsonDocument(root).toJson(QJsonDocument::Compact);
+  const QByteArray encoded = payload.toBase64(QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals);
+  return QString::fromLatin1(kReplyWirePrefix) + QString::fromLatin1(encoded);
+}
+
+QString firstImageUrlFromText(const QString& text) {
+  static const QRegularExpression kUrlRe(R"((https?://[^\s<>"']+))", QRegularExpression::CaseInsensitiveOption);
+  auto it = kUrlRe.globalMatch(text);
+  while (it.hasNext()) {
+    const auto m = it.next();
+    const QString urlText = m.captured(1).trimmed();
+    if (urlText.isEmpty()) continue;
+    const QUrl url(urlText);
+    if (!url.isValid()) continue;
+    const QString scheme = url.scheme().toLower();
+    if (scheme != "http" && scheme != "https" && scheme != "file") continue;
+    const QString path = url.path().toLower();
+    if (path.endsWith(".gif") || path.endsWith(".png") || path.endsWith(".jpg") || path.endsWith(".jpeg") ||
+        path.endsWith(".webp") || path.endsWith(".bmp")) {
+      return url.toString();
+    }
+  }
+  return {};
 }
 
 QString makeStamp(int hh, int mm) {
@@ -794,6 +881,14 @@ QString detectedProvidersSummary(video::Codec codec) {
   }
   keys.removeDuplicates();
   return keys.isEmpty() ? "none" : keys.join(", ");
+}
+
+bool gif_debug_enabled() {
+  static const bool enabled = [] {
+    const QByteArray v = qgetenv("P2PCHAT_GIF_DEBUG").trimmed().toLower();
+    return v == "1" || v == "true" || v == "yes" || v == "on";
+  }();
+  return enabled;
 }
 
 QString friendDisplay(const Profile::FriendEntry& e) {
@@ -1003,6 +1098,7 @@ MainWindow::MainWindow(QString keyPassword, QWidget* parent)
   webcamEnabled_ = false;
   applyTheme(profile_.darkMode);
   refreshSelfProfileWidget();
+  refreshReplyComposer();
 
   std::cout << "video: detected providers h264=" << detectedProvidersSummary(video::Codec::H264).toStdString()
             << " hevc=" << detectedProvidersSummary(video::Codec::HEVC).toStdString()
@@ -1308,6 +1404,16 @@ MainWindow::~MainWindow() {
 void MainWindow::resizeEvent(QResizeEvent* event) {
   QMainWindow::resizeEvent(event);
   refreshVideoPanel();
+}
+
+void MainWindow::changeEvent(QEvent* event) {
+  QMainWindow::changeEvent(event);
+  if (!event) return;
+  if (event->type() == QEvent::ActivationChange ||
+      event->type() == QEvent::WindowActivate ||
+      event->type() == QEvent::WindowDeactivate) {
+    refreshGifPlaybackPolicy();
+  }
 }
 
 void MainWindow::buildUi() {
@@ -1729,7 +1835,10 @@ void MainWindow::buildUi() {
   chatView_ = new QTextBrowser(chatStack_);
   chatView_->setOpenExternalLinks(false);
   chatView_->setOpenLinks(false);
-  chatView_->document()->setDefaultStyleSheet("a { color: inherit; text-decoration: none; }");
+  chatView_->setContextMenuPolicy(Qt::CustomContextMenu);
+  chatView_->document()->setDefaultStyleSheet(
+      "a { color: inherit; text-decoration: none; }"
+      "a.reply-ref:hover { background: rgba(114,118,125,0.28); }");
   chatStack_->addWidget(chatView_);
 
   voiceGallery_ = new QListWidget(chatStack_);
@@ -1760,15 +1869,43 @@ void MainWindow::buildUi() {
   rightLayout->addWidget(contentSplit, /*stretch*/ 1);
 
   auto* bottom = new QWidget(right);
-  auto* bottomLayout = new QHBoxLayout(bottom);
+  auto* bottomLayout = new QVBoxLayout(bottom);
   bottomLayout->setContentsMargins(0, 0, 0, 0);
+  bottomLayout->setSpacing(6);
+
+  replyComposer_ = new QWidget(bottom);
+  auto* replyLayout = new QHBoxLayout(replyComposer_);
+  replyLayout->setContentsMargins(8, 6, 8, 6);
+  replyLayout->setSpacing(8);
+  replyTitleLabel_ = new QLabel(replyComposer_);
+  replyTitleLabel_->setStyleSheet("font-weight:600;");
+  replyTitleLabel_->setTextFormat(Qt::PlainText);
+  replyTextLabel_ = new QLabel(replyComposer_);
+  replyTextLabel_->setTextFormat(Qt::PlainText);
+  replyTextLabel_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+  replyTextLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+  replyTextLabel_->setWordWrap(false);
+  replyCancelBtn_ = new QPushButton("×", replyComposer_);
+  replyCancelBtn_->setFixedWidth(26);
+  replyCancelBtn_->setToolTip("Cancel reply");
+  replyLayout->addWidget(replyTitleLabel_);
+  replyLayout->addWidget(replyTextLabel_, 1);
+  replyLayout->addWidget(replyCancelBtn_);
+  replyComposer_->setVisible(false);
+  bottomLayout->addWidget(replyComposer_);
+
+  auto* inputRow = new QWidget(bottom);
+  auto* inputRowLayout = new QHBoxLayout(inputRow);
+  inputRowLayout->setContentsMargins(0, 0, 0, 0);
+  inputRowLayout->setSpacing(6);
   input_ = new QLineEdit(bottom);
   input_->setPlaceholderText("Type a message…");
   auto* gifBtn = new QPushButton("Gif", bottom);
   auto* sendBtn = new QPushButton("Send", bottom);
-  bottomLayout->addWidget(input_, 1);
-  bottomLayout->addWidget(gifBtn);
-  bottomLayout->addWidget(sendBtn);
+  inputRowLayout->addWidget(input_, 1);
+  inputRowLayout->addWidget(gifBtn);
+  inputRowLayout->addWidget(sendBtn);
+  bottomLayout->addWidget(inputRow);
   rightLayout->addWidget(bottom);
 
   splitter->setStretchFactor(0, 1);
@@ -1786,6 +1923,22 @@ void MainWindow::buildUi() {
   friendList_->setContextMenuPolicy(Qt::CustomContextMenu);
   connect(friendList_, &QListWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
     showChatContextMenu(pos);
+  });
+  connect(chatView_, &QTextBrowser::customContextMenuRequested, this, [this](const QPoint& pos) {
+    showMessageContextMenu(pos);
+  });
+  connect(chatView_, &QTextBrowser::anchorClicked, this, [this](const QUrl& url) {
+    if (!url.isValid()) return;
+    if (url.scheme() == "reply") {
+      QString id = url.host().trimmed();
+      if (id.isEmpty()) id = url.path().trimmed();
+      if (id.startsWith('/')) id.remove(0, 1);
+      jumpToMessageById(id);
+      return;
+    }
+    if (url.scheme() == "http" || url.scheme() == "https" || url.scheme() == "file") {
+      QDesktopServices::openUrl(url);
+    }
   });
 
   connect(serverList_, &QListWidget::itemPressed, this, [this](QListWidgetItem* item) {
@@ -1868,12 +2021,21 @@ void MainWindow::buildUi() {
   });
 
   auto sendNow = [this] {
-    const auto msg = input_->text().trimmed();
+    const QString msg = input_->text().trimmed();
     if (msg.isEmpty()) return;
+    const QString messageId = makeMessageId();
+    const QString replySenderId = pendingReplySenderId_;
+    const QString replySenderName = pendingReplySenderName_;
+    const bool replyUnknown = pendingReplySenderUnknown_;
+    const QString replyText = pendingReplyText_;
+    const QString replyToMessageId = pendingReplyToMessageId_;
     input_->clear();
     const auto pid = currentPeerId();
     if (!pid.isEmpty()) {
-      backend_.sendMessage(pid, msg);
+      backend_.sendMessage(
+          pid,
+          encodeReplyWire(msg, messageId, replyToMessageId, replySenderId, replySenderName, replyUnknown, replyText));
+      clearPendingReply();
       return;
     }
     const auto key = currentChatKey();
@@ -1881,13 +2043,23 @@ void MainWindow::buildUi() {
     if (selectedServerId_.isEmpty() || selectedServerChannelId_.isEmpty()) return;
     if (msg.startsWith("/say ", Qt::CaseInsensitive)) {
       broadcastServerGlobalSay(selectedServerId_, msg.mid(5).trimmed());
+      clearPendingReply();
       return;
     }
-    broadcastServerText(selectedServerId_, selectedServerChannelId_, msg);
+    broadcastServerText(selectedServerId_,
+                        selectedServerChannelId_,
+                        msg,
+                        replySenderId,
+                        replySenderName,
+                        replyUnknown,
+                        replyText,
+                        replyToMessageId);
+    clearPendingReply();
   };
   connect(sendBtn, &QPushButton::clicked, this, sendNow);
   connect(gifBtn, &QPushButton::clicked, this, &MainWindow::showGifPopup);
   connect(input_, &QLineEdit::returnPressed, this, sendNow);
+  connect(replyCancelBtn_, &QPushButton::clicked, this, &MainWindow::clearPendingReply);
   connect(callBtn_, &QPushButton::clicked, this, [this] {
     if (!selectedServerChannelId_.isEmpty()) {
       if (!selectedServerChannelVoice_) return;
@@ -2211,6 +2383,7 @@ void MainWindow::applyTheme(bool dark) {
     qApp->setStyleSheet({});
     if (videoTiles_) videoTiles_->setStyleSheet("QListWidget { padding: 3px; }");
     if (serverMembersList_) serverMembersList_->setStyleSheet({});
+    refreshReplyComposer();
     return;
   }
 
@@ -2237,6 +2410,7 @@ void MainWindow::applyTheme(bool dark) {
     serverMembersList_->setStyleSheet(
         "QListWidget { background-color: #141414; color: #dcdcdc; border: 1px solid #3a3a3a; }");
   }
+  refreshReplyComposer();
 }
 
 void MainWindow::refreshSelfProfileWidget() {
@@ -2292,6 +2466,7 @@ void MainWindow::selectFriend(const QString& id) {
   selectedServerId_.clear();
   selectedServerChannelId_.clear();
   selectedServerChannelVoice_ = false;
+  clearPendingReply();
   if (serverList_) serverList_->clearSelection();
 
   selectedPeerId_ = id;
@@ -2313,12 +2488,51 @@ void MainWindow::selectFriend(const QString& id) {
   }
 
   const auto msgs = chatCache_.value(id);
+  renderedMsgBlockById_.clear();
   const auto* fe = profile_.findFriend(id);
   const auto peerLabel = fe ? friendDisplay(*fe) : id.left(14) + "...";
-  for (const auto& m : msgs) {
+  for (int i = 0; i < msgs.size(); ++i) {
+    const auto& m = msgs[i];
     const auto who = m.incoming ? peerLabel : "You";
-    chatView_->append(renderLine(stampFromUtcMs(m.tsMs), who, m.text));
-    maybeFetchGifPreviewsFromText(m.text);
+    QString bodyText = m.text;
+    QString messageId = m.messageId;
+    QString replyToMessageId = m.replyToMessageId;
+    QString replyText = m.replyText;
+    QString replySenderId = m.replySenderId;
+    QString replySenderName = m.replySenderName;
+    bool replyUnknown = m.replySenderUnknown;
+    if (replyText.isEmpty() || messageId.isEmpty() || replyToMessageId.isEmpty()) {
+      const QJsonObject wire = decodeReplyWire(m.text, &bodyText);
+      if (messageId.isEmpty()) messageId = wire.value("msg_id").toString();
+      const QJsonObject replyObj = wire.value("reply").toObject();
+      if (!replyObj.isEmpty()) {
+        if (replyToMessageId.isEmpty()) replyToMessageId = replyObj.value("message_id").toString();
+        replySenderId = replyObj.value("sender_id").toString();
+        replySenderName = replyObj.value("sender_name").toString();
+        replyUnknown = replyObj.value("sender_unknown").toBool(false);
+        replyText = normalizeReplySnippet(replyObj.value("text").toString(), 240);
+      }
+    }
+    QString replyWho;
+    if (!replyText.isEmpty()) {
+      if (replyUnknown) {
+        replyWho = "Unknown User";
+      } else if (!replySenderName.isEmpty()) {
+        replyWho = replySenderName;
+      } else if (!replySenderId.isEmpty()) {
+        if (replySenderId == selfId_) {
+          replyWho = "You";
+        } else if (replySenderId == id) {
+          replyWho = peerLabel;
+        } else {
+          replyWho = replySenderId.left(14) + "...";
+        }
+      }
+    }
+    chatView_->append(
+        renderLine(stampFromUtcMs(m.tsMs), who, bodyText, replyWho, replyText, replyUnknown, replyToMessageId));
+    indexRenderedMessage(messageId, std::max(0, chatView_->document()->blockCount() - 1));
+    maybeFetchGifPreviewsFromText(bodyText);
   }
 }
 
@@ -2421,6 +2635,7 @@ void MainWindow::rebuildServerList() {
 
 void MainWindow::selectServerChannel(const QString& serverId, const QString& channelId, bool voice) {
   selectedPeerId_.clear();
+  clearPendingReply();
   if (friendList_) friendList_->clearSelection();
 
   selectedServerId_ = serverId;
@@ -2430,6 +2645,7 @@ void MainWindow::selectServerChannel(const QString& serverId, const QString& cha
   refreshHeader();
   refreshServerMembersPane();
   if (voice) {
+    renderedMsgBlockById_.clear();
     if (chatStack_) chatStack_->setVisible(false);
     if (input_) {
       input_->clear();
@@ -2459,7 +2675,28 @@ void MainWindow::selectServerChannel(const QString& serverId, const QString& cha
   }
 
   const auto msgs = chatCache_.value(key);
-  for (const auto& m : msgs) {
+  renderedMsgBlockById_.clear();
+  for (int i = 0; i < msgs.size(); ++i) {
+    const auto& m = msgs[i];
+    QString bodyText = m.text;
+    QString messageId = m.messageId;
+    QString replyToMessageId = m.replyToMessageId;
+    QString replySenderId = m.replySenderId;
+    QString replySenderName = m.replySenderName;
+    bool replyUnknown = m.replySenderUnknown;
+    QString replyText = m.replyText;
+    if (replyText.isEmpty() || messageId.isEmpty() || replyToMessageId.isEmpty()) {
+      const QJsonObject wire = decodeReplyWire(m.text, &bodyText);
+      if (messageId.isEmpty()) messageId = wire.value("msg_id").toString();
+      const QJsonObject replyObj = wire.value("reply").toObject();
+      if (!replyObj.isEmpty()) {
+        if (replyToMessageId.isEmpty()) replyToMessageId = replyObj.value("message_id").toString();
+        replySenderId = replyObj.value("sender_id").toString();
+        replySenderName = replyObj.value("sender_name").toString();
+        replyUnknown = replyObj.value("sender_unknown").toBool(false);
+        replyText = normalizeReplySnippet(replyObj.value("text").toString(), 240);
+      }
+    }
     bool unknownUser = false;
     QString who = "You";
     if (m.incoming) {
@@ -2471,8 +2708,24 @@ void MainWindow::selectServerChannel(const QString& serverId, const QString& cha
       }
     }
     const bool verified = m.verified && !m.senderId.isEmpty();
-    chatView_->append(renderServerLine(stampFromUtcMs(m.tsMs), who, m.text, unknownUser, verified));
-    maybeFetchGifPreviewsFromText(m.text);
+    QString replyWho;
+    if (!replyText.isEmpty()) {
+      if (replyUnknown) {
+        replyWho = "Unknown User";
+      } else if (!replySenderId.isEmpty() && canShowNonFriendIdentity(replySenderId, replySenderName)) {
+        if (replySenderId == selfId_) {
+          replyWho = "You";
+        } else {
+          replyWho = serverPeerDisplayName(replySenderId, replySenderName);
+        }
+      } else if (!replySenderName.isEmpty()) {
+        replyWho = replySenderName;
+      }
+    }
+    chatView_->append(renderServerLine(
+        stampFromUtcMs(m.tsMs), who, bodyText, unknownUser, verified, replyWho, replyText, replyUnknown, replyToMessageId));
+    indexRenderedMessage(messageId, std::max(0, chatView_->document()->blockCount() - 1));
+    maybeFetchGifPreviewsFromText(bodyText);
   }
   refreshVideoPanel();
 }
@@ -2509,6 +2762,159 @@ void MainWindow::showChatContextMenu(const QPoint& pos) {
   }
   if (chosen == unfriend) {
     removeFriend(peerId);
+    return;
+  }
+}
+
+void MainWindow::showMessageContextMenu(const QPoint& pos) {
+  if (!chatView_) return;
+  const QString key = currentChatKey();
+  if (key.isEmpty()) return;
+  if (!chatCache_.contains(key)) return;
+
+  const auto cursor = chatView_->cursorForPosition(pos);
+  const int blockIndex = cursor.blockNumber();
+  if (blockIndex < 0) return;
+
+  auto& msgs = chatCache_[key];
+  if (blockIndex >= msgs.size()) return;
+  const auto& msg = msgs[blockIndex];
+  QString msgText = msg.text;
+  QString msgId = msg.messageId;
+  QString msgReplyToId = msg.replyToMessageId;
+  QString msgReplySenderId = msg.replySenderId;
+  QString msgReplySenderName = msg.replySenderName;
+  bool msgReplySenderUnknown = msg.replySenderUnknown;
+  QString msgReplyText = msg.replyText;
+  if (msgReplyText.isEmpty() || msgId.isEmpty() || msgReplyToId.isEmpty()) {
+    const QJsonObject wire = decodeReplyWire(msg.text, &msgText);
+    if (msgId.isEmpty()) msgId = wire.value("msg_id").toString();
+    const QJsonObject replyObj = wire.value("reply").toObject();
+    if (!replyObj.isEmpty()) {
+      if (msgReplyToId.isEmpty()) msgReplyToId = replyObj.value("message_id").toString();
+      msgReplySenderId = replyObj.value("sender_id").toString();
+      msgReplySenderName = replyObj.value("sender_name").toString();
+      msgReplySenderUnknown = replyObj.value("sender_unknown").toBool(false);
+      msgReplyText = normalizeReplySnippet(replyObj.value("text").toString(), 240);
+    }
+  }
+
+  auto messageDisplayName = [&]() -> QString {
+    if (!selectedPeerId_.isEmpty()) {
+      if (!msg.incoming) return "You";
+      const auto* fe = profile_.findFriend(selectedPeerId_);
+      return fe ? friendDisplay(*fe) : selectedPeerId_.left(14) + "...";
+    }
+    if (!msg.incoming) return "You";
+    if (!msg.senderId.isEmpty() && canShowNonFriendIdentity(msg.senderId, msg.senderName)) {
+      return serverPeerDisplayName(msg.senderId, msg.senderName);
+    }
+    return "Unknown User";
+  };
+
+  const QString imageUrl = firstImageUrlFromText(msgText);
+  QMenu menu(this);
+  auto* copyTextAct = menu.addAction("Copy raw text");
+  auto* copyImageAct = menu.addAction("Copy image");
+  copyImageAct->setEnabled(!imageUrl.isEmpty());
+  menu.addSeparator();
+  auto* replyAct = menu.addAction("Reply");
+  auto* editAct = menu.addAction("Edit");
+  editAct->setEnabled(!msg.incoming);
+
+  QAction* chosen = menu.exec(chatView_->viewport()->mapToGlobal(pos));
+  if (!chosen) return;
+
+  if (chosen == copyTextAct) {
+    QGuiApplication::clipboard()->setText(msgText);
+    statusBar()->showMessage("Copied message text", 2500);
+    return;
+  }
+
+  if (chosen == copyImageAct) {
+    if (imageUrl.isEmpty()) return;
+    QString srcUrl = imageUrl;
+    const auto cachedGif = gifLocalUrlByRemote_.value(imageUrl);
+    if (!cachedGif.isEmpty()) srcUrl = cachedGif;
+    const QUrl url(srcUrl);
+    if (url.isLocalFile()) {
+      QImageReader reader(url.toLocalFile());
+      reader.setAutoTransform(true);
+      QImage img = reader.read();
+      if (!img.isNull()) {
+        QGuiApplication::clipboard()->setImage(img);
+        statusBar()->showMessage("Copied image", 2500);
+      } else {
+        statusBar()->showMessage("Failed to copy image", 3500);
+      }
+      return;
+    }
+
+    if (!gifPreviewNet_) gifPreviewNet_ = new QNetworkAccessManager(this);
+    QNetworkRequest req{url};
+    req.setTransferTimeout(15000);
+    auto* reply = gifPreviewNet_->get(req);
+    connect(reply, &QNetworkReply::finished, this, [this, reply] {
+      const auto err = reply->error();
+      const QByteArray payload = reply->readAll();
+      reply->deleteLater();
+      if (err != QNetworkReply::NoError || payload.isEmpty()) {
+        statusBar()->showMessage("Failed to download image", 3500);
+        return;
+      }
+
+      QImage img = QImage::fromData(payload);
+      if (img.isNull()) {
+        QByteArray decoded = payload;
+        QBuffer buf(&decoded);
+        buf.open(QIODevice::ReadOnly);
+        QImageReader reader(&buf);
+        reader.setAutoTransform(true);
+        img = reader.read();
+      }
+      if (img.isNull()) {
+        statusBar()->showMessage("Failed to decode image", 3500);
+        return;
+      }
+      QGuiApplication::clipboard()->setImage(img);
+      statusBar()->showMessage("Copied image", 2500);
+    });
+    return;
+  }
+
+  if (chosen == replyAct) {
+    Profile::ChatMessage replyMsg = msg;
+    replyMsg.messageId = msgId;
+    replyMsg.replyToMessageId = msgReplyToId;
+    replyMsg.text = msgText;
+    replyMsg.replySenderId = msgReplySenderId;
+    replyMsg.replySenderName = msgReplySenderName;
+    replyMsg.replySenderUnknown = msgReplySenderUnknown;
+    replyMsg.replyText = msgReplyText;
+    setPendingReply(replyMsg, messageDisplayName());
+    if (input_) input_->setFocus();
+    return;
+  }
+
+  if (chosen == editAct) {
+    if (msg.incoming) return;
+    bool ok = false;
+    const QString edited = QInputDialog::getMultiLineText(this, "Edit message", "Message:", msgText, &ok);
+    if (!ok) return;
+    if (edited.trimmed().isEmpty()) {
+      statusBar()->showMessage("Message cannot be empty", 3000);
+      return;
+    }
+    msgs[blockIndex].text = edited;
+    QString err;
+    profile_.saveChat(key, msgs, &err);
+    if (!err.isEmpty()) statusBar()->showMessage(err, 8000);
+    if (!selectedPeerId_.isEmpty()) {
+      selectFriend(selectedPeerId_);
+    } else if (!selectedServerId_.isEmpty() && !selectedServerChannelId_.isEmpty()) {
+      selectServerChannel(selectedServerId_, selectedServerChannelId_, selectedServerChannelVoice_);
+    }
+    statusBar()->showMessage("Message edited", 2500);
     return;
   }
 }
@@ -3287,7 +3693,14 @@ void MainWindow::handleServerRevocation(const QString& peerId, const QJsonObject
   maybeSyncVoiceCallForJoinedChannel();
 }
 
-void MainWindow::broadcastServerText(const QString& serverId, const QString& channelId, const QString& text) {
+void MainWindow::broadcastServerText(const QString& serverId,
+                                     const QString& channelId,
+                                     const QString& text,
+                                     const QString& replySenderId,
+                                     const QString& replySenderName,
+                                     bool replySenderUnknown,
+                                     const QString& replyText,
+                                     const QString& replyToMessageId) {
   if (text.isEmpty()) return;
   auto* s = profile_.findServer(serverId);
   if (!s) return;
@@ -3300,6 +3713,7 @@ void MainWindow::broadcastServerText(const QString& serverId, const QString& cha
   }
   if (!channelOk) return;
   if (s->revokedMemberIds.contains(selfId_)) return;
+  const QString messageId = makeMessageId();
 
   for (const auto& m : s->members) {
     if (m.id.isEmpty() || m.id == selfId_) continue;
@@ -3311,11 +3725,33 @@ void MainWindow::broadcastServerText(const QString& serverId, const QString& cha
     payload["member_name"] =
         (profile_.shareIdentityWithNonFriendsInServers || isFriendAccepted(m.id)) ? profile_.selfName : QString();
     payload["text"] = text;
+    payload["msg_id"] = messageId;
+    if (!replyText.trimmed().isEmpty()) {
+      QJsonObject reply;
+      if (!replyToMessageId.isEmpty()) reply["message_id"] = replyToMessageId;
+      if (!replySenderId.isEmpty()) reply["sender_id"] = replySenderId;
+      if (!replySenderName.isEmpty()) reply["sender_name"] = replySenderName;
+      if (replySenderUnknown) reply["sender_unknown"] = true;
+      reply["text"] = normalizeReplySnippet(replyText, 240);
+      payload["reply"] = reply;
+    }
     payload["issued_ms"] = static_cast<double>(nowUtcMs());
     payload["nonce"] = makeServerObjectId();
     backend_.sendSignedControl(m.id, "server_channel_text", compactJsonString(payload));
   }
-  appendServerChannelMessage(serverId, channelId, selfId_, profile_.selfName, text, false, true);
+  appendServerChannelMessage(serverId,
+                             channelId,
+                             selfId_,
+                             profile_.selfName,
+                             text,
+                             false,
+                             true,
+                             replySenderId,
+                             replySenderName,
+                             replySenderUnknown,
+                             replyText,
+                             messageId,
+                             replyToMessageId);
 }
 
 void MainWindow::broadcastServerGlobalSay(const QString& serverId, const QString& text) {
@@ -3402,7 +3838,13 @@ void MainWindow::appendServerChannelMessage(const QString& serverId,
                                             const QString& senderName,
                                             const QString& text,
                                             bool incoming,
-                                            bool verified) {
+                                            bool verified,
+                                            const QString& replySenderId,
+                                            const QString& replySenderName,
+                                            bool replySenderUnknown,
+                                            const QString& replyText,
+                                            const QString& messageId,
+                                            const QString& replyToMessageId) {
   const auto key = serverChannelChatKey(serverId, channelId);
   if (!chatCache_.contains(key)) {
     QString err;
@@ -3414,11 +3856,18 @@ void MainWindow::appendServerChannelMessage(const QString& serverId,
   Profile::ChatMessage m;
   m.tsMs = QDateTime::currentDateTimeUtc().toMSecsSinceEpoch();
   m.incoming = incoming;
+  m.messageId = messageId.trimmed().isEmpty() ? makeMessageId() : messageId.trimmed();
   m.senderId = senderId;
   m.senderName = canShowNonFriendIdentity(senderId, senderName) ? senderName : QString();
   m.senderUnknown = incoming && !senderId.isEmpty() && !canShowNonFriendIdentity(senderId, senderName);
   m.verified = verified;
   m.text = text;
+  m.replyToMessageId = replyToMessageId.trimmed();
+  m.replySenderId = replySenderId;
+  m.replySenderName = canShowNonFriendIdentity(replySenderId, replySenderName) ? replySenderName : QString();
+  m.replySenderUnknown =
+      replySenderUnknown || (!replySenderId.isEmpty() && !canShowNonFriendIdentity(replySenderId, replySenderName));
+  m.replyText = normalizeReplySnippet(replyText, 240);
   msgs.push_back(m);
   while (msgs.size() > 500) msgs.removeFirst();
 
@@ -3438,7 +3887,24 @@ void MainWindow::appendServerChannelMessage(const QString& serverId,
   }
   if (key == currentChatKey()) {
     const bool msgVerified = m.verified && !m.senderId.isEmpty();
-    chatView_->append(renderServerLine(stampFromUtcMs(m.tsMs), who, text, unknownUser, msgVerified));
+    QString replyWho;
+    if (!m.replyText.isEmpty()) {
+      if (m.replySenderUnknown) {
+        replyWho = "Unknown User";
+      } else if (!m.replySenderId.isEmpty() && canShowNonFriendIdentity(m.replySenderId, m.replySenderName)) {
+        if (m.replySenderId == selfId_) {
+          replyWho = "You";
+        } else {
+          replyWho = serverPeerDisplayName(m.replySenderId, m.replySenderName);
+        }
+      } else if (!m.replySenderName.isEmpty()) {
+        replyWho = m.replySenderName;
+      }
+    }
+    chatView_->append(
+        renderServerLine(
+            stampFromUtcMs(m.tsMs), who, text, unknownUser, msgVerified, replyWho, m.replyText, m.replySenderUnknown, m.replyToMessageId));
+    indexRenderedMessage(m.messageId, std::max(0, chatView_->document()->blockCount() - 1));
     maybeFetchGifPreviewsFromText(text);
   }
 }
@@ -3449,6 +3915,13 @@ void MainWindow::handleServerChannelText(const QString& peerId, const QJsonObjec
   const auto memberId = payload.value("member_id").toString();
   const auto memberName = payload.value("member_name").toString();
   const auto text = payload.value("text").toString();
+  const auto msgId = payload.value("msg_id").toString();
+  const auto replyObj = payload.value("reply").toObject();
+  const auto replyToMessageId = replyObj.value("message_id").toString();
+  const auto replySenderId = replyObj.value("sender_id").toString();
+  const auto replySenderName = replyObj.value("sender_name").toString();
+  const bool replySenderUnknown = replyObj.value("sender_unknown").toBool(false);
+  const auto replyText = replyObj.value("text").toString();
   if (serverId.isEmpty() || channelId.isEmpty() || memberId.isEmpty() || text.isEmpty()) return;
   if (memberId != peerId) return;
 
@@ -3464,7 +3937,19 @@ void MainWindow::handleServerChannelText(const QString& peerId, const QJsonObjec
     }
   }
   if (!channelOk) return;
-  appendServerChannelMessage(serverId, channelId, memberId, memberName, text, true, true);
+  appendServerChannelMessage(serverId,
+                             channelId,
+                             memberId,
+                             memberName,
+                             text,
+                             true,
+                             true,
+                             replySenderId,
+                             replySenderName,
+                             replySenderUnknown,
+                             replyText,
+                             msgId,
+                             replyToMessageId);
 }
 
 void MainWindow::handleServerVoicePresence(const QString& peerId, const QJsonObject& payload, const QString&) {
@@ -4171,6 +4656,97 @@ void MainWindow::refreshVideoPanel() {
   }
 }
 
+void MainWindow::refreshReplyComposer() {
+  if (!replyComposer_ || !replyTitleLabel_ || !replyTextLabel_) return;
+
+  const bool show =
+      pendingReplyActive_ && !pendingReplyText_.trimmed().isEmpty() && !selectedServerChannelVoice_;
+  replyComposer_->setVisible(show);
+  if (!show) return;
+
+  QString display = pendingReplySenderName_;
+  if (!pendingReplySenderId_.isEmpty() && pendingReplySenderId_ == selfId_) {
+    display = "You";
+  } else if (display.isEmpty()) {
+    if (pendingReplySenderUnknown_) {
+      display = "Unknown User";
+    } else if (!pendingReplySenderId_.isEmpty()) {
+      if (pendingReplySenderId_ == selfId_) {
+        display = "You";
+      } else {
+        display = pendingReplySenderId_.left(14) + "...";
+      }
+    } else {
+      display = "message";
+    }
+  }
+
+  replyTitleLabel_->setText(QString("Replying to %1").arg(display));
+  replyTextLabel_->setText(normalizeReplySnippet(pendingReplyText_, 120));
+
+  if (profile_.darkMode) {
+    replyComposer_->setStyleSheet(
+        "QWidget { border-radius: 8px; background: rgba(79,84,92,0.32); border-left: 3px solid #72767d; }"
+        "QLabel { color: #dcddde; }"
+        "QPushButton { background: transparent; border: none; color: #b9bbbe; font-weight: 700; }"
+        "QPushButton:hover { color: #ffffff; }");
+  } else {
+    replyComposer_->setStyleSheet(
+        "QWidget { border-radius: 8px; background: rgba(220,224,230,0.75); border-left: 3px solid #7a8190; }"
+        "QLabel { color: #23272a; }"
+        "QPushButton { background: transparent; border: none; color: #4f5660; font-weight: 700; }"
+        "QPushButton:hover { color: #111315; }");
+  }
+}
+
+void MainWindow::clearPendingReply() {
+  pendingReplyActive_ = false;
+  pendingReplyToMessageId_.clear();
+  pendingReplySenderId_.clear();
+  pendingReplySenderName_.clear();
+  pendingReplySenderUnknown_ = false;
+  pendingReplyText_.clear();
+  refreshReplyComposer();
+}
+
+void MainWindow::setPendingReply(const Profile::ChatMessage& msg, const QString& displayName) {
+  pendingReplyActive_ = true;
+  pendingReplyToMessageId_ = msg.messageId;
+  pendingReplySenderId_ = msg.senderId;
+  pendingReplySenderUnknown_ = msg.senderUnknown;
+  pendingReplySenderName_.clear();
+  if (!pendingReplySenderUnknown_) {
+    if (msg.senderId == selfId_ && !profile_.selfName.trimmed().isEmpty()) {
+      pendingReplySenderName_ = profile_.selfName.trimmed();
+    } else if (!msg.senderName.trimmed().isEmpty()) {
+      pendingReplySenderName_ = msg.senderName.trimmed();
+    } else if (!displayName.trimmed().isEmpty() && displayName != "You" && displayName != "Unknown User") {
+      pendingReplySenderName_ = displayName.trimmed();
+    }
+  }
+  pendingReplyText_ = normalizeReplySnippet(msg.text, 240);
+  refreshReplyComposer();
+}
+
+void MainWindow::indexRenderedMessage(const QString& messageId, int blockIndex) {
+  if (messageId.isEmpty()) return;
+  renderedMsgBlockById_[messageId] = blockIndex;
+}
+
+void MainWindow::jumpToMessageById(const QString& messageId) {
+  if (!chatView_ || messageId.trimmed().isEmpty()) return;
+  const auto it = renderedMsgBlockById_.find(messageId.trimmed());
+  if (it == renderedMsgBlockById_.end()) {
+    statusBar()->showMessage("Original message is not in the current loaded chat window", 3500);
+    return;
+  }
+  QTextCursor cursor(chatView_->document()->findBlockByNumber(it.value()));
+  if (!cursor.isNull()) {
+    chatView_->setTextCursor(cursor);
+    chatView_->ensureCursorVisible();
+  }
+}
+
 void MainWindow::refreshCallButton() {
   if (!callBtn_) return;
   const bool dark = profile_.darkMode;
@@ -4282,10 +4858,28 @@ void MainWindow::appendMessage(const QString& peerId, const QString& label, cons
   }
 
   auto& msgs = chatCache_[peerId];
+  QString decodedText = text;
+  const QJsonObject wireObj = decodeReplyWire(text, &decodedText);
+  QJsonObject replyObj;
+  if (wireObj.value("reply").isObject()) replyObj = wireObj.value("reply").toObject();
+
   Profile::ChatMessage m;
   m.tsMs = QDateTime::currentDateTimeUtc().toMSecsSinceEpoch();
   m.incoming = incoming;
-  m.text = text;
+  m.messageId = wireObj.value("msg_id").toString();
+  if (m.messageId.isEmpty()) m.messageId = makeMessageId();
+  m.senderId = incoming ? peerId : selfId_;
+  m.senderName = incoming ? label : profile_.selfName;
+  m.senderUnknown = false;
+  m.verified = true;
+  m.text = decodedText;
+  if (!replyObj.isEmpty()) {
+    m.replyToMessageId = replyObj.value("message_id").toString();
+    m.replySenderId = replyObj.value("sender_id").toString();
+    m.replySenderName = replyObj.value("sender_name").toString();
+    m.replySenderUnknown = replyObj.value("sender_unknown").toBool(false);
+    m.replyText = normalizeReplySnippet(replyObj.value("text").toString(), 240);
+  }
   msgs.push_back(m);
   while (msgs.size() > 500) msgs.removeFirst();
 
@@ -4298,10 +4892,28 @@ void MainWindow::appendMessage(const QString& peerId, const QString& label, cons
     const auto* f = profile_.findFriend(peerId);
     who = f ? friendDisplay(*f) : label;
   }
-  const auto line = renderLine(stampFromUtcMs(m.tsMs), who, text);
+  QString replyWho;
+  if (!m.replyText.isEmpty()) {
+    if (m.replySenderUnknown) {
+      replyWho = "Unknown User";
+    } else if (!m.replySenderName.isEmpty()) {
+      replyWho = m.replySenderName;
+    } else if (!m.replySenderId.isEmpty()) {
+      if (m.replySenderId == selfId_) {
+        replyWho = "You";
+      } else if (m.replySenderId == peerId) {
+        replyWho = who;
+      } else {
+        replyWho = m.replySenderId.left(14) + "...";
+      }
+    }
+  }
+  const auto line = renderLine(
+      stampFromUtcMs(m.tsMs), who, m.text, replyWho, m.replyText, m.replySenderUnknown, m.replyToMessageId);
   if (peerId == currentChatKey()) {
     chatView_->append(line);
-    maybeFetchGifPreviewsFromText(text);
+    indexRenderedMessage(m.messageId, std::max(0, chatView_->document()->blockCount() - 1));
+    maybeFetchGifPreviewsFromText(m.text);
   }
 }
 
@@ -4321,19 +4933,75 @@ void MainWindow::maybeFetchGifPreviewsFromText(const QString& text) {
   }
 }
 
+bool MainWindow::gifsShouldAnimate() const {
+  if (!isVisible()) return false;
+  if (QApplication::applicationState() != Qt::ApplicationActive) return false;
+  QWidget* active = QApplication::activeWindow();
+  if (!active) return false;
+  if (active == this) return true;
+  return this->isAncestorOf(active);
+}
+
+void MainWindow::applyGifFrameToDocument(const QString& gifUrl, const QImage& frame) {
+  if (!chatView_ || gifUrl.isEmpty() || frame.isNull()) return;
+  auto* doc = chatView_->document();
+  if (!doc) return;
+  doc->addResource(QTextDocument::ImageResource, QUrl(gifUrl), frame);
+  doc->markContentsDirty(0, doc->characterCount());
+  chatView_->viewport()->update();
+}
+
+void MainWindow::refreshGifPlaybackPolicy() {
+  const bool animate = gifsShouldAnimate();
+  if (gif_debug_enabled()) {
+    std::cout << "gif: policy animate=" << (animate ? "1" : "0") << " movies=" << gifMoviesByRemote_.size()
+              << std::endl;
+  }
+  for (auto it = gifMoviesByRemote_.begin(); it != gifMoviesByRemote_.end(); ++it) {
+    const QString remoteUrl = it.key();
+    QMovie* movie = it.value();
+    if (!movie) continue;
+    if (animate) {
+      if (movie->state() != QMovie::Running) movie->start();
+      const QImage frame = movie->currentImage();
+      if (!frame.isNull()) applyGifFrameToDocument(remoteUrl, frame);
+    } else {
+      movie->stop();
+      if (movie->frameCount() > 0) movie->jumpToFrame(0);
+      const QImage frame = movie->currentImage();
+      if (!frame.isNull()) applyGifFrameToDocument(remoteUrl, frame);
+    }
+  }
+}
+
 void MainWindow::ensureGifPreview(const QString& gifUrl) {
   if (!chatView_ || gifUrl.isEmpty()) return;
   if (readyGifPreviewUrls_.contains(gifUrl)) {
-    const QString localUrl = gifLocalUrlByRemote_.value(gifUrl);
-    if (!localUrl.isEmpty()) {
-      auto* bar = chatView_->verticalScrollBar();
-      const int y = bar ? bar->value() : 0;
-      QString html = chatView_->toHtml();
-      html.replace(QString("src=\"%1\"").arg(gifUrl.toHtmlEscaped()),
-                   QString("src=\"%1\"").arg(localUrl.toHtmlEscaped()));
-      chatView_->setHtml(html);
-      if (bar) bar->setValue(y);
+    if (!gifMoviesByRemote_.contains(gifUrl)) {
+      const QString localPath = QUrl(gifLocalUrlByRemote_.value(gifUrl)).toLocalFile();
+      if (!localPath.isEmpty() && QFileInfo::exists(localPath)) {
+        auto* movie = new QMovie(localPath, QByteArray(), this);
+        if (movie->isValid()) {
+          movie->setCacheMode(QMovie::CacheAll);
+          connect(movie, &QMovie::frameChanged, this, [this, gifUrl, movie](int) {
+            if (!movie || !gifsShouldAnimate()) return;
+            if (gif_debug_enabled()) {
+              std::cout << "gif: frame url=" << gifUrl.toStdString() << " frame=" << movie->currentFrameNumber()
+                        << std::endl;
+            }
+            const QImage frame = movie->currentImage();
+            if (!frame.isNull()) applyGifFrameToDocument(gifUrl, frame);
+          });
+          movie->jumpToFrame(0);
+          const QImage frame0 = movie->currentImage();
+          if (!frame0.isNull()) applyGifFrameToDocument(gifUrl, frame0);
+          gifMoviesByRemote_[gifUrl] = movie;
+        } else {
+          movie->deleteLater();
+        }
+      }
     }
+    refreshGifPlaybackPolicy();
     return;
   }
   if (pendingGifPreviewUrls_.contains(gifUrl)) return;
@@ -4367,13 +5035,30 @@ void MainWindow::ensureGifPreview(const QString& gifUrl) {
     const QString localUrl = QUrl::fromLocalFile(gifPath).toString();
     readyGifPreviewUrls_.insert(gifUrl);
     gifLocalUrlByRemote_[gifUrl] = localUrl;
-    auto* bar = chatView_->verticalScrollBar();
-    const int y = bar ? bar->value() : 0;
-    QString html = chatView_->toHtml();
-    html.replace(QString("src=\"%1\"").arg(gifUrl.toHtmlEscaped()),
-                 QString("src=\"%1\"").arg(localUrl.toHtmlEscaped()));
-    chatView_->setHtml(html);
-    if (bar) bar->setValue(y);
+    auto* movie = new QMovie(gifPath, QByteArray(), this);
+    if (movie->isValid()) {
+      movie->setCacheMode(QMovie::CacheAll);
+      connect(movie, &QMovie::frameChanged, this, [this, gifUrl, movie](int) {
+        if (!movie || !gifsShouldAnimate()) return;
+        if (gif_debug_enabled()) {
+          std::cout << "gif: frame url=" << gifUrl.toStdString() << " frame=" << movie->currentFrameNumber()
+                    << std::endl;
+        }
+        const QImage frame = movie->currentImage();
+        if (!frame.isNull()) applyGifFrameToDocument(gifUrl, frame);
+      });
+      movie->jumpToFrame(0);
+      const QImage frame0 = movie->currentImage();
+      if (!frame0.isNull()) applyGifFrameToDocument(gifUrl, frame0);
+      gifMoviesByRemote_[gifUrl] = movie;
+    } else {
+      movie->deleteLater();
+      QImageReader reader(gifPath);
+      reader.setAutoTransform(true);
+      const QImage firstFrame = reader.read();
+      if (!firstFrame.isNull()) applyGifFrameToDocument(gifUrl, firstFrame);
+    }
+    refreshGifPlaybackPolicy();
   });
 }
 

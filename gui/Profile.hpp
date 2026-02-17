@@ -54,10 +54,16 @@ public:
   struct ChatMessage {
     qint64 tsMs = 0;   // UTC ms since epoch
     bool incoming = false;
+    QString messageId;  // per-message id (for reply references/jump)
     QString senderId;   // optional; used for multi-sender chats (server channels)
     QString senderName; // optional display hint for multi-sender chats
     bool senderUnknown = false; // true when sender identity/name should not be disclosed
     bool verified = false;      // true when message came from a verified signed control envelope
+    QString replyToMessageId; // optional target message id
+    QString replySenderId;     // optional sender id of replied-to message
+    QString replySenderName;   // optional sender display hint for replied-to message
+    bool replySenderUnknown = false; // true when replied-to sender identity is hidden
+    QString replyText;         // optional replied-to message text snippet
     QString text;
   };
 
